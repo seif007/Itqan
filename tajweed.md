@@ -103,6 +103,20 @@ word that the rule-detector tagged. When the model judges `P(correct) < threshol
 - the per-word chip colouring still displays "Tajweed: <rule>" in the analysis list, so the
   user can scroll back and see a full audit trail.
 
+**Surah / ayah-range change mid-session (state-reset contract).** When the user changes the
+target (different surah, or the start/end ayah pickers), the `LaunchedEffect` on
+viewModel.ayahs / selectedSurah / rangeStart / rangeEnd stops the live recognizer session,
+wipes every speech/analysis variable (`finalSpokenText`, `partialSpokenText`, `spokenTimings`,
+`recognize{dAudio,AudioUri,StartMs}`, `alignment`, `detailedAnalysis`, `latestTajweedPopup`,
+`errorMessage`) and — crucially — flips `recognizerResultsSuppressedUntil` to `now + 500 ms`.
+The partial/final recognizer consumers refuse to emit results while that window is live; this
+defeats the previous bug where the recognizer's pending whole-transcript ("Bismillah…" from the
+old range) got re-analyzed against the new/empty target and the UI popped "wrong word + tajweed
+mistakes" before the user had read a single word of the new range. If the user was listening when
+they moved the range, the session auto-resumes ~520 ms later against the new target; otherwise it
+stays stopped and they tap the mic to start cleanly.
+
+
 **Tajweed (+Tarteel cross-tracking):** the same `TAJWEED_ERROR` row feeds the Stats tab:
 `triggerGoalRealProgress` collects per-rule mistake counts (`violatedRules`) and occurrence
 counts (`encounteredRules`) so the "Correct applications of <rule>" breakdowns stay accurate.

@@ -1995,12 +1995,81 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     var tajweedRecordingStartMs by remember { mutableStateOf(0L) }
     var tajweedRecordingDurationMs by remember { mutableStateOf(0L) }
 
+    // Popup-guard: remembers which word-index the last tajweed popup fired for, so one mistake
+    // isn't re-shown on every recomposition. Declared here (before the range-reset effect) so a
+    // target change can also clear it.
+    var lastTajweedPopupIndex by remember { mutableStateOf(-1) }
+
+    // The shared SpeechRecognizer must exist BEFORE the target-change reset effect below (which
+    // stops a running session). It is the single microphone client for Memorize/Tarteel/Tajweed
+    // (never opened alongside a parallel AudioRecord, per the single-mic constraint).
+    val speechRecognizer: android.speech.SpeechRecognizer? = remember {
+        try {
+            if (android.speech.SpeechRecognizer.isRecognitionAvailable(context)) {
+                android.speech.SpeechRecognizer.createSpeechRecognizer(context)
+            } else null
+        } catch (e: Throwable) { null }
+    }
+
+    // Suppression window (epoch ms). While `System.currentTimeMillis() < recognizerResultsSuppressedUntil`,
+    // partial/final SpeechRecognizer callbacks drop their text. Used by the range/surah reset to
+    // swallow the stale whole-transcript the recognizer is about to emit as we cancel its old session.
+    var recognizerResultsSuppressedUntil by remember { mutableStateOf(0L) }
+
     
     val targetNorm = remember(viewModel.ayahs, viewModel.riwayah) {
         viewModel.ayahs.flatMap { it.normalizedWords }.map { normalizeForComparison(it, viewModel.riwayah) }
     }
     val targetOrig = remember(viewModel.ayahs) {
         viewModel.ayahs.flatMap { it.words }
+    }
+
+    // State-reset on target change. Changing the surah or the ayah pickers at ~3874/3881 reloads
+    // `viewModel.ayahs` and so flips `targetNorm`/`targetOrig` below, which would normally
+    // re-run the Memorize analysis loop. Without this reset, the stale `finalSpokenText` and
+    // `recognizedAudio` from the previous range get aligned against the EMPTY/NEW target and the
+    // first word is flagged WRONG/SKIPPED + a TAJWEED_ERROR, popping the mistake dialog/banner
+    // even though the user hasn't read a word of the new range (exactly what the user reported).
+    // We therefore stop any in-flight session and wipe every piece of speech/analysis state so
+        // the new range always starts clean, then resume listening if the mic was on.
+    LaunchedEffect(viewModel.ayahs, viewModel.selectedSurah, viewModel.rangeStart, viewModel.rangeEnd) {
+        val wasListening = isListening
+        if (wasListening) {
+            try { speechRecognizer?.stopListening(); speechRecognizer?.cancel() } catch (e: Throwable) {}
+            // We just cancelled the recognizer; onResults will NOT fire, so nothing else unlatches
+            // `isListening`. Unlatch it here so Tap-to-start doesn't think a session is still live.
+            isListening = false
+        }
+        finalSpokenText = ""
+        partialSpokenText = ""
+        spokenTimings.clear()
+        currentWordCount = 0
+        recognizedAudio = null
+        recognizedAudioUri = null
+        recognizedAudioStartMs = System.currentTimeMillis()
+        alignment = Pair(0, false)
+        detailedAnalysis = emptyList()
+        latestTajweedPopup = null
+        errorMessage = null
+        // Cancel is async: one more onPartial/onResults with the OLD whole-transcript can still
+        // arrive before the engine fully stops. Suppress recognizer output for the next 500 ms so
+        // that stale transcript isn't re-analyzed against the fresh range (the exact bug the user
+        // hit: mistakes appear immediately after changing the ayah range with nothing read).
+        recognizerResultsSuppressedUntil = System.currentTimeMillis() + 500L
+        // Resume automatically: if the user was mid-recitation when they moved the range, start
+        // listening again (once the suppression window has elapsed) so they can keep going without
+        // a manual mic tap. Guard on the recognizer being alive and the tab still being Memorize.
+        if (wasListening && speechRecognizer != null && currentTab == "Memorize") {
+            kotlinx.coroutines.delay(520)
+            if (currentTab == "Memorize" && !isListening) {
+                try {
+                    startListening(speechRecognizer!!, context.packageName) { msg ->
+                        errorMessage = if (msg.isEmpty()) null else msg; isListening = false
+                    }
+                    isListening = true
+                } catch (e: Throwable) { /* restart best-effort */ }
+            }
+        }
     }
     
     // Also watch recognizedAudio directly (not just the Uri) so that the Tajweed-mode fallback
@@ -2065,17 +2134,25 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // instantly recomposes the small floating dialog lower in the tree. We don't pause the
     // recitation: the loop continues processing further words. The `remember`ed
     // `lastTajweedPopupIndex` guard prevents re-firing for the same error on every recomposition,
-    // so the user sees each mistake once per word.
-    var lastTajweedPopupIndex by remember { mutableStateOf(-1) }
+    // so the user sees each mistake once per word. `lastTajweedPopupIndex` is declared above
+    // (next to the recognizer) so the range/surah reset can clear it too.
     LaunchedEffect(detailedAnalysis, currentTab, recitationMode) {
         if (currentTab == "Memorize" && recitationMode == "Tajweed") {
             // Find the LATEST tajweed mistake (last in word order -- the most recent error).
             val tajweedError = detailedAnalysis.lastOrNull {
                 it.status == RecitationStatus.TAJWEED_ERROR && it.tajweedRule != null
             }
-            if (tajweedError != null && tajweedError.wordIndex != lastTajweedPopupIndex) {
-                lastTajweedPopupIndex = tajweedError.wordIndex
-                latestTajweedPopup = Pair(tajweedError.tajweedRule!!, tajweedError.wordIndex)
+            if (tajweedError != null) {
+                if (tajweedError.wordIndex != lastTajweedPopupIndex) {
+                    lastTajweedPopupIndex = tajweedError.wordIndex
+                    latestTajweedPopup = Pair(tajweedError.tajweedRule!!, tajweedError.wordIndex)
+                }
+            } else if (latestTajweedPopup == null) {
+                // No error currently AND no popup showing -> reset the latch so that if the user
+                // re-reads the SAME word and makes the SAME mistake again after the previous popup
+                // auto-dismissed, the fresh TAJWEED_ERROR re-triggers instead of being swallowed
+                // by the stale index.
+                lastTajweedPopupIndex = -1
             }
         } else if (currentTab != "Memorize") {
             // User left Memorize -- clear any stale popup state so re-entering is clean.
@@ -2100,14 +2177,6 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     val matchedWordCount = alignment.first
     val hasError = alignment.second
     val errorIndex = if (hasError) matchedWordCount else -1
-    
-    val speechRecognizer: android.speech.SpeechRecognizer? = remember { 
-        try {
-            if (android.speech.SpeechRecognizer.isRecognitionAvailable(context)) {
-                android.speech.SpeechRecognizer.createSpeechRecognizer(context)
-            } else null
-        } catch (e: Throwable) { null }
-    }
 
     // Start a Tajweed practice session. Our OWN AudioRecord is the SINGLE microphone client so the
     // acoustic score measures the user's real voice. We deliberately do NOT start the SpeechRecognizer
@@ -2274,25 +2343,34 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         }
     }
     
-    listenerWrapper.onResult = { result -> 
+    listenerWrapper.onResult = { result ->
         mainHandler.post {
-            if (currentTab == "Tajweed") {
-                tajweedFinalSpokenText = "$tajweedFinalSpokenText $result".trim()
-                tajweedPartialSpokenText = ""
-            } else {
-                finalSpokenText = "$finalSpokenText $result".trim()
-                partialSpokenText = ""
+            // Drop results that arrive during the post-range-reset suppression window: they carry
+            // the WHOLE stale transcript from the previous ayah range and would immediately
+            // re-fire wrong/tajweed mistakes with nothing read.
+            if (System.currentTimeMillis() >= recognizerResultsSuppressedUntil) {
+                if (currentTab == "Tajweed") {
+                    tajweedFinalSpokenText = "$tajweedFinalSpokenText $result".trim()
+                    tajweedPartialSpokenText = ""
+                } else {
+                    finalSpokenText = "$finalSpokenText $result".trim()
+                    partialSpokenText = ""
+                }
+                // In the Tajweed coach we own the microphone session (AudioRecord); the recognizer
+                // is only a best-effort transcript source, so its completion must NOT end our
+                // recording. Otherwise this result ends the Memorize/Tarteel session.
+                if (currentTab != "Tajweed") isListening = false
             }
-            // In the Tajweed coach we own the microphone session (AudioRecord); the recognizer is
-            // only a best-effort transcript source, so its completion must NOT end our recording.
-            if (currentTab != "Tajweed") isListening = false
         }
     }
     val whitespaceRegex = remember { Regex("\\s+") }
     
-    listenerWrapper.onPartial = { partial -> 
+    listenerWrapper.onPartial = { partial ->
         val timeNow = System.currentTimeMillis()
-        mainHandler.post {
+        // During the range-reset suppression window, drop partial transcripts entirely: they carry
+        // the previous range's whole text until the engine fully cancels, and would re-fire
+        // word-timings + analysis against a target the user hasn't read yet.
+        if (timeNow >= recognizerResultsSuppressedUntil) mainHandler.post {
             val words = partial.split(whitespaceRegex).filter { it.isNotBlank() }
             val wordsLength = words.size
             if (wordsLength > currentWordCount) {
