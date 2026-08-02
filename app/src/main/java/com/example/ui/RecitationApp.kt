@@ -41,6 +41,8 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.quran.QuranApi
 import com.example.quran.SurahData
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import kotlinx.coroutines.launch
 import com.example.data.Goal
 import com.example.data.GoalDatabase
@@ -1255,6 +1257,84 @@ data class TajweedRuleInfo(
     val examples: List<TajweedExample>
 )
 
+// ============================================================================
+// Online random-example generator (Tajweed Rules coach)
+//
+// The examples baked into the rulesList below are the bundled offline fallback.
+// The user explicitly asked that the coach surface a DIFFERENT Quran example on
+// every expand/refresh, generated live from a Quran source, like the sister
+// practice_recitation-main repo does. This generator fetches a random surah's
+// per-word tajweed-flavoured Quran text from AlQuran.cloud (Uthmani-script
+// marks, including the madd/ikhfa/ikhfa-meem glyphs our colouriser expects),
+// scans every ayah with the SAME `getTajweedRuleForWord` the app uses to color
+// and to drive the acoustic model, and returns the first phrase whose matched
+// token belongs to the requested rule head. The picked phrase is then rendered
+// with `buildTajweedAnnotatedString` per token (exactly the same paint path the
+// cards and Memorize already use), so the colours and verdict labels always agree.
+//
+// Network failure is handled by the caller, which silently falls back to the
+// bundled pool. Offline behaviour is therefore identical to today.
+// ============================================================================
+
+/**
+ * Fetch a random Quran excerpt from the network that exhibits a tajweed rule
+ * belonging to [targetHead] (e.g. "GHUNNAH", "MADD", ...). Returns a
+ * [TajweedExample] whose arabic is a phrase (one ayah, trimmed to a reasonable
+ * length) guaranteed to contain a training-relevant token whose first rule match
+ * is [targetHead]. Returns null on any network/parse/no-match failure so the
+ * caller can fall back to the bundled examples.
+ */
+suspend fun generateRandomQuranExample(targetHead: String): TajweedExample? = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    try {
+        // Random surah across the whole Quran; a large surah is retried a few times
+        // before giving up, so cost stays small even for rare rules.
+        val surahNumber = (1..114).random()
+        val body = Request.Builder()
+            .url("https://api.alquran.cloud/v1/surah/$surahNumber/ar.alafasy")
+            .build()
+            .let { QuranApiOkHttpClient.newCall(it).execute() }
+            .body?.string() ?: return@withContext null
+        val ayahsJson = org.json.JSONObject(body).getJSONObject("data").getJSONArray("ayahs")
+
+        // Shuffle ayah order so repeated calls to the same surah surface a new one.
+        val ayahIndices = (0 until ayahsJson.length()).shuffled()
+        for (ai in ayahIndices) {
+            val ayah = ayahsJson.getJSONObject(ai).getString("text").trim()
+            // Skip bismillah-prefix stripping already done elsewhere; and empty.
+            if (ayah.isBlank() || ayah.length > 300) continue
+            val tokens = ayah.split(Regex("\\s+")).filter { it.isNotBlank() }
+            for (j in tokens.indices) {
+                val token = tokens[j]
+                val nextToken = tokens.getOrNull(j + 1)
+                val label = getTajweedRuleForWord(token, nextToken, "Hafs") ?: continue
+                if (ruleLabelToHead(label) == targetHead) {
+                    val englishName = try { QuranApi.instance.getSurahs().data.firstOrNull { it.number == surahNumber }?.englishName } catch (e: Throwable) { null }
+                    return@withContext TajweedExample(
+                        arabic = ayah,
+                        translation = (englishName?.let { "$it — " } ?: "") + "Surah $surahNumber"
+                    )
+                }
+            }
+        }
+        null
+    } catch (e: Throwable) {
+        null
+    }
+}
+
+/**
+ * Minimal OkHttp client dedicated to the example generator. The app already uses
+ * OkHttp for QuranApi (Retrofit transitively brings it in); a small singleton here
+ * keeps the generator independent of Retrofit's suspend functions (which are for
+ * the surah *list* only).
+ */
+private val QuranApiOkHttpClient by lazy {
+    OkHttpClient.Builder()
+        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
+}
+
 /**
  * Maps the app's friendly tajweed-rule label (from [getTajweedRuleForWord]) to the
  * canonical head name used by the trained TajweedNet model. Returns null when the label
@@ -2035,9 +2115,15 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     LaunchedEffect(viewModel.ayahs, viewModel.selectedSurah, viewModel.rangeStart, viewModel.rangeEnd) {
         val wasListening = isListening
         if (wasListening) {
-            try { speechRecognizer?.stopListening(); speechRecognizer?.cancel() } catch (e: Throwable) {}
-            // We just cancelled the recognizer; onResults will NOT fire, so nothing else unlatches
-            // `isListening`. Unlatch it here so Tap-to-start doesn't think a session is still live.
+            // Use stopListening (NOT cancel) so the recognizer DELIVERS its final onResults with the
+            // GET_AUDIO bundle for whatever we just heard, and watch the restart path in Memorize's
+            // auto-continue loop resume the session on its own when it sees the session ended.
+            // (cancel would kill both the final transcript AND the audio the acoustic scorer needs,
+            // plus it would no-op the recognizer while hasError also fails sane -- the two things
+            // that originally made changing the range fire phantom mistakes.)
+            try { speechRecognizer?.stopListening() } catch (e: Throwable) {}
+            // stopListening DOES fire onResults (which unlatches isListening), but if the engine is
+            // already wedged we still must not leave the UI thinking a session is live.
             isListening = false
         }
         finalSpokenText = ""
@@ -2280,7 +2366,15 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEndOfSpeech() {}
         override fun onError(error: Int) {
-            mainHandler.post { recognizedAudio = null; recognizedAudioUri = null }
+            // IMPORTANT (recognized-audio preservation): on the continuous-loop recognizer the
+            // ONLY place recognizedAudio/recognizedAudioUri get filled is onResults (which decodes
+            // the GET_AUDIO bundle the SpeechRecognizer hands back). Every benign error branch
+            // (CLIENT / NO_MATCH / SPEECH_TIMEOUT) used to ALSO null them out, which erased the
+            // just-decoded clip before analyzeRecitationDetails ever got to use it — that is what
+            // made Memorize+Tajweed look like Memorize+Tarteel (no tajweed feedback). Stopping a
+            // recognizer session does NOT invalidate the audio it already produced, so we simply
+            // do not clear these here; the only places that legitimately wipe the clip are start(),
+            // surah/range reset, and the Tajweed coach's own session starter.
             if (error == android.speech.SpeechRecognizer.ERROR_CLIENT || error == android.speech.SpeechRecognizer.ERROR_NO_MATCH || error == android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
                 onError?.invoke("")
                 return
@@ -3053,8 +3147,45 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 items(rulesList) { rule ->
                     val isExpanded = activePracticeRule == rule.name
                     var currentExample by remember { mutableStateOf(rule.examples.first()) }
+                    // True while the online Quran-wide generator is fetching; used to show a
+                    // subtle loading cue so the network/parse latency isn't silent.
+                    var isGeneratingExample by remember { mutableStateOf(false) }
+                    // Coroutine scope so the refresh IconButton can call the suspend generator without
+                    // leaving the composition (the expand LaunchedEffect already runs in one).
+                    val refreshScope = rememberCoroutineScope()
+                    // Pick a fresh, DIFFERENT example every time the card expands. We try the
+                    // online Quran-wide generator first (new Quran phrase every time, like the
+                    // practice_recitation-main behaviour the user asked to match), and fall back
+                    // to the bundled pool if there's no network or the surah we drew happens to
+                    // not contain this rule.
                     LaunchedEffect(isExpanded) {
-                        if (isExpanded) currentExample = rule.examples.random()
+                        if (isExpanded) {
+                            // Silah is Qalun-specific and has no dedicated model head — it maps to
+                            // IZHAR via ruleLabelToHead, so the generic generator would refresh it
+                            // into a plain Izhar example, which would mislead the user. Silah keeps
+                            // its curated Qalun pool instead.
+                            if (rule.name == "Silah") return@LaunchedEffect
+                            val head = ruleLabelToHead(rule.name) ?: return@LaunchedEffect
+                            isGeneratingExample = true
+                            val online = generateRandomQuranExample(head)
+                            isGeneratingExample = false
+                            if (online != null) {
+                                currentExample = online
+                            } else {
+                                val list = rule.examples
+                                if (list.isNotEmpty()) {
+                                    var nextEx = list.random()
+                                    if (list.size > 1 && nextEx == currentExample) {
+                                        var attempts = 0
+                                        while (nextEx == currentExample && attempts < 10) {
+                                            nextEx = list.random()
+                                            attempts++
+                                        }
+                                    }
+                                    currentExample = nextEx
+                                }
+                            }
+                        }
                     }
                     
                     val targetTokens = remember(currentExample) { 
@@ -3202,8 +3333,40 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                                     fontWeight = FontWeight.Bold,
                                                     color = rule.color
                                                 )
-                                                IconButton(onClick = { 
-                                                    currentExample = rule.examples.random()
+                                                IconButton(
+                                                    enabled = !isGeneratingExample,
+                                                    onClick = {
+                                                    // Same "give me a different Quran phrase" contract as the
+                                                    // expand effect: try the online generator first, fall back
+                                                    // to the bundled pool if offline or this surah lacks the rule.
+                                                    // Silah: Qalun-specific, keep its curated pool (it has no
+                                                    // dedicated model head; the generic generator would pull
+                                                    // plain Izhar examples for it).
+                                                    refreshScope.launch {
+                                                        val head = if (rule.name != "Silah") ruleLabelToHead(rule.name) else null
+                                                        if (head != null) {
+                                                            isGeneratingExample = true
+                                                            val online = generateRandomQuranExample(head)
+                                                            isGeneratingExample = false
+                                                            if (online != null) {
+                                                                currentExample = online
+                                                                return@launch
+                                                            }
+                                                        }
+                                                        // Offline / no-match / Silah: no-repeat pick from bundles.
+                                                        val list = rule.examples
+                                                        if (list.isNotEmpty()) {
+                                                            var nextEx = list.random()
+                                                            if (list.size > 1 && nextEx == currentExample) {
+                                                                var attempts = 0
+                                                                while (nextEx == currentExample && attempts < 10) {
+                                                                    nextEx = list.random()
+                                                                    attempts++
+                                                                }
+                                                            }
+                                                            currentExample = nextEx
+                                                        }
+                                                    }
                                                     tajweedFinalSpokenText = ""
                                                     tajweedPartialSpokenText = ""
                                                     if (tajweedRecorder.running || isListening) {
@@ -3214,7 +3377,15 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                                         tajweedRecordingDurationMs = 0
                                                     }
                                                 }) {
-                                                    Icon(Icons.Default.Refresh, contentDescription = "Change Example", tint = rule.color)
+                                                    if (isGeneratingExample) {
+                                                        CircularProgressIndicator(
+                                                            modifier = Modifier.size(20.dp),
+                                                            strokeWidth = 2.dp,
+                                                            color = rule.color
+                                                        )
+                                                    } else {
+                                                        Icon(Icons.Default.Refresh, contentDescription = "Change Example", tint = rule.color)
+                                                    }
                                                 }
                                             }
                                             Spacer(modifier = Modifier.height(6.dp))
@@ -3237,13 +3408,26 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                                     }
                                                 }
                                             }
-                                            Text(
-                                                text = exampleColored,
-                                                style = MaterialTheme.typography.titleLarge,
-                                                fontWeight = FontWeight.Bold,
-                                                textAlign = TextAlign.Right,
-                                                modifier = Modifier.fillMaxWidth()
-                                            )
+                                            if (isGeneratingExample && currentExample == rule.examples.first()) {
+                                                // First-time generation inside this expand: show a tiny cue so
+                                                // the user isn't looking at a blank card while the new Quran
+                                                // phrase is being fetched.
+                                                Text(
+                                                    text = getAppString(isArabic, "Loading example…"),
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    textAlign = TextAlign.Right
+                                                )
+                                            } else {
+                                                Text(
+                                                    text = exampleColored,
+                                                    style = MaterialTheme.typography.titleLarge,
+                                                    fontWeight = FontWeight.Bold,
+                                                    textAlign = TextAlign.Right,
+                                                    modifier = Modifier.fillMaxWidth()
+                                                )
+                                            }
                                             Spacer(modifier = Modifier.height(4.dp))
                                             // Hide the English translation when the UI is in Arabic --
                                             // the Quran text itself already IS Arabic, and the user

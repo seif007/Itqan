@@ -121,6 +121,30 @@ stays stopped and they tap the mic to start cleanly.
 `triggerGoalRealProgress` collects per-rule mistake counts (`violatedRules`) and occurrence
 counts (`encounteredRules`) so the "Correct applications of <rule>" breakdowns stay accurate.
 
+### 4.1 Tajweed Rules coach — random example generator
+
+Each Tajweed card previously bundled a fixed list of 9–12 curated Quran phrases. The user asked
+for fresh material on every expand/refresh, like the practice_recitation-main build. Because the
+card colouring and the acoustic coach are both driven by `getTajweedRuleForWord` /
+`buildTajweedAnnotatedString`, the generator reuses those exact functions rather than
+duplicating colouring logic. On expand and on the refresh icon, the card calls
+[`generateRandomQuranExample(head)`](app/src/main/java/com/example/ui/RecitationApp.kt), which:
+
+1. picks a random surah (1..114),
+2. fetches it from `https://api.alquran.cloud/v1/surah/{n}/ar.alafasy` (OkHttp),
+3. walks the ayahs' tokens and returns the first one whose
+   `ruleLabelToHead(getTajweedRuleForWord(token, next, "Hafs"))` matches the card's head
+   (GHUNNAH / MADD / QALQALAH / IDGHAM / IKHFA / ALLAM / MEEM_SAKINAH / IZHAR).
+   The Qalun-only **Silah** card is excluded (it has no dedicated model head and maps to
+   IZHAR in `ruleLabelToHead`, so the generic generator would fetch plain Izhar examples for
+   it); Silah keeps its curated Qalun pool.
+
+The resulting phrase is coloured with the same `buildTajweedAnnotatedString` per token used
+elsewhere, so the rule marking inside it shows the same colour as the card chip. If the
+network fetch fails (offline, or the surah happens to lack the rule), the card falls back
+to the bundled no-repeat random pick from its curated examples list — same behaviour as
+before, so offline UX is unchanged.
+
 ## 5. Why the previous pipeline is gone
 
 The old acoustic path (`MaddAnalyzer`/`GhunnahAnalyzer`/`QalqalahAnalyzer`/`SimilarityEngine.kt`)
