@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Sound Waves / Circles -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#5EEAD4"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M38,36 a20,20 0 0,1 32,0" />
+        
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#99F6E4"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M30,30 a28,28 0 0,1 48,0" />
+
+    <!-- Microphone body -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M50,23 C50,20.8 51.8,19 54,19 C56.2,19 58,20.8 58,23 L58,33 C58,35.2 56.2,37 54,37 C51.8,37 50,35.2 50,33 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M46,29 C46,34 50,38 54,38 C58,38 62,34 62,29" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2"
+        android:pathData="M54,38 L54,43" />
+
+    <!-- Open Quran Book design -->
+    <!-- Left Page -->
+    <path
+        android:fillColor="#5EEAD4"
+        android:pathData="M54,65 C46,62 38,65 30,68 L30,52 C38,49 46,46 54,49 Z" />
+    <!-- Right Page -->
+    <path
+        android:fillColor="#99F6E4"
+        android:pathData="M54,65 C62,62 70,65 78,68 L78,52 C70,49 62,46 54,49 Z" />
+        
+    <!-- Book Base / Stand -->
+    <path
+        android:fillColor="#115E59"
+        android:pathData="M54,65 L36,75 L41,79 L54,71 L67,79 L72,75 Z" />
+</vector>
