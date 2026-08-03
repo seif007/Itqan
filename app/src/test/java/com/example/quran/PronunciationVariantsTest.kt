@@ -33,6 +33,13 @@ class PronunciationVariantsTest {
         return false
     }
 
+    @Test
+    fun `isWordMatchPlural requires exact slot count`() {
+        // Not a prefix match: 2 tokens must NOT match a 3-slot muqatta'at group.
+        assertFalse(isWordMatchPlural(listOf("الف", "لام"), listOf(listOf("الف"), listOf("لام"), listOf("ميم"))))
+        assertTrue(isWordMatchPlural(listOf("الف", "لام", "ميم"), listOf(listOf("الف"), listOf("لام"), listOf("ميم"))))
+    }
+
     // -------------------------------------------------------------------
     // Muqatta'at (disjointed letters)
     // -------------------------------------------------------------------
@@ -137,5 +144,19 @@ class PronunciationVariantsTest {
     @Test
     fun `مئة (dagger alif) accepts ميه spelling`() {
         assertTrue(spokenMatches("مِائَةِ", listOf("ميه")))
+    }
+
+    @Test
+    fun `muqattaat with maddah-above annotation still expand`() {
+        // S.2 v1 arrives as الٓمٓ (0627 0644 0653 0645 0653) — the maddah marks must
+        // strip so the key matches the plain "الم" table entry. Previously U+0653 was
+        // outside the strip range, so muqatta'at lookup NEVER fired for the API shape.
+        assertTrue(hasMuqattaatExpansion("الٓمٓ"))
+        assertTrue(spokenMatches("الٓمٓ", listOf("الف", "لام", "ميم")))
+        assertTrue(spokenMatches("ٱلٓمٓ", listOf("الف", "لام", "ميم")))  // wasla-marked
+        assertTrue(spokenMatches("الٓمٓ", listOf("الفلامميم")))         // concatenated
+        assertTrue(spokenMatches("كٓهيعٓصٓ", listOf("كاف", "ها", "يا", "عين", "صاد")))
+        assertTrue(spokenMatches("عٓسٓقٓ", listOf("عين", "سين", "قاف")))
+        assertTrue(spokenMatches("طسٓمٓ", listOf("طا", "سين", "ميم")))
     }
 }

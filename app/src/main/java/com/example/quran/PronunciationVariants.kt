@@ -132,9 +132,18 @@ private fun normalizeForSpokenForms(text: String): String {
     val sb = StringBuilder(text.length)
     for (i in 0 until text.length) {
         val c = text[i]
-        if (c in '\u064B'..'\u065F' || c == '\u0670' || c in '\u06D6'..'\u06ED' || c == '\uFEFF' || c == '۬' || c == 'ے' || c == 'ـ') continue
+        // Arabic harakat + dagger alif + maddah-above + honourific/Quranic annotation
+        // marks + tatweel + ZWJ/FWJ: all stripped so "الٓمٓ" and "الم" are identical.
+        if (c in '\u064B'..'\u065F' ||    // fathatan .. sukun .. hamza-above/below
+            c == '\u0670' ||               // dagger alif
+            c in '\u06D6'..'\u06ED' ||      // Quranic annotation signs
+            c == '\u0653' || c == '\u0654' || c == '\u0655' || // maddah-above + hamza marks
+            c == '\uFEFF' || c == '۬' || c == 'ے' || c == 'ـ' ||
+            c == '\u200D' || c == '\u200C' ||
+            c == '\u0671' && false  // wasl handled in the switch below
+        ) continue
         if (".,;:!?()[]{}'\"/\\-_".contains(c)) continue
-        if (c == '،' || c == '؛' || c == '،' || c == '؟') continue
+        if (c == '،' || c == '؛' || c == '؟') continue
         when (c) {
             '\u0622', '\u0623', '\u0625', '\u0671' -> sb.append('ا')
             '\u0629' -> sb.append('ه')
