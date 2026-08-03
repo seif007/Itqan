@@ -41,6 +41,8 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.quran.QuranApi
 import com.example.quran.SurahData
+import com.example.quran.formGroupsFor
+import com.example.quran.hasMuqattaatExpansion
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import kotlinx.coroutines.launch
@@ -1210,10 +1212,30 @@ fun isWordMatch(w1: String, w2: String): Boolean {
     if (w1 == w2) return true
     val length = maxOf(w1.length, w2.length)
     if (length <= 3) return w1 == w2
-    
+
     val dist = levenshtein(w1, w2)
     val maxDist = if (length <= 5) 1 else 2
     return dist <= maxDist
+}
+
+/** True when any of the accepted [candidates] (pronunciation variants) matches [spoken]. */
+fun isWordMatchAny(spoken: String, candidates: List<String>): Boolean {
+    for (c in candidates) {
+        if (isWordMatch(spoken, c)) return true
+    }
+    return false
+}
+
+/**
+ * True when an ordered group of spoken tokens (a muqatta'at letter-name sequence
+ * like الف لام ميم) matches [slots], each slot accepting any of its alternates.
+ */
+fun isWordMatchPlural(spokenTokens: List<String>, slots: List<List<String>>): Boolean {
+    if (spokenTokens.size != slots.size) return false
+    for (i in slots.indices) {
+        if (!isWordMatchAny(spokenTokens[i], slots[i])) return false
+    }
+    return true
 }
 
 enum class RecitationStatus {
@@ -1221,7 +1243,8 @@ enum class RecitationStatus {
     WRONG,       // Spoken word was wrong (substitution/mispronunciation)
     SKIPPED,     // Target word was skipped by the user
     PENDING,     // Haven't reached yet
-    TAJWEED_ERROR // Acoustic test failed for tajweed rule
+    TAJWEED_ERROR, // Acoustic test failed for tajweed rule
+    HINTED       // User tapped the Hint button for this word (counts as a mistake, but recitation advances)
 }
 
 data class SpokenWordTiming(
@@ -1702,15 +1725,18 @@ suspend fun decodeRecognizerAudio(context: Context, uri: Uri): FloatArray? = wit
 }
 
 suspend fun analyzeRecitationDetails(
-    spoken: List<String>, 
-    targetWordsOriginal: List<String>, 
+    spoken: List<String>,
+    targetWordsOriginal: List<String>,
     targetWordsNormalized: List<String>,
     riwayah: String,
     spokenTimings: List<SpokenWordTiming> = emptyList(),
     context: android.content.Context? = null,
     fullAudio: FloatArray? = null,
     recordingStartMs: Long = 0L,
-    recordingDurationMs: Long = 0L
+    recordingDurationMs: Long = 0L,
+    targetAllGroups: List<List<Any>>? = null,
+    hintedIndices: Collection<Int> = emptySet(),
+    isTajweedMode: Boolean = false
 ): List<WordAnalysis> {
     val result = ArrayList<WordAnalysis>()
     var targetIndex = 0
@@ -1729,6 +1755,26 @@ suspend fun analyzeRecitationDetails(
         kotlinx.coroutines.yield()
         val targetWordNorm = targetWordsNormalized[targetIndex]
         val targetWordOrig = targetWordsOriginal[targetIndex]
+
+        // Hint-matched words were revealed to the user (we injected their text into the
+        // transcript to advance the tracker). Treat them as CORRECT-in-position only so the
+        // recognizer keeps tracking; the HINTED status + mistake counting are applied in the
+        // post-pass below (and we deliberately skip the acoustic tajweed scoring for them,
+        // since scoring the injected silence would pop a false TAJWEED_ERROR).
+        val isHintedWord = hintedIndices.contains(targetIndex)
+        if (isHintedWord) {
+            result.add(WordAnalysis(
+                wordIndex = targetIndex,
+                text = targetWordOrig,
+                normalizedText = targetWordNorm,
+                status = RecitationStatus.CORRECT,
+                spokenText = if (spokenIndex < spoken.size) spoken[spokenIndex] else null,
+                tajweedRule = null  // never scored (see below)
+            ))
+            targetIndex++; spokenIndex++
+            continue
+        }
+
         val nextWordOrig = if (targetIndex + 1 < limit) targetWordsOriginal[targetIndex + 1] else null
         val rule = getTajweedRuleForWord(targetWordOrig, nextWordOrig, riwayah)
         
@@ -1737,11 +1783,31 @@ suspend fun analyzeRecitationDetails(
         }
         
         var matchInSpokenAhead = -1
+        var matchedSpokenAdvance = 1
+        val wordGroups = targetAllGroups?.getOrNull(targetIndex)
         for (i in spokenIndex until minOf(spokenIndex + 3, spoken.size)) {
-            if (isWordMatch(spoken[i], targetWordNorm)) {
-                matchInSpokenAhead = i
-                break
+            var matched = false
+            if (wordGroups != null) {
+                for (group in wordGroups) {
+                    if (group is List<*> && group.isNotEmpty() && group[0] is List<*>) {
+                        @Suppress("UNCHECKED_CAST")
+                        val slots = group as List<List<String>>
+                        if (i + slots.size <= spoken.size &&
+                            isWordMatchPlural((0 until slots.size).map { spoken[i + it] }, slots)) {
+                            matchInSpokenAhead = i; matchedSpokenAdvance = slots.size; matched = true; break
+                        }
+                    } else {
+                        @Suppress("UNCHECKED_CAST")
+                        if (isWordMatchAny(spoken[i], group as List<String>)) {
+                            matchInSpokenAhead = i; matchedSpokenAdvance = 1; matched = true; break
+                        }
+                    }
+                }
             }
+            if (!matched && isWordMatch(spoken[i], targetWordNorm)) {
+                matchInSpokenAhead = i; matchedSpokenAdvance = 1; matched = true
+            }
+            if (matched) break
         }
         
         if (matchInSpokenAhead != -1) {
@@ -1750,7 +1816,7 @@ suspend fun analyzeRecitationDetails(
             var tScore: Int? = null
             
             // Step 3 - Measure Audio: Validate Tajweed Acoustic properties on the user's REAL voice.
-            if (rule != null && hasRealAudio) {
+            if (rule != null && hasRealAudio && isTajweedMode && !isHintedWord) {
                 // Find timing by exact index, or fallback to the closest matched word text
                 val timing = spokenTimings.find { it.startIndex == matchInSpokenAhead }
                     ?: spokenTimings.findLast { isWordMatch(it.word, targetWordNorm) }
@@ -1849,7 +1915,7 @@ suspend fun analyzeRecitationDetails(
                 tajweedAcousticFeedback = acousticFeedback,
                 tajweedScore = tScore
             ))
-            spokenIndex = matchInSpokenAhead + 1
+            spokenIndex = matchInSpokenAhead + matchedSpokenAdvance
             targetIndex++
             continue
         }
@@ -1888,26 +1954,63 @@ suspend fun analyzeRecitationDetails(
         targetIndex++
     }
     
+    // Hint-matched words were revealed via the Hint button (we injected their text into the
+    // transcript so the tracker advanced past them). Positionally they are CORRECT so the loop
+    // keeps going, but the user never said them -- flip them to HINTED so the UI paints the
+    // tertiary/orange "hinted" styling and the mistake counter already counted 1 wrong. We do
+    // NOT score the tajweed head on their audio (it would be analysing injected silence).
+    if (hintedIndices.isNotEmpty()) {
+        for (i in result.indices) {
+            val w = result[i]
+            if (hintedIndices.contains(w.wordIndex) && w.status == RecitationStatus.CORRECT) {
+                result[i] = w.copy(status = RecitationStatus.HINTED)
+            }
+        }
+    }
+
     return result
 }
 
-suspend fun alignRecitation(spoken: List<String>, target: List<String>): Pair<Int, Boolean> {
+suspend fun alignRecitation(spoken: List<String>, target: List<String>, targetAllGroups: List<List<Any>>? = null): Pair<Int, Boolean> {
     var targetIndex = 0
     var spokenIndex = 0
     var hasError = false
-    
+
     while (targetIndex < target.size && spokenIndex < spoken.size) {
         kotlinx.coroutines.yield()
         val targetWord = target[targetIndex]
-        
+        val groups = targetAllGroups?.getOrNull(targetIndex)
+
+        // Match this target word against the next few spoken tokens. A muqatta'at word
+        // (الم -> الف لام ميم) may consume several consecutive spoken tokens, so we
+        // track how many tokens the match advanced (foundSpokenAdvance).
         var foundMatchIndexInSpoken = -1
+        var foundSpokenAdvance = 1
         for (i in spokenIndex until minOf(spokenIndex + 3, spoken.size)) {
-            if (isWordMatch(spoken[i], targetWord)) {
-                foundMatchIndexInSpoken = i
-                break
+            var matched = false
+            if (groups != null) {
+                for (group in groups) {
+                    if (group is List<*> && group.isNotEmpty() && group[0] is List<*>) {
+                        @Suppress("UNCHECKED_CAST")
+                        val slots = group as List<List<String>>
+                        if (i + slots.size <= spoken.size &&
+                            isWordMatchPlural((0 until slots.size).map { spoken[i + it] }, slots)) {
+                            foundMatchIndexInSpoken = i; foundSpokenAdvance = slots.size; matched = true; break
+                        }
+                    } else {
+                        @Suppress("UNCHECKED_CAST")
+                        if (isWordMatchAny(spoken[i], group as List<String>)) {
+                            foundMatchIndexInSpoken = i; foundSpokenAdvance = 1; matched = true; break
+                        }
+                    }
+                }
             }
+            if (!matched && isWordMatch(spoken[i], targetWord)) {
+                foundMatchIndexInSpoken = i; foundSpokenAdvance = 1; matched = true
+            }
+            if (matched) break
         }
-        
+
         var foundMatchIndexInTarget = -1
         if (foundMatchIndexInSpoken == -1) {
             val spokenWord = spoken[spokenIndex]
@@ -1918,10 +2021,10 @@ suspend fun alignRecitation(spoken: List<String>, target: List<String>): Pair<In
                 }
             }
         }
-        
+
         if (foundMatchIndexInSpoken != -1) {
             targetIndex++
-            spokenIndex = foundMatchIndexInSpoken + 1
+            spokenIndex = foundMatchIndexInSpoken + foundSpokenAdvance
             hasError = false
         } else if (foundMatchIndexInTarget != -1) {
             targetIndex = foundMatchIndexInTarget + 1
@@ -1932,11 +2035,11 @@ suspend fun alignRecitation(spoken: List<String>, target: List<String>): Pair<In
             spokenIndex++
         }
     }
-    
+
     if (spokenIndex < spoken.size) {
         hasError = true
     }
-    
+
     return Pair(targetIndex, hasError)
 }
 
@@ -2052,6 +2155,12 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // timestamp in the state lets Compose see two consecutive errors on the same word as a
     // fresh trigger. LaunchedEffect below auto-clears after 4 s.
     var latestTajweedPopup by remember { mutableStateOf<Pair<String, Int>?>(null) }  // (rule, wordIndex)
+
+    // Hint tracking for Memorize: the global word indices the user revealed via the Hint
+    // button. Cleared on surah/range change and on Repeat/Restart. The analysis pass flips
+    // any such word's positional CORRECT to HINTED so the UI can paint it with the tertiary
+    // "hinted" styling while the mistake counter already charged 1 wrong.
+    val hintedIndices = remember { mutableStateListOf<Int>() }
     
     val acousticRmsTracker = remember { floatArrayOf(0f) }
     var currentWordCount by remember { mutableStateOf(0) }
@@ -2103,6 +2212,14 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     val targetOrig = remember(viewModel.ayahs) {
         viewModel.ayahs.flatMap { it.words }
     }
+    // Pronunciation-aware target representation: for each display word, the list of
+    // acceptable spoken FORM GROUPS (muqatta'at expand into an ordered slot list; dagger-alif
+    // words get their alternate single-token forms). alignRecitation and analyzeRecitationDetails
+    // consult this alongside targetNorm so utterances like "ألف لام ميم" for "الم" or "هذا" for
+    // "هَٰذَا" match correctly instead of flagging false WRONG/SKIPPED.
+    val targetFormGroups = remember(viewModel.ayahs) {
+        viewModel.ayahs.flatMap { it.words }.map { com.example.quran.formGroupsFor(it) }
+    }
 
     // State-reset on target change. Changing the surah or the ayah pickers at ~3874/3881 reloads
     // `viewModel.ayahs` and so flips `targetNorm`/`targetOrig` below, which would normally
@@ -2135,6 +2252,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         recognizedAudioStartMs = System.currentTimeMillis()
         alignment = Pair(0, false)
         detailedAnalysis = emptyList()
+        hintedIndices.clear()
         latestTajweedPopup = null
         errorMessage = null
         // Cancel is async: one more onPartial/onResults with the OLD whole-transcript can still
@@ -2164,7 +2282,11 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // re-analysis pass. Without `recognizedAudio` here, a Memorize+Tajweed session on a phone
     // that can't decode the SpeechRecognizer bundle would record fine but never score any
     // words, silently disabling the tajweed detector (matches the user's report).
-    LaunchedEffect(spokenText, currentTab, recitationMode, targetNorm, targetOrig, recognizedAudioUri, recognizedAudio) {
+    //
+    // `hintedIndicesSnapshot` is a plain List copy of the hint set, so Compose re-runs the effect
+    // when the hint button adds an index (the SnapshotStateSet itself is NOT a stable key).
+    val hintedIndicesSnapshot = hintedIndices.toList()
+    LaunchedEffect(spokenText, currentTab, recitationMode, targetNorm, targetOrig, targetFormGroups, recognizedAudioUri, recognizedAudio, hintedIndicesSnapshot) {
         if (currentTab != "Memorize") {
             alignment = Pair(targetOrig.size, false)
             detailedAnalysis = emptyList()
@@ -2174,8 +2296,8 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 val spoken = spokenText.split(Regex("\\s+"))
                     .filter { it.isNotBlank() }
                     .map { normalizeForComparison(it, viewModel.riwayah) }
-                
-                val align = alignRecitation(spoken, targetNorm)
+
+                val align = alignRecitation(spoken, targetNorm, targetFormGroups)
                 val analysis = analyzeRecitationDetails(
                     spoken,
                     targetOrig,
@@ -2185,7 +2307,10 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     context,
                     fullAudio = recognizedAudio,
                     recordingStartMs = recognizedAudioStartMs,
-                    recordingDurationMs = (recognizedAudio?.size ?: 0) * 1000L / 16000
+                    recordingDurationMs = (recognizedAudio?.size ?: 0) * 1000L / 16000,
+                    targetAllGroups = targetFormGroups,
+                    hintedIndices = hintedIndices,
+                    isTajweedMode = recitationMode == "Tajweed"
                 )
                 
                 var newMatchedWordCount = 0
@@ -2198,9 +2323,10 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // and skipped words still pause as before -- they are detection failures that
                 // would otherwise silently let the user babble ahead.
                 for (word in analysis) {
-                    if (word.status == RecitationStatus.CORRECT || word.status == RecitationStatus.TAJWEED_ERROR) {
-                        // TAJWEED_ERROR is always a "correct tarteel hint" -- it only matters via
-                        // the separate popup below, not via the alignment.hasError flow.
+                    if (word.status == RecitationStatus.CORRECT || word.status == RecitationStatus.TAJWEED_ERROR || word.status == RecitationStatus.HINTED) {
+                        // TAJWEED_ERROR and HINTED both continue advancing -- TAJWEED_ERROR only
+                        // matters via its popup, and HINTING is the user's own reveal, so we must
+                        // not pause waiting for a word they'll never need to say.
                         newMatchedWordCount++
                     } else if (word.status == RecitationStatus.WRONG || word.status == RecitationStatus.SKIPPED) {
                         newHasError = true
@@ -4212,11 +4338,19 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             IconButton(onClick = {
                                 currentContentAyah?.let { ayah ->
                                     val startIdx = ayah.wordStartIndex
+                                    val endIdx = ayah.wordStartIndex + ayah.words.size
                                     val prevWords = viewModel.ayahs
                                         .filter { it.wordStartIndex < startIdx }
                                         .flatMap { it.words }
                                     finalSpokenText = prevWords.joinToString(" ")
                                     partialSpokenText = ""
+                                    // Drop any hint-charges for words in this ayah: we're re-reading
+                                    // it, so those injected words must come out of the transcript too.
+                                    // (Avoid SnapshotStateSet#removeAll-with-predicate overload
+                                    // ambiguity by collecting into an IntRange first.)
+                                    val hintRange = startIdx until endIdx
+                                    val staleHints = hintedIndices.filter { it in hintRange }
+                                    hintedIndices.removeAll(staleHints)
                                     hintActive = false
                                     if (isListening) {
                                         try { speechRecognizer?.stopListening(); isListening = false } catch (e: Throwable) {}
@@ -4227,25 +4361,38 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                 Icon(Icons.Default.RepeatOne, contentDescription = "Repeat Current Ayah", tint = MaterialTheme.colorScheme.secondary)
                             }
                             IconButton(onClick = {
-                                hintActive = true
-                                // Hint -> counts as 1 wrong word on the active recitation's scope,
-                                // so it only advances goals scoped to the active surah/range (and
-                                // unscoped goals, which still accept every recitation).
-                                val activeSurah = viewModel.selectedSurah?.number ?: 0
-                                viewModel.triggerGoalRealProgress(
-                                    recitedAyahsDelta = 0,
-                                    wrongDelta = 1,
-                                    surahNumber = activeSurah,
-                                    rangeStart = viewModel.rangeStart,
-                                    rangeEnd = viewModel.rangeEnd
-                                )
+                                // Reveal the current word AND advance past it: inject the target
+                                // word into the recognizer's transcript so the alignment engine
+                                // matches it CORRECT-in-position. The analysis post-pass flips it
+                                // to HINTED so the UI paints tertiary/orange styling, and the
+                                // mistake counter below charges 1 wrong-word. This fulfils "the
+                                // app expects the user to read the next word" while still charging
+                                // the mistake for not reciting it oneself.
+                                val idx: Int = matchedWordCount
+                                if (idx < targetOrig.size) {
+                                    hintedIndices.add(idx)
+                                    finalSpokenText = "$finalSpokenText ${targetOrig[idx]}".trim()
+                                    hintActive = true
+                                    // Hint -> counts as 1 wrong word on the active recitation's scope,
+                                    // so it only advances goals scoped to the active surah/range (and
+                                    // unscoped goals, which still accept every recitation).
+                                    val activeSurah = viewModel.selectedSurah?.number ?: 0
+                                    viewModel.triggerGoalRealProgress(
+                                        recitedAyahsDelta = 0,
+                                        wrongDelta = 1,
+                                        surahNumber = activeSurah,
+                                        rangeStart = viewModel.rangeStart,
+                                        rangeEnd = viewModel.rangeEnd
+                                    )
+                                }
                             }) {
                                 Icon(Icons.Default.Lightbulb, contentDescription = "Hint", tint = MaterialTheme.colorScheme.tertiary)
                             }
-                            IconButton(onClick = { 
+                            IconButton(onClick = {
                                 finalSpokenText = ""
                                 partialSpokenText = ""
                                 hintActive = false
+                                hintedIndices.clear()
                                 if (isListening) {
                                     try { speechRecognizer?.stopListening(); isListening = false } catch (e: Throwable) {}
                                     errorMessage = null
@@ -4366,7 +4513,21 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                         val wordTajweed = tajweedWords?.get(index)
                                         
                                         if (globalWordIndex < matchedWordCount) {
-                                            if (wordTajweed != null) {
+                                            // Words the user revealed via Hint keep the tertiary "hinted"
+                                            // styling (orange underline) even after we've advanced past
+                                            // them -- the user never actually said them, and the mistake
+                                            // counter already charged 1 wrong.
+                                            val isHintedWord = detailedAnalysis.getOrNull(globalWordIndex)?.status == RecitationStatus.HINTED
+                                            if (isHintedWord) {
+                                                withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.tertiary, fontWeight = FontWeight.Bold, textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline, background = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.3f))) {
+                                                    if (wordTajweed != null) {
+                                                        append(wordTajweed)
+                                                        append(" ")
+                                                    } else {
+                                                        append("$word ")
+                                                    }
+                                                }
+                                            } else if (wordTajweed != null) {
                                                 append(wordTajweed)
                                                 append(" ")
                                             } else {
