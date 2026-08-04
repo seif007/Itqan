@@ -2271,8 +2271,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             // plus it would no-op the recognizer while hasError also fails sane -- the two things
             // that originally made changing the range fire phantom mistakes.)
             try { speechRecognizer?.stopListening() } catch (e: Throwable) {}
-            // If Memorize+Tajweed had our own AudioRecord running (the no-BUNDLE_AUDIO fallback),
-            // tear it down too so its buffer doesn't bleed into the new range's analysis pass.
+            // Defensive: a parallel AudioRecord should never be running in Memorize (single-mic
+            // invariant), but if a future caller ever starts one, stop it here so its buffer
+            // can't bleed into the new range's analysis pass.
             try { if (tajweedRecorder.running) tajweedRecorder.stop() } catch (e: Throwable) {}
             tajweedRecordedAudio = null
             tajweedRecordingDurationMs = 0
@@ -2571,17 +2572,19 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     }
                 } catch (e: Throwable) {
                     android.util.Log.e("RecognizerAudio", "onResults audio decode failed", e)
-                    // If BUNDLE_AUDIO_SOURCE is undecodable on this device, the post-stop
-                    // hook in the FAB (scroll down) fires a short re-record via
-                    // tajweedRecorder and feeds that buffer into `recognizedAudio`. We do
-                    // NOT do that here because the recognizer still holds the mic here.
+                    // No parallel-AudioRecord fallback: starting a second mic alongside the
+                    // recognizer collides on devices like the Samsung A05s and stops partial
+                    // transcripts from arriving (word tracking breaks). If the bundle can't be
+                    // decoded on this device, the tajweed score is simply skipped -- recitation
+                    // tracking still works because it only needs the transcript.
                 }
             }
-            // When audioUri is null (Samsung A05s's common case) we previously fell back to a
-            // parallel AudioRecord snapshot -- that collides with the recognizer's mic on the
-            // A05s and stops partial transcripts from arriving (the regression already hit
-            // in user testing: "no word display"). We rely solely on the post-stop re-record
-            // hook below to score Memorize+Tajweed, so single-mic invariant stays intact.
+            // When audioUri is null (Samsung A05s's common case) the per-word tajweed verdict
+            // is skipped silently. We deliberately do NOT start a parallel AudioRecord here or
+            // in the FAB stop branch: two simultaneous mic clients on the A05s starve the
+            // SpeechRecognizer of partial results and word-tracking breaks -- which is the exact
+            // regression the user hit twice ("no word display in memorize + tajweed"). The
+            // single-mic invariant stays intact here.
             onState?.invoke(false)
         }
         override fun onPartialResults(results: android.os.Bundle?) {
@@ -2719,18 +2722,13 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     recognizedAudioUri = null
                     recognizedAudio = null
                     recognizedAudioStartMs = System.currentTimeMillis()
-                    // Same ordering as the FAB: own-audio capture starts BEFORE the
-                    // SpeechRecognizer on the A05s (parallel-with-second breaks partial
-                    // transcripts), so the AudioRecord goes first in Memorize+Tajweed.
-                    if (recitationMode == "Tajweed") {
-                        viewModel.preloadTajweedModel()
-                        tajweedRecordingStartMs = recognizedAudioStartMs
-                        try { tajweedRecorder.start() } catch (e: Throwable) {
-                            android.util.Log.e("MemTajweed", "own-audio capture start failed", e)
-                        }
-                    }
                     isListening = true
                     startListening(speechRecognizer!!, context.packageName, onError = { errorMessage = if(it.isEmpty()) null else it; isListening = false })
+                    // Same single-mic invariant as the FAB: no parallel AudioRecord here.
+                    // See the FAB start-listening branch for the A05s single-mic rationale.
+                    if (recitationMode == "Tajweed") {
+                        viewModel.preloadTajweedModel()
+                    }
                 } else {
                     errorMessage = "Speech Recognizer not available"
                 }
@@ -4869,25 +4867,14 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             val matchedWordsList = targetOrig.take(matchedWordCount)
                             finalSpokenText = matchedWordsList.joinToString(" ")
                             partialSpokenText = ""
-                            // Memorize+Tajweed stop: pull our own AudioRecord buffer into
-                            // `recognizedAudio` so the analysis pass actually scores the user's
-                            // real voice. The SpeechRecognizer's BUNDLE_AUDIO_SOURCE is
-                            // unreliable on many devices (Samsung A05s in particular) and the
-                            // onResults hook above has the same fallback -- this one fires
-                            // reliably when the stop-listening tap hands back no audio bundle,
-                            // so the user's tajweed is still scored.
-                            if (tajweedRecorder.running) {
-                                try {
-                                    val selfAudio = tajweedRecorder.stop()
-                                    if (selfAudio.size >= 256 && recognizedAudio == null) {
-                                        recognizedAudio = selfAudio
-                                        tajweedRecordedAudio = selfAudio
-                                        tajweedRecordingDurationMs = (selfAudio.size * 1000L) / 16000
-                                    }
-                                } catch (e: Throwable) {
-                                    android.util.Log.e("MemTajweed", "own-audio stop failed", e)
-                                }
-                            }
+                            // Reminder: Memorize+Tajweed does NOT run our own AudioRecord here.
+                            // Two simultanous mic clients on the user's Samsung A05s starve the
+                            // SpeechRecognizer of partial results (matchedWordCount never
+                            // advances and the user sees no word-tracking happening), so we rely
+                            // solely on whatever BUNDLE_AUDIO_SOURCE the recognizer hands back in
+                            // onResults above. Tajweed scoring is best-effort on devices that do
+                            // populate that bundle -- on the A05s it may simply be missing, which
+                            // means no per-word tajweed verdict but recitation-tracking still works.
                         } catch (e: Throwable) {
                             errorMessage = "Error stopping recognition"
                         }
@@ -4902,23 +4889,22 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                     recognizedAudioUri = null
                                     recognizedAudio = null
                                     recognizedAudioStartMs = System.currentTimeMillis()
-                                    // Memorize+Tajweed acoustic capture: the recognizer's
-                                    // BUNDLE_AUDIO_SOURCE is unreliable on Samsung A05s, so we
-                                    // capture OUR OWN audio via tajweedRecorder for the analyzer.
-                                    // Order matters on the A05s: starting the AudioRecord FIRST
-                                    // and the SpeechRecognizer SECOND works (the Tajweed Rules
-                                    // coach does exactly this), but reversing the order makes
-                                    // partial transcripts stop arriving -- so the recorder must
-                                    // start BEFORE `startListening`.
-                                    if (recitationMode == "Tajweed") {
-                                        viewModel.preloadTajweedModel()
-                                        tajweedRecordingStartMs = recognizedAudioStartMs
-                                        try { tajweedRecorder.start() } catch (e: Throwable) {
-                                            android.util.Log.e("MemTajweed", "own-audio capture start failed", e)
-                                        }
-                                    }
                                     isListening = true
                                     startListening(speechRecognizer!!, context.packageName, onError = { msg -> errorMessage = if(msg.isEmpty()) null else msg; isListening = false })
+                                    // Memorize+Tajweed does NOT run a second mic alongside the
+                                    // SpeechRecognizer. The user's Samsung A05s reports that two
+                                    // simultanous mic clients make word-tracking fail entirely -- no
+                                    // partial results arrive, matchedWordCount stays at 0 and the
+                                    // user sees "nothing happens". The Tajweed Rules coach tab works
+                                    // because it uses the AudioRecord ALONE (no SpeechRecognizer);
+                                    // that approach cannot be copied here because Memorize genuinely
+                                    // needs the live transcript to track word position. The tajweed
+                                    // score therefore depends on BUNDLE_AUDIO_SOURCE arriving via
+                                    // onResults -- on devices that don't populate it, scoring is
+                                    // simply skipped, which is the trade-off the original design made.
+                                    if (recitationMode == "Tajweed") {
+                                        viewModel.preloadTajweedModel()
+                                    }
                                 } else {
                                     errorMessage = "Speech Recognizer not available"
                                 }
@@ -5227,16 +5213,6 @@ class MicRecorderController {
         thread = null
         return data.copyOf(size)
     }
-
-    /**
-     * Live snapshot of the in-progress capture (does not stop recording). Used by the
-     * Memorize+Tajweed acoustic fallback: when the SpeechRecognizer never delivers its
-     * BUNDLE_AUDIO_SOURCE (common on Samsung A05s), we hand back the buffer our own
-     * AudioRecord has built so far, so the per-word tajweed scorer still has real audio
-     * to chew on instead of silently behaving like Tarteel.
-     */
-    @Synchronized
-    fun snapshot(): FloatArray = data.copyOf(size)
 }
 
 private fun startListening(
