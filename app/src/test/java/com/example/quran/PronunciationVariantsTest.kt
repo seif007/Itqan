@@ -159,4 +159,15 @@ class PronunciationVariantsTest {
         assertTrue(spokenMatches("عٓسٓقٓ", listOf("عين", "سين", "قاف")))
         assertTrue(spokenMatches("طسٓمٓ", listOf("طا", "سين", "ميم")))
     }
+
+    @Test
+    fun `reciter says the segmented letter names for full ayah shape end-to-end`() {
+        // The realistic case the device-failures complained about: a real reciter
+        // pronounces S.2 v1 as "alif lam meem" -- this proves the slot match holds
+        // against the API's maddah-marked shape and the user is NOT flagged wrong.
+        assertTrue(spokenMatches("الٓمٓ", listOf("الف", "لام", "ميم")))
+        assertTrue(spokenMatches("الٓمٓ", listOf("الف", "لم", "ميم")))
+        assertTrue(spokenMatches("الٓمٓ", listOf("الفلامميم")))
+        assertTrue(spokenMatches("الٓمٓ", listOf("الفلمميم")))
+    }
 }

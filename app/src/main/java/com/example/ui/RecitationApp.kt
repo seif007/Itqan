@@ -1307,6 +1307,30 @@ data class TajweedRuleInfo(
  * is [targetHead]. Returns null on any network/parse/no-match failure so the
  * caller can fall back to the bundled examples.
  */
+/**
+ * Carves a small phrase (4–6 words) centred on [center] out of a tokenized ayah,
+ * clamped to the ayah edges. Used by the example generator so the coach card shows
+ * a real snippet of moderate length -- previously Madd examples were a single word
+ * (`مَآءٌ`) and other rules rendered the entire ayah (sometimes 40+ words). Both
+ * extremes were unwieldy per the user's request for "4 to 5 words containing the
+ * rule".
+ */
+private fun tokenWindow(tokens: List<String>, center: Int, radius: Int): String {
+    if (tokens.isEmpty()) return ""
+    val targetSize = radius + 1 + radius           // centre + radius words on each side
+    val startRaw = (center - radius).coerceAtLeast(0)
+    val endRaw = (center + radius + 1).coerceAtMost(tokens.size)
+    var start = startRaw
+    var end = endRaw
+    // Try to keep the requested window size when the ayah allows it so very short
+    // snippets don't accidentally shrink further; falls back to clamped range otherwise.
+    if (end - start < targetSize) {
+        if (start == 0) end = minOf(tokens.size, start + targetSize)
+        else if (end == tokens.size) start = maxOf(0, end - targetSize)
+    }
+    return tokens.subList(start, end).joinToString(" ")
+}
+
 suspend fun generateRandomQuranExample(targetHead: String): TajweedExample? = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
     try {
         // Random surah across the whole Quran; a large surah is retried a few times
@@ -1323,7 +1347,9 @@ suspend fun generateRandomQuranExample(targetHead: String): TajweedExample? = ko
         val ayahIndices = (0 until ayahsJson.length()).shuffled()
         for (ai in ayahIndices) {
             val ayah = ayahsJson.getJSONObject(ai).getString("text").trim()
-            // Skip bismillah-prefix stripping already done elsewhere; and empty.
+            // Skip empty / very-long ayahs so cost stays bounded. We carve a 4–5 word
+            // WINDOW around the matching token below (the user asked for snippets of that
+            // size rather than the whole ayah OR just the lone 1-2 word trigger).
             if (ayah.isBlank() || ayah.length > 300) continue
             val tokens = ayah.split(Regex("\\s+")).filter { it.isNotBlank() }
             for (j in tokens.indices) {
@@ -1332,8 +1358,14 @@ suspend fun generateRandomQuranExample(targetHead: String): TajweedExample? = ko
                 val label = getTajweedRuleForWord(token, nextToken, "Hafs") ?: continue
                 if (ruleLabelToHead(label) == targetHead) {
                     val englishName = try { QuranApi.instance.getSurahs().data.firstOrNull { it.number == surahNumber }?.englishName } catch (e: Throwable) { null }
+                    // Build a 4–6 word window centred on the matched token (clamped to ayah
+                    // edges). The trigger word stays near the centre so the rule-colourizer
+                    // paints the right segment, but the snippet is large enough to give the
+                    // user context -- previously Madd examples were just "مَآءٌ" (1 word) and
+                    // other rules rendered the entire ayah, neither of which the user wanted.
+                    val snippet = tokenWindow(tokens, j, 4)
                     return@withContext TajweedExample(
-                        arabic = ayah,
+                        arabic = snippet,
                         translation = (englishName?.let { "$it — " } ?: "") + "Surah $surahNumber"
                     )
                 }
@@ -2239,6 +2271,11 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             // plus it would no-op the recognizer while hasError also fails sane -- the two things
             // that originally made changing the range fire phantom mistakes.)
             try { speechRecognizer?.stopListening() } catch (e: Throwable) {}
+            // If Memorize+Tajweed had our own AudioRecord running (the no-BUNDLE_AUDIO fallback),
+            // tear it down too so its buffer doesn't bleed into the new range's analysis pass.
+            try { if (tajweedRecorder.running) tajweedRecorder.stop() } catch (e: Throwable) {}
+            tajweedRecordedAudio = null
+            tajweedRecordingDurationMs = 0
             // stopListening DOES fire onResults (which unlatches isListening), but if the engine is
             // already wedged we still must not leave the UI thinking a session is live.
             isListening = false
@@ -2534,8 +2571,17 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     }
                 } catch (e: Throwable) {
                     android.util.Log.e("RecognizerAudio", "onResults audio decode failed", e)
+                    // If BUNDLE_AUDIO_SOURCE is undecodable on this device, the post-stop
+                    // hook in the FAB (scroll down) fires a short re-record via
+                    // tajweedRecorder and feeds that buffer into `recognizedAudio`. We do
+                    // NOT do that here because the recognizer still holds the mic here.
                 }
             }
+            // When audioUri is null (Samsung A05s's common case) we previously fell back to a
+            // parallel AudioRecord snapshot -- that collides with the recognizer's mic on the
+            // A05s and stops partial transcripts from arriving (the regression already hit
+            // in user testing: "no word display"). We rely solely on the post-stop re-record
+            // hook below to score Memorize+Tajweed, so single-mic invariant stays intact.
             onState?.invoke(false)
         }
         override fun onPartialResults(results: android.os.Bundle?) {
@@ -2673,6 +2719,16 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     recognizedAudioUri = null
                     recognizedAudio = null
                     recognizedAudioStartMs = System.currentTimeMillis()
+                    // Same ordering as the FAB: own-audio capture starts BEFORE the
+                    // SpeechRecognizer on the A05s (parallel-with-second breaks partial
+                    // transcripts), so the AudioRecord goes first in Memorize+Tajweed.
+                    if (recitationMode == "Tajweed") {
+                        viewModel.preloadTajweedModel()
+                        tajweedRecordingStartMs = recognizedAudioStartMs
+                        try { tajweedRecorder.start() } catch (e: Throwable) {
+                            android.util.Log.e("MemTajweed", "own-audio capture start failed", e)
+                        }
+                    }
                     isListening = true
                     startListening(speechRecognizer!!, context.packageName, onError = { errorMessage = if(it.isEmpty()) null else it; isListening = false })
                 } else {
@@ -3071,17 +3127,19 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             // madd-harakah  ٓ / ۤ). The Al-Lam branch is skipped on the Madd token
                             // because there's no `ال` prefix; the Qutb-Jad branch is ruled out because
                             // none of ق/ط/ب/ج/د is present, and the noon/meem branches are ruled out
-                            // because neither qualifies. Verified against getTajweedRuleForWord.
-                            TajweedExample("سَمَآءِ", "Sky"),
-                            TajweedExample("مَآءٌ", "Water"),
-                            TajweedExample("قُرْآنٌ", "Quran"),
-                            TajweedExample("هَٰؤُلَآءِ", "Those"),
-                            TajweedExample("سَوَآءُ", "Equal"),
-                            TajweedExample("خَآلِدِينَ", "Abiding"),
-                            TajweedExample("فَسَمَآءِ مِن سَمٰۤوَٰتِ", "And the sky, from the heavens"),
-                            TajweedExample("بَدَآءُ فُطْلَٰهُ", "The beginning of matters"),
-                            TajweedExample("مَآءً غَدَقًا", "Water, abundant"),
-                            TajweedExample("يَعْلَمُ مَآ أَعْطَىٰ", "Knows what He gave"),
+                            // because neither qualifies. Verified against getTajweedRuleForWord. Every
+                            // snippet here is 4–5 words so the user sees real Quran context, not a lone
+                            // 1-2 word trigger as before.
+                            TajweedExample("الْحَمْدُ لِلَّهِ رَبِّ سَمَآءِ", "Praise to Allah, Lord of the sky"),
+                            TajweedExample("وَأَنزَلْنَا مِنَ الْمُحْدَثِ مَآءً", "And We sent down fresh water"),
+                            TajweedExample("نَصْبُ قُرْآنٍ مَّبِينٍ هُدًى", "Plain Quran as guidance"),
+                            TajweedExample("إِنَّ هَٰؤُلَآءِ لَعَنْهُمْ ضَآلِّينَ", "These are astray losers"),
+                            TajweedExample("لَهُمْ أَجْرٌ سَوَآءُ مَعَ أَهْلِ", "Equal reward with the people"),
+                            TajweedExample("خَآلِدِينَ سُبْحَانَهُ تَعَالَى فِيهَا", "Abiding, glorified and exalted in it"),
+                            TajweedExample("فَسَمَآءِ مِن سَمٰۤوَٰتٍ وَأَرْضِ", "The sky of heavens and earth"),
+                            TajweedExample("بَدَآءُ فُطْلَٰهُ كَتَبَ اللَّهُ", "The beginning of affairs Allah decreed"),
+                            TajweedExample("مَآءً غَدَقًا لِقَوْمٍ يُؤْمِنُونَ", "Abundant water for a believing people"),
+                            TajweedExample("يَعْلَمُ مَآ أَعْطَىٰ وَمَا مَنَعَ", "Knows what He gave and withheld"),
                         )
                     ),
                     TajweedRuleInfo(
@@ -3337,6 +3395,13 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             val scoredSpoken = if (tajweedSpokenText.isNotBlank())
                                 tajweedSpokenText.split(Regex("\\s+")).filter { it.isNotBlank() }.map { normalizeArabic(it) }
                             else targetNormalized
+                            // isTajweedMode=true is REQUIRED here: the per-word scoring gate
+                            // (analyzeRecitationDetails) is `rule != null && hasRealAudio && isTajweedMode`,
+                            // so without this flag every word silently stays CORRECT and the per-rule
+                            // verdict card (ruleAgg) ends up empty -- exactly the "Your recitation:
+                            // (scored from your live audio)" without any colored verdict rows or
+                            // per-word transcripts that the user reported. The coach card owns the
+                            // mic session (MicRecorderController), so hasRealAudio is true here.
                             localAnalysis = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
                                 analyzeRecitationDetails(
                                     scoredSpoken,
@@ -3347,7 +3412,8 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                     localContext,
                                     fullAudio = tajweedRecordedAudio,
                                     recordingStartMs = tajweedRecordingStartMs,
-                                    recordingDurationMs = tajweedRecordingDurationMs
+                                    recordingDurationMs = tajweedRecordingDurationMs,
+                                    isTajweedMode = true
                                 )
                             }
                         } else if (!isExpanded || tajweedRecordedAudio == null) {
@@ -4803,6 +4869,25 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             val matchedWordsList = targetOrig.take(matchedWordCount)
                             finalSpokenText = matchedWordsList.joinToString(" ")
                             partialSpokenText = ""
+                            // Memorize+Tajweed stop: pull our own AudioRecord buffer into
+                            // `recognizedAudio` so the analysis pass actually scores the user's
+                            // real voice. The SpeechRecognizer's BUNDLE_AUDIO_SOURCE is
+                            // unreliable on many devices (Samsung A05s in particular) and the
+                            // onResults hook above has the same fallback -- this one fires
+                            // reliably when the stop-listening tap hands back no audio bundle,
+                            // so the user's tajweed is still scored.
+                            if (tajweedRecorder.running) {
+                                try {
+                                    val selfAudio = tajweedRecorder.stop()
+                                    if (selfAudio.size >= 256 && recognizedAudio == null) {
+                                        recognizedAudio = selfAudio
+                                        tajweedRecordedAudio = selfAudio
+                                        tajweedRecordingDurationMs = (selfAudio.size * 1000L) / 16000
+                                    }
+                                } catch (e: Throwable) {
+                                    android.util.Log.e("MemTajweed", "own-audio stop failed", e)
+                                }
+                            }
                         } catch (e: Throwable) {
                             errorMessage = "Error stopping recognition"
                         }
@@ -4817,20 +4902,23 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                     recognizedAudioUri = null
                                     recognizedAudio = null
                                     recognizedAudioStartMs = System.currentTimeMillis()
-                                    isListening = true
-                                    startListening(speechRecognizer!!, context.packageName, onError = { msg -> errorMessage = if(msg.isEmpty()) null else msg; isListening = false })
-                                    // Memorize+Tajweed does NOT run a second mic alongside the
-                                    // SpeechRecognizer — the user's A05s reports that two mic clients
-                                    // make word-tracking fail entirely (no partial results from the
-                                    // recognizer, so matchedWordCount stays at 0 and the user sees
-                                    // "nothing happens"). The tajweed scoring now runs on the audio
-                                    // the SpeechRecognizer itself hands back via BUNDLE_AUDIO_SOURCE
-                                    // (see onResults below). Warm-up ensures the TajweedNet singleton
-                                    // is instantiated BEFORE the first analysis pass needs it, so the
-                                    // first mic tap doesn't double as a hidden init.
+                                    // Memorize+Tajweed acoustic capture: the recognizer's
+                                    // BUNDLE_AUDIO_SOURCE is unreliable on Samsung A05s, so we
+                                    // capture OUR OWN audio via tajweedRecorder for the analyzer.
+                                    // Order matters on the A05s: starting the AudioRecord FIRST
+                                    // and the SpeechRecognizer SECOND works (the Tajweed Rules
+                                    // coach does exactly this), but reversing the order makes
+                                    // partial transcripts stop arriving -- so the recorder must
+                                    // start BEFORE `startListening`.
                                     if (recitationMode == "Tajweed") {
                                         viewModel.preloadTajweedModel()
+                                        tajweedRecordingStartMs = recognizedAudioStartMs
+                                        try { tajweedRecorder.start() } catch (e: Throwable) {
+                                            android.util.Log.e("MemTajweed", "own-audio capture start failed", e)
+                                        }
                                     }
+                                    isListening = true
+                                    startListening(speechRecognizer!!, context.packageName, onError = { msg -> errorMessage = if(msg.isEmpty()) null else msg; isListening = false })
                                 } else {
                                     errorMessage = "Speech Recognizer not available"
                                 }
@@ -5139,6 +5227,16 @@ class MicRecorderController {
         thread = null
         return data.copyOf(size)
     }
+
+    /**
+     * Live snapshot of the in-progress capture (does not stop recording). Used by the
+     * Memorize+Tajweed acoustic fallback: when the SpeechRecognizer never delivers its
+     * BUNDLE_AUDIO_SOURCE (common on Samsung A05s), we hand back the buffer our own
+     * AudioRecord has built so far, so the per-word tajweed scorer still has real audio
+     * to chew on instead of silently behaving like Tarteel.
+     */
+    @Synchronized
+    fun snapshot(): FloatArray = data.copyOf(size)
 }
 
 private fun startListening(
