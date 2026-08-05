@@ -567,7 +567,7 @@ class MainViewModel(application: Application) : androidx.lifecycle.AndroidViewMo
                         if (qalunAyahsForSurah.isEmpty()) {
                             isQalunFallback = true
                             processedSurahAyahs = rawAyahs.map { ayah ->
-                                val words = ayah.text.split(Regex("\\s+")).filter { it.isNotBlank() }
+                                val words = splitAyahWords(ayah.text)
                                 AyahDisplay(
                                     ayahId = ayah.numberInSurah,
                                     text = ayah.text,
@@ -579,15 +579,25 @@ class MainViewModel(application: Application) : androidx.lifecycle.AndroidViewMo
                             }
                         } else {
                             var hafsIndex = 0
-                            val hafsWords = rawAyahs.flatMap { it.text.split(Regex("\\s+")).filter { w -> w.isNotBlank() } }
-                            val hafsAyahIds = rawAyahs.flatMap { ayah -> ayah.text.split(Regex("\\s+")).filter { it.isNotBlank() }.map { ayah.numberInSurah } }
+                            // Both arrays MUST stay index-aligned (hafsWords[i] <-> hafsAyahIds[i]);
+                            // both use the same splitAyahWords helper so standalone Quranic annotation
+                            // tokens (ۛ etc.) are dropped in lock-step.
+                            val hafsWords = rawAyahs.flatMap { splitAyahWords(it.text) }
+                            val hafsAyahIds = rawAyahs.flatMap { ayah -> splitAyahWords(ayah.text).map { ayah.numberInSurah } }
                             val hafsAudios = rawAyahs.associate { it.numberInSurah to it.audio }
                             
                             processedSurahAyahs = qalunAyahsForSurah.map { qAyahJson ->
                                 val meta = qAyahJson.getJSONObject("meta")
                                 val ayahId = meta.getInt("ayah_qalun")
                                 val wordsArray = meta.getJSONArray("words_uthmani")
-                                val words = (0 until wordsArray.length()).map { wordsArray.getString(it) }
+                                // The curated words_uthmani array is normally spoken words, but a
+                                // handful of entries (e.g. final-rub-el-hizb or standalone paused
+                                // marks) may be sentinel annotation tokens -- drop them so they do
+                                // not occupy a target slot the user is never expected to speak
+                                // (mirrors splitAyahWords for the Hafs fallback above).
+                                val words = (0 until wordsArray.length())
+                                    .map { wordsArray.getString(it) }
+                                    .filter { !isAyahAnnotationOnlyToken(it) }
                                 
                                 var matchedHafsAyahId = 1
                                 for (qw in words) {
@@ -623,7 +633,7 @@ class MainViewModel(application: Application) : androidx.lifecycle.AndroidViewMo
                         }
                     } else {
                         processedSurahAyahs = rawAyahs.map { ayah ->
-                            val words = ayah.text.split(Regex("\\s+")).filter { it.isNotBlank() }
+                            val words = splitAyahWords(ayah.text)
                             AyahDisplay(
                                 ayahId = ayah.numberInSurah,
                                 text = ayah.text,
@@ -827,6 +837,7 @@ class MainViewModel(application: Application) : androidx.lifecycle.AndroidViewMo
 val diacriticsRegex = Regex("[\\u064B-\\u065F\\u0670\\u06D6-\\u06ED\\uFEFF۬ے]")
 val punctuationRegex = Regex("[.,،؛؟?\"'()\\-!]")
 val alifRegex = Regex("[\\u0622\\u0623\\u0625\\u0671]")
+
 fun normalizeArabic(text: String): String {
     val sb = StringBuilder(text.length)
     for (i in 0 until text.length) {
@@ -864,6 +875,57 @@ fun normalizeForComparison(text: String, riwayah: String): String {
         }
     }
     return normalized
+}
+
+// Tokenize an ayah string into the words the user is expected to SPEAK.
+//
+// The AlQuran.cloud text (and other Uthmani Mushaf transcriptions) interleaves the
+// spoken words with freestanding Quranic annotation signs -- the small-high stop
+// marks U+06D6..U+06ED that sit between words, e.g. the "three-dot" U+06DB (ۛ) in
+// Al-Baqarah 2 (`ذَٰلِكَ ٱلْكِتَٰبُ لَا رَيْبَ ۛ فِيهِ ۛ هُدًۭى …`). They are NOT recited:
+// they are structural pause cues, not part of the spoken text. But because they
+// are whitespace-separated from neighbouring words, a naive `.split("\\s+")` keeps
+// them as their own "word" token. `normalizeArabic` then strips every character in
+// that range, leaving an ENTRY in `words` whose `normalizedWords` partner is the
+// empty string "" -- and that zero-length target slot can NEVER be matched by the
+// user's speech, so the recitation tracker would flag a WRONG/SKIPPED mistake on
+// something the user was never supposed to say ("the app wants me to read it or
+// it gives me a mistake"). This was the bug the user reported on Al-Baqarah 2, and
+// the same mark appears in many other ayahs (every `ۛ`, `ۖ`, `ۗ`, `ۘ`, `ۚ`, `ۜ` and
+// the standalone `ۭ`-style suffixes), so the fix must apply everywhere.
+//
+// `isAyahAnnotationOnlyToken` recognises these tokens: a token whose every
+// character is either whitespace or a Quranic annotation sign (U+06D6..U+06ED) --
+// including the possibility that some Mushaf variants add an Arabic-letter base
+// (e.g. ۝ a rub-el-hizb mark expecting no speech) is handled by checking the
+// post-normalize emptiness as well. We drop those tokens here so `words`,
+// `normalizedWords`, `targetOrig`, `targetNorm`, `targetFormGroups` AND the
+// per-ayah renderer (which derives `wordStartIndex` from `words.size`) all stay
+// index-consistent and contain ONLY spoken words. The bare stop-glyph therefore
+// does NOT appear as an actionable word in the recitation display -- matching the
+// universal convention that these are non-spoken structural marks.
+fun isAyahAnnotationOnlyToken(token: String): Boolean {
+    if (token.isBlank()) return true
+    var anyNonAnnotation = false
+    var anyAnnotation = false
+    for (ch in token) {
+        val cp = ch.code
+        if (cp == 0xFEFF || cp == 0x200B || cp == 0x200C || cp == 0x200D || cp == 0x0640) continue
+        if (cp in 0x06D6..0x06ED) { anyAnnotation = true; continue }
+        anyNonAnnotation = true
+    }
+    // Pure annotation mark(s) and nothing spoken -> drop. Also drop the degenerate
+    // case of a token that normalizes to empty (defensive: future annotation ranges
+    // that normalizeArabic strips but Ibayt isAyahAnnotationOnlyToken missed).
+    if (!anyNonAnnotation) return true
+    if (normalizeArabic(token).isEmpty()) return true
+    return false
+}
+
+fun splitAyahWords(text: String): List<String> {
+    return text.split(Regex("\\s+"))
+        .filter { it.isNotBlank() }
+        .filter { !isAyahAnnotationOnlyToken(it) }
 }
 
 fun isSakinah(word: String, index: Int): Boolean {
@@ -1351,7 +1413,8 @@ suspend fun generateRandomQuranExample(targetHead: String): TajweedExample? = ko
             // WINDOW around the matching token below (the user asked for snippets of that
             // size rather than the whole ayah OR just the lone 1-2 word trigger).
             if (ayah.isBlank() || ayah.length > 300) continue
-            val tokens = ayah.split(Regex("\\s+")).filter { it.isNotBlank() }
+            val tokens = splitAyahWords(ayah)
+
             for (j in tokens.indices) {
                 val token = tokens[j]
                 val nextToken = tokens.getOrNull(j + 1)
@@ -2755,7 +2818,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             Column(modifier = modifier.fillMaxSize().padding(12.dp)) {
                 Box(modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
                     Text(
-                        text = getAppString(isArabic, "Recitation Practice"),
+                        text = if (isArabic) "إتقان" else "Itqān",
                         style = MaterialTheme.typography.titleLarge.copy(
                             fontWeight = FontWeight.Bold,
                             letterSpacing = 1.sp
@@ -5295,7 +5358,7 @@ fun SplashScreen(isArabic: Boolean, onDismiss: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = if (isArabic) "ممارسة التلاوة" else "Recitation Practice",
+                    text = if (isArabic) "إتقان" else "Itqān",
                     style = MaterialTheme.typography.headlineLarge.copy(
                         fontWeight = FontWeight.ExtraBold,
                         letterSpacing = 1.sp
@@ -5328,7 +5391,7 @@ fun SplashScreen(isArabic: Boolean, onDismiss: () -> Unit) {
 fun getAppString(isArabic: Boolean, key: String): String {
     if (!isArabic) return key
     return when (key) {
-        "Recitation Practice" -> "ممارسة التلاوة"
+        "Recitation Practice" -> "إتقان"   // legacy key, kept for backwards reference; new code uses the literal "Itqān" / "إتقان"
         "Read" -> "قراءة"
         "Memorize" -> "تسميع"
         "Tajweed" -> "تجويد"
