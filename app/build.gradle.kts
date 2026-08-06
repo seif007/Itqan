@@ -119,4 +119,13 @@ dependencies {
   "ksp"(libs.androidx.room.compiler)
   "ksp"(libs.moshi.kotlin.codegen)
   testImplementation("javazoom:jlayer:1.0.1")
+
+  // Sherpa-ONNX offline streaming speech recognizer (prebuilt AAR, vendored in
+  // app/libs/). Drives the Memorize+Tajweed pipeline: one AudioRecord buffer is
+  // split between this recognizer and the existing TajweedNet sink, so we
+  // satisfy the single-mic invariant on devices like the A05s. The AAR's
+  // classes.jar provides com.k2fsa.sherpa.onnx.* and the jni/<abi>/ .so files.
+  // The leading `:` + `@aar` extension is Gradle's flatDir coordinate syntax —
+  // resolved against the app/libs/ flatDir repo declared in settings.gradle.kts.
+  implementation(":sherpa-onnx-1.13.4@aar")
 }

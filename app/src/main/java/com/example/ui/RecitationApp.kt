@@ -39,6 +39,15 @@ import android.app.Application
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+
+// Offline streaming speech recognizer pipeline (Memorize+Tajweed only).
+// Sherpa-ONNX JNI + bindings ship inside the vendored AAR; the streaming
+// Zipformer weights download on first launch into filesDir/sherpa_model/.
+// See com.example.sherpa.SherpaPipeline.kt for the single-AudioRecord shared
+// pipeline + AyahWordMatcher hallucination guard.
+import com.example.sherpa.SherpaModelDownloader
+import com.example.sherpa.SingleAudioPipeline
+import com.example.sherpa.isSherpaModelReady
 import com.example.quran.QuranApi
 import com.example.quran.SurahData
 import com.example.quran.formGroupsFor
@@ -2274,7 +2283,23 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // Samsung A05s the recognizer either (a) conflicts with a parallel AudioRecord or (b) hands
     // back an audio Uri we cannot decode. Owning the capture guarantees the Tajweed score always
     // reflects the user's real voice. The example text is known, so no speech-to-text is needed.
-    val tajweedRecorder = remember { MicRecorderController() }
+    //
+    // Memorize+Tajweed now drives its speech transcript from the Sherpa-ONNX
+    // offline recognizer via [tajweedPipeline] (single AudioRecord feeds both the
+    // Sherpa OnlineRecognizer stream AND the TajweedNet acoustic sink). The old
+    // MicRecorderController is kept as a fallback only when the model hasn't
+    // been downloaded yet, but the Compose download dialog blocks the user from
+    // entering Memorize+Tajweed until Sherpa is ready, so that path is rare.
+    // `ayahWordsProvider` reads `targetOrig` (the active ayah range's display
+    // words) at start() time, and the [AyahWordMatcher] uses the same list as a
+    // post-filter hallucination guard — see com.example.sherpa.SherpaPipeline.kt.
+    //
+    // To work around Kotlin's ban on forward local references inside a closure,
+    // the pipeline is constructed BELOW `targetOrig` and stored in this holder,
+    // scope; the pipeline is assigned to it once `targetOrig` is available.
+    val tajweedPipelineHolder = remember { TajweedPipelineHolder() }
+    val sherpaDownloader = remember(context) { SherpaModelDownloader(context) }
+    val sherpaReady = remember { mutableStateOf<Boolean?>(null) }
     var tajweedRecordedAudio by remember { mutableStateOf<FloatArray?>(null) }
     var tajweedRecordingStartMs by remember { mutableStateOf(0L) }
     var tajweedRecordingDurationMs by remember { mutableStateOf(0L) }
@@ -2316,6 +2341,25 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         viewModel.ayahs.flatMap { it.words }.map { com.example.quran.formGroupsFor(it) }
     }
 
+    // Construct the Sherpa-ONNX offline streaming pipeline once per ayah range
+    // (so its decoder-level hotwordsFile bias tracks the new vocabulary each
+    // time the user changes the range — see com.example.sherpa.SherpaPipeline.kt
+    // for why hotwordsFile is set only at recognizer construction time).
+    // `tajweedPipelineHolder` was declared earlier in the Composable scope; the
+    // pipeline is wired into it the first time `targetOrig` is resolved AND
+    // re-wired on every range change (the previous instance is released first
+    // to avoid leaking a native OnlineRecognizer + AudioRecord handle). The
+    // wrap is safe even when the model files aren't downloaded yet: `start()`
+    // returns false in that case, and the Compose download dialog blocks the
+    // FAB until the user finishes the first-launch download.
+    LaunchedEffect(targetOrig) {
+        try { tajweedPipelineHolder.pipeline?.release() } catch (e: Throwable) {}
+        tajweedPipelineHolder.pipeline = SingleAudioPipeline(
+            context = context,
+            ayahWordsProvider = { targetOrig }
+        )
+    }
+
     // State-reset on target change. Changing the surah or the ayah pickers at ~3874/3881 reloads
     // `viewModel.ayahs` and so flips `targetNorm`/`targetOrig` below, which would normally
     // re-run the Memorize analysis loop. Without this reset, the stale `finalSpokenText` and
@@ -2337,7 +2381,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             // Defensive: a parallel AudioRecord should never be running in Memorize (single-mic
             // invariant), but if a future caller ever starts one, stop it here so its buffer
             // can't bleed into the new range's analysis pass.
-            try { if (tajweedRecorder.running) tajweedRecorder.stop() } catch (e: Throwable) {}
+            try { if (tajweedPipelineHolder.running) tajweedPipelineHolder.stop() } catch (e: Throwable) {}
             tajweedRecordedAudio = null
             tajweedRecordingDurationMs = 0
             // stopListening DOES fire onResults (which unlatches isListening), but if the engine is
@@ -2491,13 +2535,29 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     val hasError = alignment.second
     val errorIndex = if (hasError) matchedWordCount else -1
 
-    // Start a Tajweed practice session. Our OWN AudioRecord is the SINGLE microphone client so the
-    // acoustic score measures the user's real voice. We deliberately do NOT start the SpeechRecognizer
-    // here: on this device (and many Samsung HALs) the recognizer monopolizes the mic when active,
-    // which would leave our parallel capture silent and the score frozen. Owning the mic guarantees
-    // we actually record the recitation.
+    // Start a Tajweed practice session. Our own AudioRecord is the SINGLE
+    // microphone client so the acoustic score measures the user's real voice.
+    // The AudioRecord feed is split between the Sherpa OnlineRecognizer
+    // (drives the word-by-word transcript — replaces the platform
+    // SpeechRecognizer, which on the A05s starves voice capture when two HAL
+    // clients compete) and the TajweedNet acoustic scorer.
+    // Sherpa's hotwordsFile is sampled at recognizer-construction time inside
+    // [SingleAudioPipeline.start], so this whole session must run against the
+    // current `targetOrig` (the Compose UI's active ayah range) — a mid-session
+    // range change stops + restarts the pipeline (see the LaunchedEffect on
+    // `targetOrig` above).
     fun startTajweedSession() {
-        if (tajweedRecorder.running) return
+        if (tajweedPipelineHolder.running) return
+        // First-launch gate: if the Sherpa model files aren't on disk yet,
+        // the pipeline's start() returns false without touching the mic.
+        // The Compose download dialog (further down in this Composable) is
+        // the user-facing restart button — bail out silently here so the FAB
+        // doesn't flap when they tap before the model has landed.
+        if (!isSherpaModelReady(context)) {
+            isListening = true
+            errorMessage = getAppString(isArabic, "Downloading the speech recognizer model — please wait")
+            return
+        }
         spokenTimings.clear()
         currentWordCount = 0
         tajweedFinalSpokenText = ""
@@ -2507,19 +2567,19 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         recognizedAudioUri = null
         tajweedRecordingStartMs = System.currentTimeMillis()
         isListening = true
-        tajweedRecorder.start()
-        if (!tajweedRecorder.running) {
+        val started = tajweedPipelineHolder.pipeline?.start() ?: false
+        if (!started) {
             isListening = false
             errorMessage = "Microphone is unavailable on this device"
         }
     }
 
     fun stopTajweedSession() {
-        if (!tajweedRecorder.running && !isListening) {
+        if (!tajweedPipelineHolder.running && !isListening) {
             isListening = false
             return
         }
-        val audio = if (tajweedRecorder.running) tajweedRecorder.stop() else FloatArray(0)
+        val audio = if (tajweedPipelineHolder.running) tajweedPipelineHolder.stop() else FloatArray(0)
         tajweedRecordedAudio = audio
         tajweedRecordingDurationMs = (audio.size * 1000L) / 16000
         try { speechRecognizer?.stopListening() } catch (e: Throwable) {}
@@ -2529,7 +2589,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     fun stopAllListening() {
         isListening = false
         try { speechRecognizer?.stopListening(); speechRecognizer?.cancel() } catch (e: Throwable) {}
-        try { if (tajweedRecorder.running) tajweedRecorder.stop() } catch (e: Throwable) {}
+        try { if (tajweedPipelineHolder.running) tajweedPipelineHolder.stop() } catch (e: Throwable) {}
     }
 
     LaunchedEffect(currentTab) {
@@ -2542,7 +2602,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 android.util.Log.e("SpeechRec", "Error auto-stopping on tab change", e)
             }
             try {
-                if (tajweedRecorder.running) tajweedRecorder.stop()
+                if (tajweedPipelineHolder.running) tajweedPipelineHolder.stop()
             } catch (e: Throwable) {
                 android.util.Log.e("SpeechRec", "Error auto-stopping tajweed recorder on tab change", e)
             }
@@ -2562,7 +2622,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         android.util.Log.e("SpeechRec", "Error auto-stopping on background", e)
                     }
                     try {
-                        if (tajweedRecorder.running) tajweedRecorder.stop()
+                        if (tajweedPipelineHolder.running) tajweedPipelineHolder.stop()
                     } catch (e: Throwable) {
                         android.util.Log.e("SpeechRec", "Error auto-stopping tajweed recorder on background", e)
                     }
@@ -2573,7 +2633,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         onDispose {
             try {
                 lifecycleOwner.lifecycle.removeObserver(observer)
-                if (tajweedRecorder.running) tajweedRecorder.stop()
+                if (tajweedPipelineHolder.running) tajweedPipelineHolder.stop()
             } catch (e: Throwable) {}
             try { speechRecognizer?.destroy() } catch (e: Throwable) {}
         }
@@ -2772,6 +2832,66 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 speechRecognizer?.destroy()
             } catch (e: Throwable) {
                 android.util.Log.e("SpeechRec", "Error destroying SpeechRecognizer", e)
+            }
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Sherpa-ONNX offline pipeline partials subscription (Memorize+Tajweed).
+    //
+    // Each [SherpaPartialEvent] emitted by the [SingleAudioPipeline]'s
+    // recogniser thread carries the cleaned partial transcript (post
+    // [com.example.sherpa.AyahWordMatcher] hallucination guard). We mirror the
+    // same state writes that the SpeechRecognizer `onPartial`/`onResults`
+    // callbacks above do for the tajweed transcript slot: append cumulative
+    // timings for any newly spoken words, advance `currentWordCount`, and
+    // publish the partial text. The `endpoint == true` events commit the
+    // partial as final (mirroring `onResults` from the platform recognizer).
+    // Runs only while in the Tajweed tab AND while the pipeline is running —
+    // re-launches whenever the holder wires a new pipeline (range change).
+    LaunchedEffect(tajweedPipelineHolder, currentTab) {
+        if (currentTab != "Tajweed") return@LaunchedEffect
+        val pipe = tajweedPipelineHolder.pipeline ?: return@LaunchedEffect
+        pipe.partials.collect { ev ->
+            val timeNow = System.currentTimeMillis()
+            val words = ev.partial
+            val wordsLength = words.size
+            if (wordsLength > currentWordCount) {
+                if (spokenTimings.isNotEmpty()) {
+                    spokenTimings.last().endMs = timeNow
+                }
+                val rVal = synchronized(acousticRmsTracker) {
+                    val r = acousticRmsTracker[0]
+                    acousticRmsTracker[0] = 0f
+                    r
+                }
+                for (i in currentWordCount until wordsLength) {
+                    spokenTimings.add(SpokenWordTiming(
+                        word = words[i],
+                        startIndex = i,
+                        startMs = timeNow,
+                        endMs = timeNow,
+                        maxRms = rVal
+                    ))
+                }
+                currentWordCount = wordsLength
+            } else if (wordsLength == currentWordCount && spokenTimings.isNotEmpty()) {
+                val last = spokenTimings.last()
+                last.endMs = timeNow
+                synchronized(acousticRmsTracker) {
+                    if (acousticRmsTracker[0] > last.maxRms) {
+                        last.maxRms = acousticRmsTracker[0]
+                    }
+                }
+            }
+            val partialStr = words.joinToString(" ").trim()
+            if (ev.endpoint) {
+                if (partialStr.isNotEmpty()) {
+                    tajweedFinalSpokenText = "$tajweedFinalSpokenText $partialStr".trim()
+                }
+                tajweedPartialSpokenText = ""
+            } else {
+                if (partialStr.isNotEmpty()) tajweedPartialSpokenText = partialStr
             }
         }
     }
@@ -3150,6 +3270,71 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         }
 
         if (currentTab == "Tajweed") {
+            // ── Sherpa-ONNX model download dialog (Memorize+Tajweed only) ─
+            //
+            // First-launch gate for the offline streaming Zipformer (~323 MB,
+            // Apache-2.0). The transcript pipeline refuses `start()` until the
+            // weights land in filesDir/sherpa_model/, so this dialog overlays
+            // the coach and downloads on demand. We DO NOT auto-download on app
+            // startup — only when the user actually enters the Tajweed tab — so
+            // a Memorize-only user never pays the bandwidth cost.
+            val dlState = sherpaDownloader.progress.collectAsState().value
+            // Trigger the download the first time the user lands on Tajweed and
+            // the model isn't ready. Re-triggered whenever the user returns here
+            // if a previous download failed (the downloader is idempotent: it
+            // reads file sizes + skips complete ones, so re-runs are safe).
+            LaunchedEffect(Unit) {
+                if (!isSherpaModelReady(context) && dlState !is SherpaModelDownloader.Progress.Downloading) {
+                    try { sherpaDownloader.downloadIfNeeded() } catch (e: Throwable) {
+                        android.util.Log.e("ItqanSherpa", "Model download failed", e)
+                    }
+                }
+                sherpaReady.value = isSherpaModelReady(context)
+            }
+            when (dlState) {
+                is SherpaModelDownloader.Progress.Downloading -> {
+                    val pct = if (dlState.totalBytes > 0)
+                        dlState.receivedTotal.toFloat() / dlState.totalBytes
+                    else 0f
+                    AlertDialog(
+                        onDismissRequest = { /* non-dismissable until DL completes */ },
+                        title = { Text(getAppString(isArabic, "Downloading speech model")) },
+                        text = {
+                            Column {
+                                Text(getAppString(
+                                    isArabic,
+                                    "Itqān needs the offline speech recognizer (${(dlState.totalBytes / 1_048_576).toInt()} MB) for word-by-word highlight in Memorize+Tajweed."
+                                ))
+                                Spacer(Modifier.height(12.dp))
+                                Text("${(pct * 100).toInt()}%  •  ${dlState.currentFile}")
+                                Spacer(Modifier.height(8.dp))
+                                LinearProgressIndicator(
+                                    progress = { pct },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                        },
+                        confirmButton = {} // no cancel while in-flight
+                    )
+                }
+                is SherpaModelDownloader.Progress.Failed -> {
+                    AlertDialog(
+                        onDismissRequest = {},
+                        title = { Text(getAppString(isArabic, "Download failed")) },
+                        text = { Text(dlState.message) },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                // Re-trigger via a coroutine scope. The state flow
+                                // picks up the new download's progress immediately.
+                                kotlinx.coroutines.GlobalScope.launch {
+                                    try { sherpaDownloader.downloadIfNeeded() } catch (_: Throwable) {}
+                                }
+                            }) { Text(getAppString(isArabic, "Retry")) }
+                        }
+                    )
+                }
+                else -> { /* Idle/Done — pipe is ready or pending */ }
+            }
             // Tajweed companion learning & reference hub
             var activePracticeRule by remember { mutableStateOf<String?>(null) }
             val rulesList = remember {
@@ -3493,8 +3678,8 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                     // Switching to a different rule: the previous recording belongs to a
                                     // different example, so discard it. Otherwise the new card would show a
                                     // stale score from audio the user never recorded for this rule.
-                                    if (tajweedRecorder.running || isListening) {
-                                        try { if (tajweedRecorder.running) tajweedRecorder.stop() } catch (e: Throwable) {}
+                                    if (tajweedPipelineHolder.running || isListening) {
+                                        try { if (tajweedPipelineHolder.running) tajweedPipelineHolder.stop() } catch (e: Throwable) {}
                                         try { speechRecognizer?.cancel() } catch (e: Throwable) {}
                                         isListening = false
                                     }
@@ -3504,8 +3689,8 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                     tajweedPartialSpokenText = ""
                                 } else {
                                     activePracticeRule = null
-                                    if (tajweedRecorder.running || isListening) {
-                                        try { if (tajweedRecorder.running) tajweedRecorder.stop() } catch (e: Throwable) {}
+                                    if (tajweedPipelineHolder.running || isListening) {
+                                        try { if (tajweedPipelineHolder.running) tajweedPipelineHolder.stop() } catch (e: Throwable) {}
                                         try { speechRecognizer?.cancel() } catch (e: Throwable) {}
                                         isListening = false
                                         tajweedRecordedAudio = null
@@ -3622,8 +3807,8 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                                     }
                                                     tajweedFinalSpokenText = ""
                                                     tajweedPartialSpokenText = ""
-                                                    if (tajweedRecorder.running || isListening) {
-                                                        try { if (tajweedRecorder.running) tajweedRecorder.stop() } catch (e: Throwable) {}
+                                                    if (tajweedPipelineHolder.running || isListening) {
+                                                        try { if (tajweedPipelineHolder.running) tajweedPipelineHolder.stop() } catch (e: Throwable) {}
                                                         try { speechRecognizer?.cancel() } catch (e: Throwable) {}
                                                         isListening = false
                                                         tajweedRecordedAudio = null
@@ -3701,7 +3886,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                             onClick = {
                                                 val hasPermission = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
                                                 if (hasPermission) {
-                                                    if (tajweedRecorder.running || isListening) {
+                                                    if (tajweedPipelineHolder.running || isListening) {
                                                         stopTajweedSession()
                                                     } else {
                                                         startTajweedSession()
@@ -4883,8 +5068,21 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     }
                     if (isListening) {
                         try {
-                            speechRecognizer.stopListening()
-                            isListening = false
+                            // Tajweed mode: hand off the stop to the Sherpa
+                            // pipeline-aware helper (which flushes the
+                            // OnlineRecognizer + writes tajweedRecordedAudio +
+                            // sets the recording duration). This mirrors what
+                            // `stopTajweedSession()` already does for the Tajweed
+                            // Rules Coach practice tab — centralizes the pipeline
+                            // teardown so the analyzeRecitationDetails
+                            // LaunchedEffect below picks up the audio on its
+                            // `tajweedRecordedAudio != null` trigger.
+                            if (recitationMode == "Tajweed" && tajweedPipelineHolder.running) {
+                                stopTajweedSession()
+                            } else {
+                                speechRecognizer.stopListening()
+                                isListening = false
+                            }
 
                             var newCompletedCount = 0
                             for (ayah in viewModel.ayahs) {
@@ -4946,7 +5144,27 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         val hasPermission = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
                         if (hasPermission) {
                             if (!isListening) {
-                                if (speechRecognizer != null) {
+                                // Memorize+Tajweed now uses the Sherpa-ONNX offline
+                                // recognizer pipeline (single AudioRecord feeds both the
+                                // Sherpa OnlineRecognizer and TajweedNet acoustic
+                                // scorer). The platform SpeechRecognizer is NOT used in
+                                // Tajweed mode -- on the user's Samsung A05s two HAL
+                                // clients starve each other and the word-by-word
+                                // highlight stops. Non-Tajweed modes keep the
+                                // SpeechRecognizer path (TajweedNet has no companion
+                                // transcript pipeline there because it doesn't need a
+                                // transcript -- the practice recitation text is known).
+                                if (recitationMode == "Tajweed" && tajweedPipelineHolder.pipeline != null) {
+                                    // Start via the pipeline-aware session helper so the
+                                    // hotwords bias (active ayah range) and the standard
+                                    // state reset (spokenTimings, audio, etc.) all happen
+                                    // in one place, mirroring the SpeechRecognizer path
+                                    // above.
+                                    startTajweedSession()
+                                    if (isListening) {
+                                        viewModel.preloadTajweedModel()
+                                    }
+                                } else if (speechRecognizer != null) {
                                     spokenTimings.clear()
                                     currentWordCount = 0
                                     recognizedAudioUri = null
@@ -5202,6 +5420,25 @@ fun SurahChip(surahName: String, isSelected: Boolean, onClick: () -> Unit) {
  * what originally broke recognition). Owning the capture ourselves guarantees we always have the
  * user's real 16 kHz PCM voice to score. The example text is known, so no speech-to-text is needed.
  */
+/**
+ * Mutable holder for the [com.example.sherpa.SingleAudioPipeline] created when
+ * the Memorize+Tajweed Composable first resolves its ayah target list. Kotlin
+ * disallows forward references to local variables inside closures (so the
+ * pipeline cannot be `remember`-constructed before `targetOrig` is declared
+ * while also binding `{ targetOrig }` into its hotness provider). This holder
+ * is declared early in the Composable scope (so it's visible to all wiring
+ * sites) and the pipeline is assigned to it once `targetOrig` is available.
+ */
+class TajweedPipelineHolder {
+    @Volatile var pipeline: com.example.sherpa.SingleAudioPipeline? = null
+    /** Same semantics as [SingleAudioPipeline.running], null-safe. */
+    val running: Boolean get() = pipeline?.running ?: false
+    /** Null-safe passthrough for `pipeline.stop()`. */
+    fun stop(): FloatArray = pipeline?.stop() ?: FloatArray(0)
+    /** Null-safe passthrough for `pipeline.release()`. */
+    fun release() { pipeline?.release() }
+}
+
 class MicRecorderController {
     @Volatile var running = false
         private set

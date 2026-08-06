@@ -11,6 +11,10 @@
 *.apk
 *.aab
 *.aar
+# Exception: vendored prebuilt AARs that ship inside the APK (Sherpa-ONNX JNI
+# bridge + ONNX Runtime). Without this the source repo can't reproduce a build
+# offline and developers would have to fetch the AAR separately.
+!app/libs/*.aar
 *.dex
 *.ap_
 
