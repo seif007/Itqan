@@ -769,6 +769,41 @@ class SingleAudioPipeline(
      * handles become unreachable from the worker once `running` is false and
      * the worker's finally block releases the AudioRecord itself.
      */
+    /**
+     * Stops the worker, releases the recognizer & stream asynchronously, and
+     * returns the accumulated full recitation PCM (16 kHz mono, [-1,1]).
+     *
+     * CRITICAL: this MUST be safe to call from the Compose main thread, AND
+     * MUST NOT race the IO worker. The previous implementation did
+     * `runBlocking { job?.join() }` which blocks main until the AudioRecord-
+     * worker drains its current read buffer — on the A05s this is enough to
+     * trip the 5s ANR watchdog when the app is shutting down.
+     *
+     * An EARLIER fix then made `stop()` schedule the teardown on the IO scope
+     * with `_state.value = Idle` synchronously, but it still called
+     * `stream?.release()` inside `teardown()` that the IO job would invoke
+     * — without FIRST waiting for the AudioRecord worker to actually leave
+     * the `acceptWaveform(...)` / `decode(st)` native call it was in the
+     * middle of. That was a **native use-after-free**: the freed `st` pointer
+     * was still being dereferenced by the worker thread (synchronous C++
+     * OnlineStream is NOT thread-safe between two callers), giving SIGSEGV
+     * on the user's report "second ayah -> app crashes" — the range change
+     * triggers `LaunchedEffect(targetOrig)` -> `release()` -> `teardown()` ->
+     * `stream=null`+`stream?.release()` while the worker iterated on `st`.
+     *
+     * The contract here is now:
+     *   1. flip `running = false` (the worker checks this between iterations,
+     *      so it will exit its loop and stop touching native pointers),
+     *   2. snapshot the audio accumulator synchronously (the worker only writes
+     *      while running=true),
+     *   3. emit the synthetic endpoint so the partial collector commits the
+     *      last segment,
+     *   4. SCHEDULE `job.join() + teardown()` on the IO scope — this awaits
+     *      the worker BEFORE freeing native handles, so no concurrent native
+     *      access ever happens. The scheduler coroutine waits on the join
+     *      from the IO scope, which is allowed to block (it is not the
+     *      main thread).
+     */
     @Synchronized
     fun stop(): FloatArray {
         if (!running) {
@@ -794,11 +829,12 @@ class SingleAudioPipeline(
             audio = FloatArray(sampleRate * 10)
             audioSize = 0
         }
-        // Schedule the (potentially slow) native teardown off main. The
-        // listener (if any) is invoked once teardown completes so the UI can
-        // release its references.
+        val workerToJoin = job
+        // Schedule teardown AFTER the worker has actually exited its `while(running)`
+        // loop, so the native OnlineStream handle can't be freed while the worker
+        // is mid-`decode(st)`. The IO scope is fine tosuspend on.
         scope.launch {
-            try { kotlinx.coroutines.delay(0) } catch (_: Throwable) {}
+            try { workerToJoin?.join() } catch (_: Throwable) {}
             teardown()
             _state.value = State.Idle
         }
@@ -820,14 +856,47 @@ class SingleAudioPipeline(
         matcher = null
     }
 
-    /** Releases native resources unconditionally (lifecycle teardown). */
+    /**
+     * Releases native resources unconditionally (lifecycle teardown).
+     *
+     * Invoked by the Compose `LaunchedEffect(targetOrig)` when the ayah range
+     * changes — the most recent crash site. CRITICAL: this is called from the
+     * Compose main thread while the IO AudioRecord worker is potentially mid
+     * native call (`st.acceptWaveform` / `rec.decode(st)`). Calling
+     * `stream?.release()` / `recognizer?.release()` synchronously here would
+     * free the native pointers under the worker's feet -> SIGSEGV (the exact
+     * "second ayah crashes" bug the user reported).
+     *
+     * The new contract: we flip `running=false` (worker checks this on its
+     * loop) and `cancelledDuringLoad=true` (start IO job checks this), and we
+     * SCHEDULE the teardown on the IO scope to run AFTER the worker has actually
+     * exited (`job?.join()`). The new pipeline that replaces THIS one runs on
+     * its own fresh `CoroutineScope` so it can't collide with this scheduled
+     * teardown either — even on a hot range-change burst (Compose cancelling
+     * the old LaunchedEffect mid-flight), the `launch` here stays alive until
+     * the worker drains because it captures its parent-job reference.
+     *
+     * No synchronous native call from this method, no join-from-main, no
+     * ANR risk.
+     */
     fun release() {
         running = false
         cancelledDuringLoad = true
         try { stream?.inputFinished() } catch (_: Throwable) {}
-        scope.cancel()
-        teardown()
-        _state.value = State.Idle
+        val workerToJoin = job
+        // Schedule teardown on the IO scope AFTER the worker has joined. We do
+        // NOT cancel this scope from inside the launcher (that would cancel the
+        // launcher itself mid-flight); the calling Composable discards its
+        // holder reference and replaces it with a fresh pipeline whose own
+        // CoroutineScope is independent, so the OLD scope becomes unreachable
+        // for new work the moment the holder field is overwritten. The single
+        // `launch` here completes its `join()+teardown()` and the scope goes
+        // idle.
+        scope.launch {
+            try { workerToJoin?.join() } catch (_: Throwable) {}
+            teardown()
+            _state.value = State.Idle
+        }
     }
 
     private fun startReadLoop(st: OnlineStream) {
@@ -869,6 +938,14 @@ class SingleAudioPipeline(
                 while (running) {
                     val n = audioRecord.read(shortBuf, 0, shortBuf.size)
                     if (n > 0) {
+                        // Re-check `running` between a possibly-blocking
+                        // `audioRecord.read(...)` and the native `acceptWaveform`
+                        // — [stop]/[release] may have landed during the read,
+                        // in which case a teardown-job is queued on this same
+                        // IO scope waiting for the worker to exit; do NOT push
+                        // PCM into `st` after running flips false because that
+                        // job will free `st` the moment this loop returns.
+                        if (!running) break
                         val floats = FloatArray(n)
                         for (i in 0 until n) floats[i] = shortBuf[i] / 32768f
                         // 1) TajweedNet sink: append to the full-audio accumulator.
@@ -909,9 +986,15 @@ class SingleAudioPipeline(
     }
 
     private fun decodeAndEmit(st: OnlineStream) {
+        // Defensive: if [stop]/[release] flipped running=false, do NOT touch
+        // native pointers — a teardown is scheduled on the IO scope that will
+        // free `st` once this worker has exited. Calling into `rec.isReady(st)`
+        // here after teardown completed would dereference a freed handle.
+        if (!running) return
         val rec = recognizer ?: return
         try {
-            while (rec.isReady(st)) rec.decode(st)
+            while (running && rec.isReady(st)) rec.decode(st)
+            if (!running) return
             val result = rec.getResult(st)
             val rawText = result.text ?: ""
             val cleaned = matcher?.clean(rawText) ?: rawText.split(Regex("\\s+"))

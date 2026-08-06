@@ -2868,50 +2868,61 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // publish the partial text. The `endpoint == true` events commit the
     // partial as final (mirroring `onResults` from the platform recognizer).
     // Runs in BOTH the Tajweed Rules Coach tab (standalone) AND the
-    // Memorize+Tajweed tab, whenever the Sherpa pipeline is running — re-launches
-    // whenever the holder wires a new pipeline (range change). The original version
-    // gated on `currentTab != "Tajweed" -> return`, which silently dropped all
-    // partials of a Memorize+Tajweed session: with no subscriber the SharedFlow's
-    // buffer capped and the user saw the word-by-word highlight frozen at 0 even
-    // though audio was being captured. Now we run whenever the active mode is
-    // pipeline-driven (either tab).
-    LaunchedEffect(tajweedPipelineHolder, currentTab, recitationMode) {
-        val pipelineDriven =
-            currentTab == "Tajweed" || (currentTab == "Memorize" && recitationMode == "Tajweed")
-        if (!pipelineDriven) return@LaunchedEffect
-        val pipe = tajweedPipelineHolder.pipeline ?: return@LaunchedEffect
-        pipe.partials.collect { ev ->
-            val timeNow = System.currentTimeMillis()
-            val words = ev.partial
-            val wordsLength = words.size
-            if (wordsLength > currentWordCount) {
-                if (spokenTimings.isNotEmpty()) {
-                    spokenTimings.last().endMs = timeNow
-                }
-                val rVal = synchronized(acousticRmsTracker) {
-                    val r = acousticRmsTracker[0]
-                    acousticRmsTracker[0] = 0f
-                    r
-                }
-                for (i in currentWordCount until wordsLength) {
-                    spokenTimings.add(SpokenWordTiming(
-                        word = words[i],
-                        startIndex = i,
-                        startMs = timeNow,
-                        endMs = timeNow,
-                        maxRms = rVal
-                    ))
-                }
-                currentWordCount = wordsLength
-            } else if (wordsLength == currentWordCount && spokenTimings.isNotEmpty()) {
-                val last = spokenTimings.last()
-                last.endMs = timeNow
-                synchronized(acousticRmsTracker) {
-                    if (acousticRmsTracker[0] > last.maxRms) {
-                        last.maxRms = acousticRmsTracker[0]
+    // Memorize+Tajweed tab, whenever the Sherpa pipeline is running —
+    // re-launches whenever the holder wires a NEW pipeline on a range change.
+    //
+    // Re-keying: `tajweedPipelineHolder.pipeline` is a Compose `mutableStateOf`
+    // since the holder class opt-in to Compose state observation. Reading it
+    // inside a `key {}` block makes THIS LaunchedEffect re-launch whenever a
+    // new pipeline is wired into the holder (range change), so the partials
+    // collector re-subscribes to the new pipeline's `_partials` SharedFlow.
+    // The earlier version captured the pipeline ONCE at first composition and
+    // kept listening to the OLD pipeline even after the ayah-range changed —
+    // so ayah 2's partials were emitted but never collected, the highlight froze
+    // at ayah 1's last word, and the user saw "the first ayah displays words
+    // but the second ayah does nothing". The original version also gated on
+    // `currentTab != "Tajweed" -> return`, which silently dropped all partials
+    // of a Memorize+Tajweed session: with no subscriber the SharedFlow's buffer
+    // capped. Now we run whenever the active mode is pipeline-driven (either
+    // tab) AND on every pipeline swap.
+    androidx.compose.runtime.key(tajweedPipelineHolder.pipeline) {
+        LaunchedEffect(tajweedPipelineHolder.pipeline, currentTab, recitationMode) {
+            val pipelineDriven =
+                currentTab == "Tajweed" || (currentTab == "Memorize" && recitationMode == "Tajweed")
+            if (!pipelineDriven) return@LaunchedEffect
+            val pipe = tajweedPipelineHolder.pipeline ?: return@LaunchedEffect
+            pipe.partials.collect { ev ->
+                val timeNow = System.currentTimeMillis()
+                val words = ev.partial
+                val wordsLength = words.size
+                if (wordsLength > currentWordCount) {
+                    if (spokenTimings.isNotEmpty()) {
+                        spokenTimings.last().endMs = timeNow
+                    }
+                    val rVal = synchronized(acousticRmsTracker) {
+                        val r = acousticRmsTracker[0]
+                        acousticRmsTracker[0] = 0f
+                        r
+                    }
+                    for (i in currentWordCount until wordsLength) {
+                        spokenTimings.add(SpokenWordTiming(
+                            word = words[i],
+                            startIndex = i,
+                            startMs = timeNow,
+                            endMs = timeNow,
+                            maxRms = rVal
+                        ))
+                    }
+                    currentWordCount = wordsLength
+                } else if (wordsLength == currentWordCount && spokenTimings.isNotEmpty()) {
+                    val last = spokenTimings.last()
+                    last.endMs = timeNow
+                    synchronized(acousticRmsTracker) {
+                        if (acousticRmsTracker[0] > last.maxRms) {
+                            last.maxRms = acousticRmsTracker[0]
+                        }
                     }
                 }
-            }
             val partialStr = words.joinToString(" ").trim()
             if (ev.endpoint) {
                 if (partialStr.isNotEmpty()) {
@@ -2922,8 +2933,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 if (partialStr.isNotEmpty()) tajweedPartialSpokenText = partialStr
             }
         }
+        }
     }
- 
+
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
         if (isGranted) {
             if (!isListening) {
@@ -5479,13 +5491,34 @@ fun SurahChip(surahName: String, isSelected: Boolean, onClick: () -> Unit) {
  * sites) and the pipeline is assigned to it once `targetOrig` is available.
  */
 class TajweedPipelineHolder {
-    @Volatile var pipeline: com.example.sherpa.SingleAudioPipeline? = null
+    /**
+     * Backed by Compose `mutableStateOf` so the partials-collector
+     * `LaunchedEffect(tajweedPipelineHolder, currentTab, recitationMode)`
+     * re-launches when a range change wires a NEW pipeline into this holder —
+     * otherwise the collector would keep listening to the OLD pipeline's
+     * `_partials` SharedFlow, which dies after [release], and the user's
+     * word-by-word highlight would freeze on ayah 2 (the exact symptom the user
+     * reported after the range-change `release()`).
+     *
+     * The `@Volatile`-only field the previous version used does NOT notify
+     * Compose of writes, so the LaunchedEffect's key did not change. Wrapping
+     * in `mutableStateOf` is the cheapest fix: it makes the holder notify
+     * Compose observers on assignment, and the LaunchedEffect's key (this
+     * holder instance itself is stable) only has this one writable property
+     * — observing that property IS observing the pipeline.
+     */
+    var pipeline: com.example.sherpa.SingleAudioPipeline? by androidx.compose.runtime.mutableStateOf(null)
+
     /** Same semantics as [SingleAudioPipeline.running], null-safe. */
     val running: Boolean get() = pipeline?.running ?: false
     /** Null-safe passthrough for `pipeline.stop()`. */
     fun stop(): FloatArray = pipeline?.stop() ?: FloatArray(0)
     /** Null-safe passthrough for `pipeline.release()`. */
     fun release() { pipeline?.release() }
+
+    /** Compose-friendly identity-stable key for triggering re-collection. */
+    val pipelineKey: Any get() = pipeline ?: NULL_KEY
+    private companion object { val NULL_KEY = Any() }
 }
 
 class MicRecorderController {
