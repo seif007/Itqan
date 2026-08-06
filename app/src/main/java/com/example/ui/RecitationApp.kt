@@ -2566,6 +2566,15 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         recognizedAudio = null
         recognizedAudioUri = null
         tajweedRecordingStartMs = System.currentTimeMillis()
+        // isListening turns on immediately so the mic FAB shows the "stop"
+        // icon while the recognizer is still loading on the IO scope — this
+        // prevents the user from re-tapping and starting a second pipeline
+        // while the first OnlineRecognizer is still being constructed (which
+        // on the A05s takes 2–5 s for the 296 MB int8 encoder). The FAB's
+        // stop branch calls stopTajweedSession, which handles a still-loading
+        // pipeline cleanly (running stays false, the start job's `running=true`
+        // write happens after the recognizer is ready, and stop() flips it back
+        // false without blocking main).
         isListening = true
         val started = tajweedPipelineHolder.pipeline?.start() ?: false
         if (!started) {
@@ -2575,7 +2584,18 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     }
 
     fun stopTajweedSession() {
-        if (!tajweedPipelineHolder.running && !isListening) {
+        // Tolerate the "tap-stop-during-load" race: the user may tap the mic,
+        // see isListening go true immediately, and tap again before the
+        // recognizer finishes constructing on IO. `running` stays false until
+        // the IO job succeeds, so `tajweedPipelineHolder.running` is false —
+        // but isListening was set true optimistically. Clear both, and the IO
+        // job's eventual `running=true` / state=Running write is harmless
+        // because stop() will already have flipped them back. We also call
+        // pipeline.stop() defensively — it's a no-op if `running` is false,
+        // and we add the @Volatile guard so the warm-native path sets
+        // running=false before tearing down.
+        val wasListening = isListening || tajweedPipelineHolder.running
+        if (!wasListening) {
             isListening = false
             return
         }
@@ -2847,10 +2867,18 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // timings for any newly spoken words, advance `currentWordCount`, and
     // publish the partial text. The `endpoint == true` events commit the
     // partial as final (mirroring `onResults` from the platform recognizer).
-    // Runs only while in the Tajweed tab AND while the pipeline is running —
-    // re-launches whenever the holder wires a new pipeline (range change).
-    LaunchedEffect(tajweedPipelineHolder, currentTab) {
-        if (currentTab != "Tajweed") return@LaunchedEffect
+    // Runs in BOTH the Tajweed Rules Coach tab (standalone) AND the
+    // Memorize+Tajweed tab, whenever the Sherpa pipeline is running — re-launches
+    // whenever the holder wires a new pipeline (range change). The original version
+    // gated on `currentTab != "Tajweed" -> return`, which silently dropped all
+    // partials of a Memorize+Tajweed session: with no subscriber the SharedFlow's
+    // buffer capped and the user saw the word-by-word highlight frozen at 0 even
+    // though audio was being captured. Now we run whenever the active mode is
+    // pipeline-driven (either tab).
+    LaunchedEffect(tajweedPipelineHolder, currentTab, recitationMode) {
+        val pipelineDriven =
+            currentTab == "Tajweed" || (currentTab == "Memorize" && recitationMode == "Tajweed")
+        if (!pipelineDriven) return@LaunchedEffect
         val pipe = tajweedPipelineHolder.pipeline ?: return@LaunchedEffect
         pipe.partials.collect { ev ->
             val timeNow = System.currentTimeMillis()
@@ -3269,21 +3297,39 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             )
         }
 
-        if (currentTab == "Tajweed") {
-            // ── Sherpa-ONNX model download dialog (Memorize+Tajweed only) ─
-            //
-            // First-launch gate for the offline streaming Zipformer (~323 MB,
-            // Apache-2.0). The transcript pipeline refuses `start()` until the
-            // weights land in filesDir/sherpa_model/, so this dialog overlays
-            // the coach and downloads on demand. We DO NOT auto-download on app
-            // startup — only when the user actually enters the Tajweed tab — so
-            // a Memorize-only user never pays the bandwidth cost.
+        // ── Sherpa-ONNX model download dialog (Memorize+Tajweed AND Tajweed Rules Coach) ─
+        //
+        // First-launch gate for the offline streaming Zipformer (~323 MB,
+        // Apache-2.0). The transcript pipeline refuses `start()` until the
+        // weights land in filesDir/sherpa_model/, so this dialog overlays the
+        // active screen and downloads on demand. We DO NOT auto-download on app
+        // startup — only when the user actually enters a pipeline-driven surface
+        // (the standalone Tajweed Rules Coach tab, OR the Memorize tab with
+        // recitationMode == "Tajweed") — so a Memorize-only / Read-only user
+        // never pays the bandwidth cost.
+        //
+        // This block was originally gated INSIDE `if (currentTab == "Tajweed")`,
+        // which meant a user who went straight to Memorize+Tajweed never saw
+        // the dialog and the model never downloaded — the bug the user reported
+        // ("i tried memorize + tajweed but the model didnt download"). Now it
+        // fires on EITHER pipeline-driven surface.
+        //
+        // Idempotency: `downloadIfNeeded()` is single-flight (see the
+        // `inflight` AtomicBoolean in `SherpaModelDownloader`), so even though
+        // both the Memorize+Tajweed-tab and Tajweed-tab effects can register
+        // HERE, only one parallel download ever runs — a tab switch mid-download
+        // simply attaches a second subscriber to the same progress flow, it
+        // does NOT spawn a second HTTP transfer.
+        val sherpaSurfaceActive =
+            currentTab == "Tajweed" || (currentTab == "Memorize" && recitationMode == "Tajweed")
+        if (sherpaSurfaceActive) {
             val dlState = sherpaDownloader.progress.collectAsState().value
-            // Trigger the download the first time the user lands on Tajweed and
-            // the model isn't ready. Re-triggered whenever the user returns here
-            // if a previous download failed (the downloader is idempotent: it
-            // reads file sizes + skips complete ones, so re-runs are safe).
-            LaunchedEffect(Unit) {
+            // Trigger the download the first time the user lands on a
+            // pipeline-driven surface and the model isn't ready. Safe to
+            // re-fire per re-entry: the downloader's `inflight` guard means
+            // an in-flight download is not duplicated, and a finished download
+            // short-circuits to `Done` without touching the network.
+            LaunchedEffect(currentTab, recitationMode) {
                 if (!isSherpaModelReady(context) && dlState !is SherpaModelDownloader.Progress.Downloading) {
                     try { sherpaDownloader.downloadIfNeeded() } catch (e: Throwable) {
                         android.util.Log.e("ItqanSherpa", "Model download failed", e)
@@ -3335,6 +3381,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 }
                 else -> { /* Idle/Done — pipe is ready or pending */ }
             }
+        }
+
+        if (currentTab == "Tajweed") {
             // Tajweed companion learning & reference hub
             var activePracticeRule by remember { mutableStateOf<String?>(null) }
             val rulesList = remember {

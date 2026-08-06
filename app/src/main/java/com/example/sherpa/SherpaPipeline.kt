@@ -154,56 +154,82 @@ class SherpaModelDownloader(private val context: Context) {
             .build()
     }
 
+    /**
+     * Concurrency guard so the Compose side can fire `downloadIfNeeded()`
+     * from MULTIPLE `LaunchedEffect(Unit)` blocks (Memorize+Tajweed FAB AND
+     * the Tajweed Rules Coach landing) without spawning duplicate parallel
+     * downloads. Whichever caller wins the `compareAndSet` schedules the work;
+     * subsequent callers see an already-active job and return immediately.
+     */
+    private val inflight = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /** True iff download is already complete (no work to do). */
     fun isComplete(): Boolean = isSherpaModelReady(context)
 
+    /**
+     * Idempotent model download. Safe to call from multiple Compose effects
+     * and safe to re-call after a failure (the [inflight] guard prevents
+     * concurrent duplicates; per-file size-checks make a re-run after a partial
+     * download a resume, not a restart). Returns immediately if the model is
+     * already on disk.
+     */
     suspend fun downloadIfNeeded() = withContext(Dispatchers.IO) {
+        // Fast path: already complete. Flip straight to Done so the UI dialog
+        // collapses without ever showing a spurious "Downloading" frame.
         if (isComplete()) {
             _progress.value = Progress.Done
             return@withContext
         }
-        val dir = sherpaModelDir(context)
-        val totalFiles = MODEL_FILES.size
-        var receivedTotal = 0L
+        // Single-flight: another caller is already driving the download.
+        if (!inflight.compareAndSet(false, true)) return@withContext
+        try {
+            val dir = sherpaModelDir(context)
+            val totalFiles = MODEL_FILES.size
+            var receivedTotal = 0L
 
-        MODEL_FILES.forEachIndexed { idx, mf ->
-            val target = File(dir, mf.name)
-            // Resume support: if the existing partial is at least mf.size, skip.
-            if (target.exists() && target.length() >= mf.size) {
-                receivedTotal += mf.size
+            MODEL_FILES.forEachIndexed { idx, mf ->
+                val target = File(dir, mf.name)
+                // Resume support: if the existing partial is at least mf.size, skip.
+                if (target.exists() && target.length() >= mf.size) {
+                    receivedTotal += mf.size
+                    _progress.value = Progress.Downloading(
+                        currentFile = mf.name, fileIndex = idx + 1, fileCount = totalFiles,
+                        receivedFileBytes = mf.size, fileBytes = mf.size,
+                        receivedTotal = receivedTotal, totalBytes = MODEL_TOTAL_BYTES
+                    )
+                    return@forEachIndexed
+                }
+                // Streams via HF CDN; follows HF's 307 to the Xet CDN behind the scenes
+                // because OkHttp auto-follows redirects.
+                val url = "https://huggingface.co/$MODEL_REPO/resolve/main/${mf.name}?download=true"
                 _progress.value = Progress.Downloading(
                     currentFile = mf.name, fileIndex = idx + 1, fileCount = totalFiles,
-                    receivedFileBytes = mf.size, fileBytes = mf.size,
+                    receivedFileBytes = 0L, fileBytes = mf.size,
                     receivedTotal = receivedTotal, totalBytes = MODEL_TOTAL_BYTES
                 )
-                return@forEachIndexed
+                try {
+                    downloadFile(url, target, mf, idx, totalFiles)
+                    receivedTotal = MODEL_FILES.subList(0, idx + 1).sumOf { it.size }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Failed to download ${mf.name}", e)
+                    target.delete()
+                    _progress.value = Progress.Failed(
+                        message = "${mf.name}: ${e.message ?: e.javaClass.simpleName}"
+                    )
+                    throw IOException("Download failed for ${mf.name}", e)
+                }
             }
-            // Streams via HF CDN; follows HF's 307 to the Xet CDN behind the scenes
-            // because OkHttp auto-follows redirects.
-            val url = "https://huggingface.co/$MODEL_REPO/resolve/main/${mf.name}?download=true"
-            _progress.value = Progress.Downloading(
-                currentFile = mf.name, fileIndex = idx + 1, fileCount = totalFiles,
-                receivedFileBytes = 0L, fileBytes = mf.size,
-                receivedTotal = receivedTotal, totalBytes = MODEL_TOTAL_BYTES
-            )
-            try {
-                downloadFile(url, target, mf, idx, totalFiles)
-                receivedTotal = MODEL_FILES.subList(0, idx + 1).sumOf { it.size }
-            } catch (e: Throwable) {
-                Log.e(TAG, "Failed to download ${mf.name}", e)
-                target.delete()
-                _progress.value = Progress.Failed(
-                    message = "${mf.name}: ${e.message ?: e.javaClass.simpleName}"
-                )
-                throw IOException("Download failed for ${mf.name}", e)
+            // Final integrity check — refuse to declare success with a truncated file.
+            if (!isSherpaModelReady(context)) {
+                _progress.value = Progress.Failed("Model files are incomplete")
+                throw IOException("Model files are incomplete after download")
             }
+            _progress.value = Progress.Done
+        } finally {
+            // Release the single-flight latch whether we succeeded or failed so
+            // a Tap-Retry works without needing an Activity restart.
+            inflight.set(false)
         }
-        // Final integrity check — refuse to declare success with a truncated file.
-        if (!isSherpaModelReady(context)) {
-            _progress.value = Progress.Failed("Model files are incomplete")
-            throw IOException("Model files are incomplete after download")
-        }
-        _progress.value = Progress.Done
     }
 
     /**
@@ -569,14 +595,35 @@ class SingleAudioPipeline(
     /** Caller-supplied extra hotword phrases (e.g. muqatta'at expansions). */
     private val extraPhrasesProvider: () -> List<String> = { emptyList() }
 ) {
+    /**
+     * Coarse lifecycle state of the pipeline, exposed for the Compose UI so it
+     * can show a "Loading recognizer…" affordance instead of ANR-ing when the
+     * 296 MB ONNX encoder first lands in the ONNX Runtime.
+     *
+     * The recognizer is NOT ready to drive AudioRecord through [startReadLoop]
+     * until state flips to [State.Running]. Mirrors the [running] boolean but
+     * with an explicit "Loading" transition so the UI can distinguish "starting
+     * (loading model on IO)" from "started".
+     */
+    sealed interface State {
+        data object Idle : State
+        data object Loading : State
+        data object Running : State
+        data class Failed(val message: String) : State
+    }
+
+    private val _state = MutableStateFlow<State>(State.Idle)
+    val state: StateFlow<State> = _state.asStateFlow()
+
+    /** True iff the pipeline is fully up (AudioRecord + recognizer live). */
     @Volatile var running: Boolean = false
         private set
 
     private val sampleRate = 16_000
 
     // Native recognizer lifecycle.
-    private var recognizer: OnlineRecognizer? = null
-    private var stream: OnlineStream? = null
+    @Volatile private var recognizer: OnlineRecognizer? = null
+    @Volatile private var stream: OnlineStream? = null
 
     // Background read/decode thread.
     private var job: Job? = null
@@ -604,45 +651,85 @@ class SingleAudioPipeline(
     private var audio = FloatArray(sampleRate * 10)
     private var audioSize = 0
     private val audioSync = Any()
-    private var matcher: AyahWordMatcher? = null
+    @Volatile private var matcher: AyahWordMatcher? = null
 
     /**
-     * Resolves + opens the recognizer and starts the worker thread.
+     * Cancel-during-load latch. Set to true by [stop] so that an in-flight
+     * [start] IO job — still busy constructing the 296 MB ONNX recognizer —
+     * knows NOT to flip `running=true` and tear itself down instead. Without
+     * this, a user who taps the mic, sees `isListening` go true immediately,
+     * then taps Stop before the recognizer finishes loading (a 2–5 s window on
+     * the A05s) would end up with a fully-loaded recognizer + live AudioRecord
+     * running under a deactivated UI, leaking mic + 300 MB RSS until the next
+     * pipeline reload.
+     */
+    @Volatile private var cancelledDuringLoad: Boolean = false
+
+    /**
+     * Kicks off asynchronous recognizer + AudioRecord startup. Returns
+     * immediately — the heavy work `createOnlineRecognizer(...)` (which loads
+     * the 296 MB int8 encoder ONNX + ORT init, taking 2–5 s on the Samsung
+     * A05s) runs on [Dispatchers.IO], NEVER on the Compose main thread which
+     * would otherwise ANR the app and Android would auto-kill it.
      *
-     * Returns false if either (a) the model files aren't on disk yet (caller
-     * must launch the sherpa downloader UI first) or (b) AudioRecord couldn't
-     * be initialised (microphone busy / denied). On false, `running` is left
-     * false and the caller surfaces an error in Compose state the same way
-     * `MicRecorderController.start()` does today.
+     * Lifecycle outcome is observable via [state]:
+     *  - `Idle`     : pipeline was never started,
+     *  - `Loading`  : recognizer is being constructed on IO,
+     *  - `Running`  : AudioRecord is live, partials are flowing,
+     *  - `Failed`   : construction failed (mic busy / model corrupted).
+     *
+     * Returns `false` synchronously ONLY when the model isn't on disk yet
+     * (caller must launch the sherpa downloader UI first). Every other case
+     * returns `true` to indicate "async start accepted", and the UI watches
+     * [state] to know when audio is actually live.
+     *
+     * Safe to call from main thread — does NO heavy work inline.
      */
     @Synchronized
     fun start(): Boolean {
-        if (running) return true
+        if (running || _state.value is State.Loading) return true
         if (!isSherpaModelReady(context)) {
             Log.w(TAG, "start(): model not downloaded yet")
             return false
         }
-        // (Re)build the hotwords file from the active ayah range. The hotwords
-        // bias (layer i) is applied at recognizer-construction-time per the
-        // Sherpa README; for per-stream hotword overrides there is the
-        // `OnlineRecognizer#createStream(hotwords: String)` API, which we use
-        // below when starting the stream so changing the ayah range mid-recital
-        // can be hot-reloaded via [updateHotwords] without rebuilding the
-        // recognizer.
-        val ayahWords = ayahWordsProvider()
-        matcher = AyahWordMatcher(ayahWords)
-        val hotwordsPath = writeHotwordsFile(context, ayahWords, extraPhrasesProvider())
-        return try {
-            recognizer = createOnlineRecognizer(context, hotwordsPath)
-            stream = recognizer!!.createStream("")
-            startReadLoop()
-            running = true
-            true
-        } catch (t: Throwable) {
-            Log.e(TAG, "Failed to start Sherpa pipeline", t)
-            teardown()
-            false
+        cancelledDuringLoad = false
+        _state.value = State.Loading
+        job = scope.launch {
+            try {
+                // (Re)build the hotwords file from the active ayah range. The
+                // hotwords bias (layer i) is applied at recognizer-construction-
+                // time per the Sherpa README.
+                val ayahWords = ayahWordsProvider()
+                matcher = AyahWordMatcher(ayahWords)
+                val hotwordsPath = writeHotwordsFile(context, ayahWords, extraPhrasesProvider())
+                // Heavy: loads the 296 MB encoder ONNX into ONNX Runtime.
+                val rec = createOnlineRecognizer(context, hotwordsPath)
+                val st = rec.createStream("")
+                // Cancel-during-load race guard: if [stop] was called while we
+                // were busy constructing the recognizer above, tear it down
+                // instead of flipping running=true. The user already saw
+                // isListening go false synchronously so the UI is correct.
+                if (cancelledDuringLoad) {
+                    try { st.release() } catch (_: Throwable) {}
+                    try { rec.release() } catch (_: Throwable) {}
+                    _state.value = State.Idle
+                    return@launch
+                }
+                recognizer = rec
+                stream = st
+                running = true
+                _state.value = State.Running
+                startReadLoop(st)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Failed to start Sherpa pipeline", t)
+                teardown()
+                _state.value = State.Failed(
+                    t.message ?: t.javaClass.simpleName
+                )
+                running = false
+            }
         }
+        return true
     }
 
     /**
@@ -667,36 +754,61 @@ class SingleAudioPipeline(
     }
 
     /**
-     * Stops the worker, releases the recognizer & stream, and returns the
-     * accumulated full recitation PCM (16 kHz mono, [-1,1]). The returned
-     * FloatArray is the same shape [MicRecorderController.stop] produced, so
-     * the existing TajweedNet feeding path consumes it unchanged.
+     * Stops the worker, releases the recognizer & stream asynchronously, and
+     * returns the accumulated full recitation PCM (16 kHz mono, [-1,1]).
+     *
+     * CRITICAL: this MUST be safe to call from the Compose main thread. The
+     * previous implementation did `runBlocking { job?.join() }` which blocks
+     * main until the AudioRecord-worker drains its current read buffer — on
+     * the Samsung A05s this is enough to trip Android's 5s ANR watchdog when
+     * the app is shutting down, leading to "the app exits automatically" the
+     * user reported. We now flip `running=false` (so the worker's own loop
+     * finishes on its next iteration) and copy out the audio accumulator
+     * synchronously — no join, no main-thread block. Native teardown is then
+     * scheduled on the IO scope, which is fine because the recognizer/stream
+     * handles become unreachable from the worker once `running` is false and
+     * the worker's finally block releases the AudioRecord itself.
      */
     @Synchronized
     fun stop(): FloatArray {
-        if (!running) return FloatArray(0)
+        if (!running) {
+            // Even when not running, we may be MID-LOAD (state == Loading).
+            // Flip the cancel latch so the start IO job tears down the
+            // recognizer it is currently constructing rather than letting it
+            // go live after the user already gave up on this session.
+            cancelledDuringLoad = true
+            return FloatArray(0)
+        }
         running = false
-        // Signal end-of-stream to the recognizer (lets the decoder flush a
-        // final endpoint) before teardown.
+        cancelledDuringLoad = true
+        // Tell the recognizer the audio stream is done so the worker doesn't
+        // push more PCM into a half-torn-down recognizer (best-effort; safe to
+        // fail because the worker checks `running` itself).
         try { stream?.inputFinished() } catch (_: Throwable) {}
-        // `Job.join()` and `flushFinal()` are suspend functions; we drive them
-        // through runBlocking because this method is non-suspend and is called
-        // from the Compose UI thread directly (matching the contract of
-        // MicRecorderController.stop()). Both are bounded by the worker's own
-        // running=false guard, so blocking here never deadlocks with the worker.
-        try {
-            kotlinx.coroutines.runBlocking { job?.join(); flushFinal() }
-        } catch (_: Throwable) {}
-        teardown()
-        // The audio accumulator is only touched by the worker thread (and us,
-        // here, after the worker has joined). Plain synchronized avoids the
-        // suspend-only Mutex.withLock.
+        // Snapshot the audio accumulator synchronously. The worker only writes
+        // to it while running=true; setting running=false above guarantees no
+        // further concurrent writes once we enter this @Synchronized block.
         val out: FloatArray
         synchronized(audioSync) {
             out = audio.copyOf(audioSize)
             audio = FloatArray(sampleRate * 10)
             audioSize = 0
         }
+        // Schedule the (potentially slow) native teardown off main. The
+        // listener (if any) is invoked once teardown completes so the UI can
+        // release its references.
+        scope.launch {
+            try { kotlinx.coroutines.delay(0) } catch (_: Throwable) {}
+            teardown()
+            _state.value = State.Idle
+        }
+        // Emit a synthetic endpoint so the partial collector commits the last
+        // segment even though the worker hasn't finished draining yet.
+        _partials.tryEmit(SherpaPartialEvent(
+            partial = emptyList(),
+            rawPartial = "",
+            endpoint = true
+        ))
         return out
     }
 
@@ -710,11 +822,20 @@ class SingleAudioPipeline(
 
     /** Releases native resources unconditionally (lifecycle teardown). */
     fun release() {
-        if (running) stop()
+        running = false
+        cancelledDuringLoad = true
+        try { stream?.inputFinished() } catch (_: Throwable) {}
         scope.cancel()
+        teardown()
+        _state.value = State.Idle
     }
 
-    private fun startReadLoop() {
+    private fun startReadLoop(st: OnlineStream) {
+        // Launched on `scope` (IO); runs the AudioRecord loop until `running`
+        // flips false (e.g. [stop] sets it). The recognizer/stream handles are
+        // captured by reference and were assigned before this call, so the
+        // worker doesn't need to re-read `recognizer`/`stream` from the
+        // outside.
         job = scope.launch {
             val minBuf = android.media.AudioRecord.getMinBufferSize(
                 sampleRate,
@@ -724,6 +845,7 @@ class SingleAudioPipeline(
             if (minBuf <= 0) {
                 Log.e(TAG, "getMinBufferSize failed: $minBuf")
                 running = false
+                _state.value = State.Failed("AudioRecord.getMinBufferSize failed")
                 return@launch
             }
             val bufFrames = maxOf(minBuf, sampleRate * 2) / 2
@@ -738,6 +860,7 @@ class SingleAudioPipeline(
                 Log.e(TAG, "AudioRecord not initialised")
                 audioRecord.release()
                 running = false
+                _state.value = State.Failed("AudioRecord not initialised")
                 return@launch
             }
             val shortBuf = ShortArray(bufFrames)
@@ -756,8 +879,8 @@ class SingleAudioPipeline(
                         }
                         // 2) Sherpa OnlineRecognizer: push the same PCM.
                         try {
-                            stream?.acceptWaveform(floats, sampleRate)
-                            decodeAndEmit()
+                            st.acceptWaveform(floats, sampleRate)
+                            decodeAndEmit(st)
                         } catch (t: Throwable) {
                             Log.w(TAG, "decode error", t)
                         }
@@ -785,9 +908,8 @@ class SingleAudioPipeline(
         audio = next
     }
 
-    private fun decodeAndEmit() {
+    private fun decodeAndEmit(st: OnlineStream) {
         val rec = recognizer ?: return
-        val st = stream ?: return
         try {
             while (rec.isReady(st)) rec.decode(st)
             val result = rec.getResult(st)
@@ -809,17 +931,6 @@ class SingleAudioPipeline(
         } catch (t: Throwable) {
             Log.w(TAG, "decode/emit error", t)
         }
-    }
-
-    private suspend fun flushFinal() {
-        // Nothing further to drain at the audio level — `decodeAndEmit` already
-        // drains the decoder after every push. Just emit a synthetic endpoint
-        // so the consumer commits the last partial as final.
-        _partials.tryEmit(SherpaPartialEvent(
-            partial = emptyList(),
-            rawPartial = "",
-            endpoint = true
-        ))
     }
 }
 
