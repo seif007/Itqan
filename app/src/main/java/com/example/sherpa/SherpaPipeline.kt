@@ -654,7 +654,7 @@ class SingleAudioPipeline(
     @Volatile private var matcher: AyahWordMatcher? = null
 
     /**
-     * Cancel-during-load latch. Set to true by [stop] so that an in-flight
+     * Cancel-during-load latch set by [stop]/[release] so an in-flight
      * [start] IO job — still busy constructing the 296 MB ONNX recognizer —
      * knows NOT to flip `running=true` and tear itself down instead. Without
      * this, a user who taps the mic, sees `isListening` go true immediately,
@@ -662,8 +662,44 @@ class SingleAudioPipeline(
      * the A05s) would end up with a fully-loaded recognizer + live AudioRecord
      * running under a deactivated UI, leaking mic + 300 MB RSS until the next
      * pipeline reload.
+     *
+     * SEE ALSO [isStopping] — the related (but distinct) "teardown in flight"
+     * latch, which prevents a NEW [start] from racing the pending teardown
+     * that an OLD [stop]/[release] scheduled on the IO scope.
      */
     @Volatile private var cancelledDuringLoad: Boolean = false
+
+    /**
+     * "Teardown in flight" latch — set true by [stop]/[release] at the moment
+     * they enqueue the **asynchronous** `worker.join() + teardown()` on the IO
+     * scope, and cleared in that same IO job after teardown() has actually
+     * released the native `OnlineRecognizer`/`OnlineStream` handles.
+     *
+     * Why this exists: [stop] and [release] are non-blocking by design (the
+     * main thread can't safely await a native join). But that means a caller
+     * that immediately re-taps the mic — or a `LaunchedEffect(targetOrig)`
+     * that re-fires on a range change — can land in [start] while the OLD
+     * pipeline's teardown is STILL pending on the IO scope. The old teardown
+     * would then either (a) free `stream#A` underneath a still-running worker
+     * `W_A` that [start]#2 just resurrected by flipping `running=true` again
+     * (native use-after-free → SIGSEGV) — or (b) leave behind a zombie
+     * AudioRecord (#A) which \(W_B\)'s new AudioRecord then can't initialize
+     * on the Samsung A05s single-mic invariant ("AudioRecord not initialised"
+     * → user sees "crash from beginning").
+     *
+     * Contract:
+     *  - [start] checks this latch FIRST. If true → previous teardown pending,
+     *    return false synchronously. The caller surfaces a "model still
+     *    shutting down, try again in a moment" message; the user can re-tap
+     *    once `isStopping` flips false (after teardown() finishes on IO).
+     *  - [stop]/[release] set it true the moment they enqueue teardown.
+     *  - The teardown IO job clears it after teardown() returns.
+     *  - [isSherpaModelReady] is **never** affected by this latch (the model
+     *    files stay on disk regardless), so the user still sees the model
+     *    as ready and CAN retry; we just block the early re-start that would
+     *    race the pending teardown.
+     */
+    @Volatile private var isStopping: Boolean = false
 
     /**
      * Kicks off asynchronous recognizer + AudioRecord startup. Returns
@@ -688,6 +724,22 @@ class SingleAudioPipeline(
     @Synchronized
     fun start(): Boolean {
         if (running || _state.value is State.Loading) return true
+        // Block an early re-start while a previous teardown is still pending
+        // on the IO scope. The user tapped mic → pause → tap mic again FAST;
+        // or `LaunchedEffect(targetOrig)` just fired `release()` (which
+        // schedules async teardown) and immediately assigned a fresh pipeline
+        // that is now being asked to start(). Allowing the new start() to
+        // proceed here would race the old teardown: the OLD worker might still
+        // be running (because new running=true would resurrect a worker whose
+        // `while (running)` would see running=true again), or the OLD AudioRe-
+        // cord + OnlineStream might still be half-freed, and we'd get a SIGSEGV
+        // under our feet on the A05s single-mic setup. Bail out instead;
+        // caller surfaces "model still shutting down, try again in a moment".
+        if (isStopping) {
+            Log.w(TAG, "start(): previous teardown still in flight — refusing to start a second pipeline")
+            _state.value = State.Failed("Recognizer is still shutting down — try again in a moment")
+            return false
+        }
         if (!isSherpaModelReady(context)) {
             Log.w(TAG, "start(): model not downloaded yet")
             return false
@@ -732,6 +784,156 @@ class SingleAudioPipeline(
         return true
     }
 
+    // ───────────────────────────────────────────────────────────────────────
+    // Pause / Resume — the lightweight alternative to stop()/start() that the
+    // Memorize+Tajweed FAB needs for a pause-and-continue flow.
+    //
+    // PROBLEM (the bug the user just reported): pausing then tapping the mic
+    // to continue crashed the app, AND every subsequent fresh open also crashed
+    // "from the beginning". Root cause was a stop()/start() race: stop()
+    // enqueues teardown on the IO scope (wait-for-worker + free OnlineStream +
+    // OnlineRecognizer), and a fast follow-up start() — either from a quick
+    // resume tap, OR from the LaunchedEffect(targetOrig) range-change that
+    // instantly reassigns a new pipeline into the holder — could race that
+    // pending teardown. The new start() reads `running=false` and proceeds to
+    // flip `running=true`; that RESURRECTS the OLD worker's `while (running)`
+    // loop, which still holds stream#A. The OLD teardown then frees stream#A
+    // under the resurrected worker's feet -> native use-after-free -> SIGSEGV.
+    // Worse, on the Samsung A05s the OLD AudioRecord#A would still be holding
+    // the single mic HAL, so AudioRecord#B's `STATE_INITIALIZED` check returned
+    // false ("AudioRecord not initialised") and the user saw what felt like a
+    // crash from the very first tap on subsequent launches.
+    //
+    // FIX: pause() / resume() reuse the SAME OnlineRecognizer + OnlineStream
+    // across a pause-resume cycle — only the cheap AudioRecord + worker thread
+    // are torn down on pause and re-spawned on resume. The 296 MB ONNX stays
+    // loaded in memory so there's no 2-5 s reload either. Teardown ONLY
+    // happens on the explicit [stop] terminal flow (the "Stop Listening" tap
+    // that ends the recitation session) or [release] (range change / app
+    // background) — never on the FAB pause-then-continue path.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /**
+     * "Soft stop" for a pause-and-resume flow: stops the AudioRecord worker and
+     * releases ONLY the AudioRecord (cheap Android-resource release), leaving
+     * the [OnlineRecognizer] + [OnlineStream] (and the 296 MB ONNX weights
+     * loaded in memory) intact so the next [resume] / [start] can re-spawn
+     * the worker in milliseconds without reloading the model.
+     *
+     * Returns the audio captured since the last resume in 16 kHz mono [-1,1],
+     * matching [stop]'s shape so the TajweedNet scorer unchanged.
+     *
+     * Idempotent: calling pause() when already paused is a no-op (returns an
+     * empty FloatArray). The `paused` flag distinguishes "never started" from
+     * "started and paused", which [resume] uses to decide whether to fresh
+     * start (no recognizer yet → fall through to [start]) or resume (re-spawn
+     * the worker on the existing stream).
+     */
+    @Synchronized
+    fun pause(): FloatArray {
+        if (!running) return FloatArray(0)
+        running = false
+        cancelledDuringLoad = true
+        // The AudioRecord handle will be released by the worker's `finally`
+        // block once it observes running=false and exits its loop. We MUST NOT
+        // call [resume] until that finally block has actually released the OLD
+        // AudioRecord — on the Samsung A05s the mic HAL is a single-instance
+        // resource, so a new AudioRecord created before the old one is released
+        // will return STATE_UNINITIALIZED and the user sees "the mic crashes
+        // from the beginning". [resume] therefore waits on the OLD job's
+        // completion (job?.join()) before spawning the new AudioRecord.
+        val out: FloatArray
+        synchronized(audioSync) {
+            out = audio.copyOf(audioSize)
+            audio = FloatArray(sampleRate * 10)
+            audioSize = 0
+        }
+        try { stream?.inputFinished() } catch (_: Throwable) {}
+        // Tell Sherpa to commit any in-flight partial as a final segment, so
+        // the partials collector (in the UI) appends it to the final transcript
+        // before the worker goes quiet.
+        _partials.tryEmit(SherpaPartialEvent(
+            partial = emptyList(),
+            rawPartial = "",
+            endpoint = true
+        ))
+        paused = true
+        _state.value = State.Idle
+        return out
+    }
+
+    /**
+     * True iff the pipeline has been paused via [pause] (the recognizer/stream
+     * are still live and can be resumed). Distinguishes "never started" from
+     * "started and paused". Cleared by [resume], [stop] (via teardown), and
+     * [release].
+     */
+    @Volatile var paused: Boolean = false
+        private set
+
+    /**
+     * Resumes the pipeline from a [pause]-flipped idle state by re-spawning the
+     * AudioRecord worker on the EXISTING Sherpa [OnlineRecognizer] +
+     * [OnlineStream]. No model reload, no 2-5 s wait, no chance of racing a
+     * previous teardown because pause() did NOT free the natives, only the
+     * AudioRecord (pending the worker's own finally block on the IO scope).
+     *
+     * CRITICAL — the A05s single-mic HAL race: we MUST wait for the OLD
+     * AudioRecord (captured inside the paused W_A worker's closure) to be
+     * released by W_A's `finally` block BEFORE we try to create AudioRecord#B
+     * in W_B. We do this by capturing the OLD `job` reference and having W_B
+     * `job.join()` it (suspended on the IO scope, NOT main) before spawning
+     * the new AudioRecord. This is what makes pause/resume race-free on a
+     * single-mic device.
+     *
+     * Returns false if the pipeline was never started in this session (caller
+     * should fall through to [start]) OR if a teardown is in flight (caller
+     * should retry shortly). Returns true on a successful resume launch —
+     * audio is live when [state] flips back to [State.Running].
+     *
+     * The worker's read/decode loop is identical to `startReadLoop` from [start]:
+     * it grabs a fresh AudioRecord (now that the OLD one is released), pushes
+     * the PCM into the SAME stream, and emits partials — exactly as if the user
+     * had never paused. The decoder's persistent state between pauses is
+     * preserved because we never reset the stream between pause/resume; the
+     * AyahWordMatcher's monotonicity cursor is also preserved, matching user
+     * expectation that the word-by-word highlight continues from where they
+     * left off.
+     */
+    @Synchronized
+    fun resume(): Boolean {
+        if (running) return true
+        if (!paused) return false           // not paused → caller falls through to start()
+        if (isStopping) {                  // defensive: a teardown IS pending
+            Log.w(TAG, "resume(): teardown in flight — caller should retry")
+            return false
+        }
+        val rec = recognizer ?: return false
+        val st = stream ?: return false
+        val oldWorkerToJoin = job          // W_A — captured for join on IO
+        running = true
+        cancelledDuringLoad = false
+        paused = false
+        _state.value = State.Running
+        // Re-spawn the AudioRecord worker on the IO scope, but FIRST join the
+        // old job so the A05s mic HAL is free for the new AudioRecord.
+        job = scope.launch {
+            try { oldWorkerToJoin?.join() } catch (_: Throwable) {}
+            // Defensive: someone could have called stop()/release() while we
+            // were waiting for oldWorkerToJoin. Don't resuscitate a torn-down
+            // pipeline.
+            if (!running || recognizer == null || stream == null) {
+                _state.value = State.Idle
+                return@launch
+            }
+            // Re-spawn the AudioRecord + read-loop body against the SAME
+            // OnlineStream. The OLD AudioRecord has been released by the OLD
+            // worker's finally block (we just joined it), so the single-mic
+            // HAL on the A05s is free for the new AudioRecord instance.
+            runReadLoop(st)
+        }
+        return true
+    }
     /**
      * Notifies the pipeline that the active ayah range changed (e.g. user
      * picked a different surah/ayah). Resets the [AyahWordMatcher]'s
@@ -754,20 +956,8 @@ class SingleAudioPipeline(
     }
 
     /**
-     * Stops the worker, releases the recognizer & stream asynchronously, and
-     * returns the accumulated full recitation PCM (16 kHz mono, [-1,1]).
-     *
-     * CRITICAL: this MUST be safe to call from the Compose main thread. The
-     * previous implementation did `runBlocking { job?.join() }` which blocks
-     * main until the AudioRecord-worker drains its current read buffer — on
-     * the Samsung A05s this is enough to trip Android's 5s ANR watchdog when
-     * the app is shutting down, leading to "the app exits automatically" the
-     * user reported. We now flip `running=false` (so the worker's own loop
-     * finishes on its next iteration) and copy out the audio accumulator
-     * synchronously — no join, no main-thread block. Native teardown is then
-     * scheduled on the IO scope, which is fine because the recognizer/stream
-     * handles become unreachable from the worker once `running` is false and
-     * the worker's finally block releases the AudioRecord itself.
+     * Removes the (now-stale) duplicate comment block above — the canonical
+     * contract is documented in the larger comment that follows.
      */
     /**
      * Stops the worker, releases the recognizer & stream asynchronously, and
@@ -792,17 +982,21 @@ class SingleAudioPipeline(
      * `stream=null`+`stream?.release()` while the worker iterated on `st`.
      *
      * The contract here is now:
-     *   1. flip `running = false` (the worker checks this between iterations,
-     *      so it will exit its loop and stop touching native pointers),
+     *   1. flip `running = false` AND `isStopping = true` (the worker sees
+     *      `running` between iterations and exits; a fast follow-up [start]
+     *      sees `isStopping` and refuses to build a new pipeline until
+     *      teardown is done),
      *   2. snapshot the audio accumulator synchronously (the worker only writes
      *      while running=true),
      *   3. emit the synthetic endpoint so the partial collector commits the
      *      last segment,
-     *   4. SCHEDULE `job.join() + teardown()` on the IO scope — this awaits
-     *      the worker BEFORE freeing native handles, so no concurrent native
-     *      access ever happens. The scheduler coroutine waits on the join
-     *      from the IO scope, which is allowed to block (it is not the
-     *      main thread).
+     *   4. SCHEDULE `job.join() + teardown()` on the IO scope and clear
+     *      `isStopping` AFTER teardown() returns — this awaits the worker
+     *      BEFORE freeing native handles (no concurrent native access), and
+     *      guarantees a re-entry into [start] sees `isStopping == false`
+     *      only once the OLD recognizer/stream/AudioRecord are fully gone.
+     *      The scheduler coroutine waits on the join from the IO scope,
+     *      which is allowed to suspend (it is NOT the main thread).
      */
     @Synchronized
     fun stop(): FloatArray {
@@ -816,6 +1010,15 @@ class SingleAudioPipeline(
         }
         running = false
         cancelledDuringLoad = true
+        // Block a fast re-entry into [start] until the teardown we are about to
+        // schedule has actually finished freeing the native handles. Without
+        // this latch, a user tapping mic → pause → tap mic would race a second
+        // `start()` against the OLD pipeline's pending teardown: the new start
+        // builds recognizer#B and flips running=true, which can resurrect the
+        // OLD worker's `while (running)` loop — that worker then dereferences
+        // stream#A which the OLD teardown is about to free, giving SIGSEGV on
+        // the A05s single-mic setup. SEE [isStopping] doc for the full race.
+        isStopping = true
         // Tell the recognizer the audio stream is done so the worker doesn't
         // push more PCM into a half-torn-down recognizer (best-effort; safe to
         // fail because the worker checks `running` itself).
@@ -836,6 +1039,10 @@ class SingleAudioPipeline(
         scope.launch {
             try { workerToJoin?.join() } catch (_: Throwable) {}
             teardown()
+            // ONLY now — after teardown() has actually freed the native
+            // recognizer/stream handles — clear the gate so a follow-up
+            // [start] can proceed safely.
+            isStopping = false
             _state.value = State.Idle
         }
         // Emit a synthetic endpoint so the partial collector commits the last
@@ -854,6 +1061,9 @@ class SingleAudioPipeline(
         try { recognizer?.release() } catch (_: Throwable) {}
         recognizer = null
         matcher = null
+        // Also clear the pause/resume latch so a follow-up [resume] on this
+        // pipeline doesn't try to re-spawn the worker against freed handles.
+        paused = false
     }
 
     /**
@@ -868,13 +1078,16 @@ class SingleAudioPipeline(
      * "second ayah crashes" bug the user reported).
      *
      * The new contract: we flip `running=false` (worker checks this on its
-     * loop) and `cancelledDuringLoad=true` (start IO job checks this), and we
-     * SCHEDULE the teardown on the IO scope to run AFTER the worker has actually
-     * exited (`job?.join()`). The new pipeline that replaces THIS one runs on
-     * its own fresh `CoroutineScope` so it can't collide with this scheduled
-     * teardown either — even on a hot range-change burst (Compose cancelling
-     * the old LaunchedEffect mid-flight), the `launch` here stays alive until
-     * the worker drains because it captures its parent-job reference.
+     * loop) and `cancelledDuringLoad=true` (start IO job checks this) AND
+     * `isStopping=true` (any follow-up [start] refuses to proceed until
+     * teardown is done — see [isStopping] doc for the stop/start race it
+     * closes), and we SCHEDULE the teardown on the IO scope to run AFTER the
+     * worker has actually exited (`job?.join()`). The new pipeline that
+     * replaces THIS one runs on its own fresh `CoroutineScope` so it can't
+     * collide with this scheduled teardown either — even on a hot range-change
+     * burst (Compose cancelling the old LaunchedEffect mid-flight), the
+     * `launch` here stays alive until the worker drains because it captures
+     * its parent-job reference.
      *
      * No synchronous native call from this method, no join-from-main, no
      * ANR risk.
@@ -882,6 +1095,7 @@ class SingleAudioPipeline(
     fun release() {
         running = false
         cancelledDuringLoad = true
+        isStopping = true
         try { stream?.inputFinished() } catch (_: Throwable) {}
         val workerToJoin = job
         // Schedule teardown on the IO scope AFTER the worker has joined. We do
@@ -891,87 +1105,111 @@ class SingleAudioPipeline(
         // CoroutineScope is independent, so the OLD scope becomes unreachable
         // for new work the moment the holder field is overwritten. The single
         // `launch` here completes its `join()+teardown()` and the scope goes
-        // idle.
+        // idle. We also clear `isStopping` AFTER teardown() returns — the
+        // holder field is overwritten by then so a follow-up [start] on the
+        // NEW pipeline sees its own (initially false) isStopping; this clear
+        // only matters as a defensive no-op for any lingering reference.
         scope.launch {
             try { workerToJoin?.join() } catch (_: Throwable) {}
             teardown()
+            isStopping = false
             _state.value = State.Idle
         }
     }
 
+    /**
+     * Launches a fresh AudioRecord worker on the IO scope immediately, capturing
+     * it as [job]. Used by the fresh-start path in [start]. The pause/resume
+     * path's [resume] does its OWN `scope.launch { oldWorkerToJoin.join();
+     * runReadLoop(st) }` so it can ensure the OLD AudioRecord is released before
+     * creating the new one on the single-mic A05s.
+     */
     private fun startReadLoop(st: OnlineStream) {
-        // Launched on `scope` (IO); runs the AudioRecord loop until `running`
-        // flips false (e.g. [stop] sets it). The recognizer/stream handles are
-        // captured by reference and were assigned before this call, so the
-        // worker doesn't need to re-read `recognizer`/`stream` from the
-        // outside.
-        job = scope.launch {
-            val minBuf = android.media.AudioRecord.getMinBufferSize(
-                sampleRate,
-                android.media.AudioFormat.CHANNEL_IN_MONO,
-                android.media.AudioFormat.ENCODING_PCM_16BIT
-            )
-            if (minBuf <= 0) {
-                Log.e(TAG, "getMinBufferSize failed: $minBuf")
-                running = false
-                _state.value = State.Failed("AudioRecord.getMinBufferSize failed")
-                return@launch
-            }
-            val bufFrames = maxOf(minBuf, sampleRate * 2) / 2
-            val audioRecord = android.media.AudioRecord(
-                android.media.MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                android.media.AudioFormat.CHANNEL_IN_MONO,
-                android.media.AudioFormat.ENCODING_PCM_16BIT,
-                bufFrames * 2
-            )
-            if (audioRecord.state != android.media.AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord not initialised")
-                audioRecord.release()
-                running = false
-                _state.value = State.Failed("AudioRecord not initialised")
-                return@launch
-            }
-            val shortBuf = ShortArray(bufFrames)
-            try {
-                audioRecord.startRecording()
-                while (running) {
-                    val n = audioRecord.read(shortBuf, 0, shortBuf.size)
-                    if (n > 0) {
-                        // Re-check `running` between a possibly-blocking
-                        // `audioRecord.read(...)` and the native `acceptWaveform`
-                        // — [stop]/[release] may have landed during the read,
-                        // in which case a teardown-job is queued on this same
-                        // IO scope waiting for the worker to exit; do NOT push
-                        // PCM into `st` after running flips false because that
-                        // job will free `st` the moment this loop returns.
-                        if (!running) break
-                        val floats = FloatArray(n)
-                        for (i in 0 until n) floats[i] = shortBuf[i] / 32768f
-                        // 1) TajweedNet sink: append to the full-audio accumulator.
-                        synchronized(audioSync) {
-                            ensureAudioCapacity(audioSize + n)
-                            for (i in 0 until n) audio[audioSize + i] = floats[i]
-                            audioSize += n
-                        }
-                        // 2) Sherpa OnlineRecognizer: push the same PCM.
-                        try {
-                            st.acceptWaveform(floats, sampleRate)
-                            decodeAndEmit(st)
-                        } catch (t: Throwable) {
-                            Log.w(TAG, "decode error", t)
-                        }
-                    } else if (n == android.media.AudioRecord.ERROR ||
-                        n == android.media.AudioRecord.ERROR_INVALID_OPERATION) {
-                        break
+        job = scope.launch { runReadLoop(st) }
+    }
+
+    /**
+     * The AudioRecord + decode worker body. Runs inside whichever coroutine it
+     * is invoked from (the fresh-start `startReadLoop` launcher, or the
+     * pause/resume `[resume]` launcher that first joins the OLD worker so the
+     * single-mic HAL is free before creating the new AudioRecord).
+     *
+     * Body sketch: getMinBufferSize → make AudioRecord → startRecording →
+     * `while (running) { read shortBuf; convert; append to audioSync sink;
+     * st.acceptWaveform(floats, sr); decodeAndEmit(st) }` → finally stop+release
+     * the AudioRecord. Pure Kotlin once the AudioRecord is created — no native
+     * calls outside `st.acceptWaveform` and `decodeAndEmit(st)`.
+     *
+     * State-writer on failure: if minBuf<=0 OR AudioRecord doesn't INIT,
+     * flips `running=false` AND emits [State.Failed("AudioRecord ...")] so the
+     * Compose UI surfaces a "mic unavailable" message instead of locking up.
+     */
+    private suspend fun runReadLoop(st: OnlineStream) {
+        val minBuf = android.media.AudioRecord.getMinBufferSize(
+            sampleRate,
+            android.media.AudioFormat.CHANNEL_IN_MONO,
+            android.media.AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuf <= 0) {
+            Log.e(TAG, "getMinBufferSize failed: $minBuf")
+            running = false
+            _state.value = State.Failed("AudioRecord.getMinBufferSize failed")
+            return
+        }
+        val bufFrames = maxOf(minBuf, sampleRate * 2) / 2
+        val audioRecord = android.media.AudioRecord(
+            android.media.MediaRecorder.AudioSource.MIC,
+            sampleRate,
+            android.media.AudioFormat.CHANNEL_IN_MONO,
+            android.media.AudioFormat.ENCODING_PCM_16BIT,
+            bufFrames * 2
+        )
+        if (audioRecord.state != android.media.AudioRecord.STATE_INITIALIZED) {
+            Log.e(TAG, "AudioRecord not initialised")
+            audioRecord.release()
+            running = false
+            _state.value = State.Failed("AudioRecord not initialised")
+            return
+        }
+        val shortBuf = ShortArray(bufFrames)
+        try {
+            audioRecord.startRecording()
+            while (running) {
+                val n = audioRecord.read(shortBuf, 0, shortBuf.size)
+                if (n > 0) {
+                    // Re-check `running` between a possibly-blocking
+                    // `audioRecord.read(...)` and the native `acceptWaveform`
+                    // — [stop]/[release] may have landed during the read,
+                    // in which case a teardown-job is queued on this same
+                    // IO scope waiting for the worker to exit; do NOT push
+                    // PCM into `st` after running flips false because that
+                    // job will free `st` the moment this loop returns.
+                    if (!running) break
+                    val floats = FloatArray(n)
+                    for (i in 0 until n) floats[i] = shortBuf[i] / 32768f
+                    // 1) TajweedNet sink: append to the full-audio accumulator.
+                    synchronized(audioSync) {
+                        ensureAudioCapacity(audioSize + n)
+                        for (i in 0 until n) audio[audioSize + i] = floats[i]
+                        audioSize += n
                     }
+                    // 2) Sherpa OnlineRecognizer: push the same PCM.
+                    try {
+                        st.acceptWaveform(floats, sampleRate)
+                        decodeAndEmit(st)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "decode error", t)
+                    }
+                } else if (n == android.media.AudioRecord.ERROR ||
+                    n == android.media.AudioRecord.ERROR_INVALID_OPERATION) {
+                    break
                 }
-            } catch (t: Throwable) {
-                Log.e(TAG, "AudioRecord read loop crashed", t)
-            } finally {
-                try { audioRecord.stop() } catch (_: Throwable) {}
-                try { audioRecord.release() } catch (_: Throwable) {}
             }
+        } catch (t: Throwable) {
+            Log.e(TAG, "AudioRecord read loop crashed", t)
+        } finally {
+            try { audioRecord.stop() } catch (_: Throwable) {}
+            try { audioRecord.release() } catch (_: Throwable) {}
         }
     }
 

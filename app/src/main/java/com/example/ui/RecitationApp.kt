@@ -2558,6 +2558,24 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             errorMessage = getAppString(isArabic, "Downloading the speech recognizer model — please wait")
             return
         }
+        // Resume fast-path: the pipeline is currently PAUSED (the user paused
+        // by tapping the FAB while it was recording, then tapped again to
+        // continue). re-spawn the AudioRecord worker on the SAME OnlineStream
+        // in milliseconds — no 2-5 s ONNX reload, no stop/start race. The
+        // AyahWordMatcher's monotonicity cursor is preserved so the highlight
+        // picks up from where the user left off.
+        val pipelineNow = tajweedPipelineHolder.pipeline
+        if (pipelineNow != null && pipelineNow.paused) {
+            isListening = true
+            val resumed = pipelineNow.resume()
+            if (resumed) {
+                viewModel.preloadTajweedModel()
+                return
+            }
+            // resume() could not proceed (e.g. a teardown is in flight) — fall
+            // through to start() below, which has its own gate for the same
+            // race.
+        }
         spokenTimings.clear()
         currentWordCount = 0
         tajweedFinalSpokenText = ""
@@ -2584,22 +2602,35 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     }
 
     fun stopTajweedSession() {
+        // PAUSE-PREFERRED: tap-the-mic-to-pause applies `pause()` so the
+        // recognizer + stream are KEPT warm in memory for a fast `resume()`
+        // on the next mic tap. This is the bug the user just hit — pause then
+        // resume crashed because the previous stop()-then-fast-restart() race
+        // resurrected the worker underneath a pending teardown, freeing stream
+        // under the worker's feet -> SIGSEGV -> "app crashes from the beginning
+        // every subsequent launch". pause()/resume() keep the natives alive
+        // across the pause, only the cheap AudioRecord is torn down. The full
+        // teardown still happens on range change via `release()`.
+        //
         // Tolerate the "tap-stop-during-load" race: the user may tap the mic,
         // see isListening go true immediately, and tap again before the
         // recognizer finishes constructing on IO. `running` stays false until
         // the IO job succeeds, so `tajweedPipelineHolder.running` is false —
-        // but isListening was set true optimistically. Clear both, and the IO
-        // job's eventual `running=true` / state=Running write is harmless
-        // because stop() will already have flipped them back. We also call
-        // pipeline.stop() defensively — it's a no-op if `running` is false,
-        // and we add the @Volatile guard so the warm-native path sets
-        // running=false before tearing down.
+        // but isListening was set true optimistically. Clear both, the IO job's
+        // eventual `running=true` write is harmless because pause()/stop() will
+        // already have flipped them back. We also call pipeline.pause()/
+        // stop() defensively — pause() is a no-op if `running` is false.
         val wasListening = isListening || tajweedPipelineHolder.running
         if (!wasListening) {
             isListening = false
             return
         }
-        val audio = if (tajweedPipelineHolder.running) tajweedPipelineHolder.stop() else FloatArray(0)
+        val audio = if (tajweedPipelineHolder.running) {
+            // pause() keeps the recognizer+stream alive for fast resume.
+            tajweedPipelineHolder.pipeline?.pause() ?: FloatArray(0)
+        } else {
+            FloatArray(0)
+        }
         tajweedRecordedAudio = audio
         tajweedRecordingDurationMs = (audio.size * 1000L) / 16000
         try { speechRecognizer?.stopListening() } catch (e: Throwable) {}
@@ -5511,8 +5542,12 @@ class TajweedPipelineHolder {
 
     /** Same semantics as [SingleAudioPipeline.running], null-safe. */
     val running: Boolean get() = pipeline?.running ?: false
+    /** True iff the pipeline is currently paused (fast-resume ready). */
+    val paused: Boolean get() = pipeline?.paused ?: false
     /** Null-safe passthrough for `pipeline.stop()`. */
     fun stop(): FloatArray = pipeline?.stop() ?: FloatArray(0)
+    /** Null-safe passthrough for `pipeline.pause()` (kept recognition warm). */
+    fun pause(): FloatArray = pipeline?.pause() ?: FloatArray(0)
     /** Null-safe passthrough for `pipeline.release()`. */
     fun release() { pipeline?.release() }
 
