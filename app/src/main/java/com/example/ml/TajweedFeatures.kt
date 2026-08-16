@@ -220,8 +220,8 @@ object TajweedFeatures {
         // (The previous Kotlin port used the global quietest frame + any rising
         // edge -- the "old crude cue" explicitly rejected by rule_acoustics.py --
         // which produced out-of-distribution ev[2]/ev[3] for the Qalqalah head.)
-        val lo_i = max(1, nF / 6)
-        val hi_i = max(2, (5 * nF) / 6)
+        val lo_i = max(1, nF / 6).coerceAtMost((nF - 1).coerceAtLeast(0))
+        val hi_i = max(2, (5 * nF) / 6).coerceAtMost(nF)
         val W = max(2, (0.03f * SR / HOP_MS).toInt())   // ~30 ms of frames
         var closure = 0f
         var onset = 0f

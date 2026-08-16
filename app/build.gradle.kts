@@ -1,4 +1,4 @@
-plugins {
+﻿plugins {
   alias(libs.plugins.android.application)
   alias(libs.plugins.kotlin.compose)
   alias(libs.plugins.google.devtools.ksp)
@@ -11,7 +11,7 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.aistudio.recitationpractice.zwtpxq"
+    applicationId = "com.aistudio.recitationpractice.quranstt"
     minSdk = 24
     targetSdk = 36
     versionCode = 1
@@ -55,7 +55,29 @@ android {
     compose = true
     buildConfig = true
   }
-  testOptions { unitTests { isIncludeAndroidResources = true } }
+  testOptions {
+    unitTests {
+      isIncludeAndroidResources = true
+      // The PC-side harness loads the 166 MB ONNX graph (and the Android
+      // artifact's own shared libs must not shadow the desktop natives).
+      // Heap is 1g, not 2g/4g: the ONNX graph lives in NATIVE memory, and on
+      // this 8 GB box (only ~2 GB free after Chrome + ZCode + Windows) a 2g
+      // test JVM plus the Gradle daemon froze the machine. The harness keeps
+      // its per-test audio buffers small (one surah at a time), so 1g heap is
+      // plenty for the JVM-side objects.
+      //
+      // forkEvery=1 + maxParallelForks=1: each test CLASS runs in its own JVM,
+      // sequentially. The ~167 MB ONNX native allocation is freed when that
+      // JVM exits, so native memory never accumulates across the two heavy
+      // harness classes — the accumulation is what froze the 8 GB box.
+      all {
+        it.maxHeapSize = "1g"
+        it.systemProperty("file.encoding", "UTF-8")
+        it.setForkEvery(1)
+        it.maxParallelForks = 1
+      }
+    }
+  }
 }
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
@@ -118,14 +140,27 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.tooling)
   "ksp"(libs.androidx.room.compiler)
   "ksp"(libs.moshi.kotlin.codegen)
-  testImplementation("javazoom:jlayer:1.0.1")
+testImplementation("javazoom:jlayer:1.0.1")
+  // PC-side end-to-end STT harness (PcQuranSttEndToEndTest): loads the SAME
+  // quran_stt ONNX model with the DESKTOP onnxruntime so unit tests can run the
+  // real recognizer on real audio without a device. The Android artifact stays
+  // on the main compile classpath (identical ai.onnxruntime API); at test
+  // RUNTIME the Android natives would shadow the desktop ones, so the Android
+  // artifact is excluded from the test runtime classpath below.
+  testImplementation("com.microsoft.onnxruntime:onnxruntime:1.17.1")
 
-  // Sherpa-ONNX offline streaming speech recognizer (prebuilt AAR, vendored in
-  // app/libs/). Drives the Memorize+Tajweed pipeline: one AudioRecord buffer is
-  // split between this recognizer and the existing TajweedNet sink, so we
-  // satisfy the single-mic invariant on devices like the A05s. The AAR's
-  // classes.jar provides com.k2fsa.sherpa.onnx.* and the jni/<abi>/ .so files.
-  // The leading `:` + `@aar` extension is Gradle's flatDir coordinate syntax —
-  // resolved against the app/libs/ flatDir repo declared in settings.gradle.kts.
-  implementation(":sherpa-onnx-1.13.4@aar")
+  // ONNX Runtime (Android) drives the FastConformer CTC model from
+  // Saboorhsn/quran-stt-onnx bundled in assets/quran_stt/. Runs on the CPU EP.
+  implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.1")
 }
+
+// Keep the Android ORT natives OFF the unit-test runtime so the desktop
+// onnxruntime (added above as a testImplementation) loads ITS natives and can
+// run the same quran_stt model on the PC. (testRuntimeClasspath is created
+// lazily by AGP, hence configureEach.)
+configurations.configureEach {
+  if (name == "testRuntimeClasspath") {
+    exclude(group = "com.microsoft.onnxruntime", module = "onnxruntime-android")
+  }
+}
+

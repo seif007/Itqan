@@ -15,10 +15,25 @@ For every word the user utters:
    `"Madd"`, `"Al-Lam"`, `"Ikhfa"`, etc. This is a deterministic rules table implemented in
    `TajweedRules.kt`, and it is **identical to what the calibration + training pipeline
    used**, so the rule label seen by the model matches the label the rule-detector expects.
-2. **Audio slicing:** the most recent audio buffer is sliced around the matched word using
-   either the `SpokenWordTiming` clocked by the SpeechRecognizer, or — in Memorize+Tajweed
-   mode — the `MicRecorderController`'s own raw PCM frames, segmented per-word by our own
-   merge/heuristic window.
+2. **Audio slicing:** the captured audio is sliced around the matched word.
+   In Memorize+Tajweed mode the audio comes from the Sherpa-ONNX pipeline's
+   **UN-GATED** accumulator (`SherpaPipeline.snapshotRawAudio()` live, or
+   `pause()`'s return value post-stop): every 250 ms mic chunk including
+   inter-word silence, in real time. (The RMS-gated STT buffer is NOT used
+   for scoring — it glues words together and compresses the timeline, which
+   the E2E harness proved is out-of-distribution for TajweedNet and
+   misaligns the wall-clock word timings.) The Tajweed Rules Coach card gets
+   the same un-gated buffer via `pause()`. The slice geometry matches the
+   TRAINING clips (`prepare_dataset.py`):
+   - **single-word rules** (MADD, GHUNNAH, QALQALAH, ALLAM): the word's own
+     span ±100 ms, widened to a 600 ms minimum, capped at 2 s (the model's
+     log-mel view is MAX_FRAMES=200 ≈ 2 s);
+   - **cross-word rules** (IDGHAM, IKHFA, IZHAR, MEEM_SAKINAH): from the
+     trigger word's start to the NEXT word's end (+100 ms margins) — the cue
+     lives at the boundary, and the training clips span exactly this cut
+     (~1.8–2.1 s median).
+   The slice is then silence-trimmed (`trimSilence`, RMS-gated,
+   loudness-independent) so the model sees speech, not silence padding.
 3. **Feature extraction:** `TajweedFeatures.extract(audio)` builds:
    - a 40 × T log-mel spectrogram,
    - a normalized duration scalar (`dur`),
@@ -30,6 +45,21 @@ For every word the user utters:
 5. **Verdict:** each word's score is compared against `decisionThresholdForHead(rule)`
    (see §3). `P(correct) < threshold` ⇒ `WordAnalysis.status = TAJWEED_ERROR`, and the
    corresponding `tajweedRule` + `tajweedAcousticFeedback` are attached.
+
+   **Bounded confirmation search (false-popup guard).** The `SpokenWordTiming`
+   wall clock is the EMISSION time of the word, which can be offset from the
+   word's true audio position by up to the 4 s decode window (and merge/repair
+   re-emissions can shift it in either direction). A single window at the
+   nominal position therefore sometimes lands on the wrong audio and would
+   flag a correct recitation. So before a `TAJWEED_ERROR` is issued, the
+   scorer slides a training-sized window (word-span 0.4–1.6 s for single-word
+   rules, 2.0 s for cross-word rules) over ±6 s around the nominal position
+   and takes the BEST score; the error is only flagged if every position
+   stays below threshold. A genuine mispronunciation fails everywhere; a
+   timing misalignment recovers. The extra cost is paid only for words about
+   to be flagged, and the search breaks as soon as any position passes.
+   Validated 15/15 by `PcTajweedFalsePositiveTest` (zero false TAJWEED_ERROR
+   on correct Alafasy recitations across 15 surahs).
 
 ## 2. TajweedNet architecture (`TajweedNet.kt`)
 
@@ -87,9 +117,13 @@ SpeechRecognizer advances through the target text. On a wrong or skipped word th
 banner appears, an `errorIndex` is computed, and the alignment stops advancing until the
 user recites correctly — no tajweed analysis is engaged, so the user pays no battery tax.
 
-**Memorize + Tajweed:** the same word-tracking runs, but `analyzeRecitationDetails` ALSO
-passes the per-word audio to `RecitationAnalyzer.analyze(..., [rule], threshold)` for any
-word that the rule-detector tagged. When the model judges `P(correct) < threshold`:
+**Memorize + Tajweed:** word-tracking runs on the **Sherpa-ONNX** offline
+recognizer (`SherpaPipeline`): a single `AudioRecord` feeds both the STT
+stream (RMS-gated buffer) and the TajweedNet scorer sink (un-gated buffer).
+`analyzeRecitationDetails` ALSO passes the per-word audio to
+`RecitationAnalyzer.analyze(..., [rule], threshold)` for any word that the
+rule-detector tagged. When the model judges `P(correct) < threshold` (after
+the bounded confirmation search, §1 step 5):
 
 - the word's `status` becomes `TAJWEED_ERROR`,
 - a separate piece of UI state (`latestTajweedPopup`) is set to `(ruleLabel, wordIndex)`,

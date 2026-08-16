@@ -65,31 +65,34 @@ class AyahWordMatcherTest {
 
     @Test
     fun `AyahWordMatcher never shrinks the emitted transcript on redecode`() {
-        // First partial: 3 clean words.
+        // clean() is now PURE: monotonicity lives in the pipeline's
+        // monotonicMerge (current decode is ground truth; words it missed are
+        // PREPENDED in reading order). This pins the pure contract — a
+        // shorter re-decode returns the shorter list, and the caller's merge
+        // (not the matcher) keeps the emission monotone.
         val matcher = AyahWordMatcher(baqarah2Words)
         val first = matcher.clean("uhm ذَٰلِكَ ٱلْكِتَٰبُ لَا")
         assertEquals(listOf("ذَٰلِكَ", "ٱلْكِتَٰبُ", "لَا"), first)
 
-        // Second partial: Sherpa re-decodes from a slightly later frame and the
-        // beam temporarily drops "ٱلْكِتَٰبُ" — outputting ["ذَٰلِكَ", "لَا"].
-        // The monotonicity guard must NOT let this shrink the UI cursor.
+        // Sherpa re-decodes from a slightly later frame and the beam
+        // temporarily drops "ٱلْكِتَٰبُ" — the pure clean() honors it.
         val second = matcher.clean("ذَٰلِكَ لَا")
-        // Guard keeps the longer prior list and appends any genuinely-new tail.
-        // The merged result is the union of last + cleanup-of-second, respecting
-        // order: ["ذَٰلِكَ", "ٱلْكِتَٰبُ", "لَا"] (no new tail in this case).
-        assertEquals(first, second)
+        assertEquals(listOf("ذَٰلِكَ", "لَا"), second)
+
+        // The pipeline's monotonicMerge then prepends the missed word back,
+        // restoring reading order: [missed] + [current decode].
+        val missed = first.filterNot { it in second }
+        assertEquals(listOf("ٱلْكِتَٰبُ"), missed)
     }
 
     @Test
     fun `AyahWordMatcher ignores empty or whitespace-only partials`() {
         val matcher = AyahWordMatcher(baqarah2Words)
-        // Empty string should not crash and should not change the last state.
+        // Empty string should not crash and returns an empty list (pure).
         assertEquals(emptyList<String>(), matcher.clean(""))
-        // After a real partial, subsequent empties stay monotonic.
         matcher.clean("ذَٰلِكَ")
         val after = matcher.clean("   ")
-        // Returns the prior emitted list (no shrink).
-        assertEquals(listOf("ذَٰلِكَ"), after)
+        assertEquals(emptyList<String>(), after)
     }
 
     @Test
