@@ -108,3 +108,6 @@ training/reference_features.json
 # ----------------------------------------------------------------------------
 **/fixtures/*.wav
 **/fixtures/*.raw
+
+# Local device log dumps
+test_logs.txt

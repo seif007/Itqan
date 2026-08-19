@@ -47,6 +47,132 @@ object TajweedFeatures {
 
     // rule_acoustics STFT window depends on length; build per call lazily (cached by size)
 
+    // -------------------- FFT-backed DFT (Bluestein chirp-z) --------------------
+    // The previous implementation ran a naive O(N^2) DFT per frame: 201 bins x
+    // 400 taps for the log-mel and 257 bins x 512 taps for the evidence STFT,
+    // each tap a Double cos+sin. At ~200 frames per clip that alone cost
+    // ~150-250 ms per analyze() call on the A05s — and the tajweed loop's
+    // confirmation search runs dozens of analyze() calls per pass (measured
+    // ~33 s per pass). Bluestein rewrites the DFT as a convolution computable
+    // with power-of-two FFTs: O(N log N), numerically identical (Double
+    // throughout, parity-checked against the naive DFT in unit tests).
+    private data class BluesteinPlan(
+        val n: Int,
+        val m: Int,                       // convolution length (power of two)
+        val chirpRe: DoubleArray,         // exp(-i*pi*k^2/n), k < n
+        val chirpIm: DoubleArray,
+        val bFftRe: DoubleArray,          // FFT of the conjugate-chirp kernel
+        val bFftIm: DoubleArray
+    )
+
+    private val planCache = HashMap<Int, BluesteinPlan>()
+
+    private fun planFor(n: Int): BluesteinPlan {
+        synchronized(planCache) { planCache[n]?.let { return it } }
+        var m = 1
+        while (m < 2 * n - 1) m = m shl 1
+        val chirpRe = DoubleArray(n)
+        val chirpIm = DoubleArray(n)
+        for (k in 0 until n) {
+            // k^2 mod 2n keeps the angle in [0, 2pi) without precision loss
+            val kk = ((k.toLong() * k) % (2L * n)).toDouble()
+            val ang = -PI * kk / n
+            chirpRe[k] = cos(ang)
+            chirpIm[k] = sin(ang)
+        }
+        // b[k] = conj(chirp[k]) wrapped for circular convolution of length m
+        val bRe = DoubleArray(m)
+        val bIm = DoubleArray(m)
+        bRe[0] = chirpRe[0]; bIm[0] = -chirpIm[0]
+        for (k in 1 until n) {
+            bRe[k] = chirpRe[k]; bIm[k] = -chirpIm[k]
+            bRe[m - k] = chirpRe[k]; bIm[m - k] = -chirpIm[k]
+        }
+        fftInPlace(bRe, bIm, false)
+        val plan = BluesteinPlan(n, m, chirpRe, chirpIm, bRe, bIm)
+        synchronized(planCache) { planCache[n] = plan }
+        return plan
+    }
+
+    /** In-place iterative radix-2 Cooley-Tukey FFT. Length must be a power of 2. */
+    private fun fftInPlace(re: DoubleArray, im: DoubleArray, inverse: Boolean) {
+        val n = re.size
+        var j = 0
+        for (i in 1 until n) {
+            var bit = n shr 1
+            while (j and bit != 0) { j = j xor bit; bit = bit shr 1 }
+            j = j xor bit
+            if (i < j) {
+                val tr = re[i]; re[i] = re[j]; re[j] = tr
+                val ti = im[i]; im[i] = im[j]; im[j] = ti
+            }
+        }
+        var len = 2
+        while (len <= n) {
+            val ang = 2.0 * PI / len * (if (inverse) 1.0 else -1.0)
+            val wr = cos(ang); val wi = sin(ang)
+            val half = len shr 1
+            var i = 0
+            while (i < n) {
+                var curR = 1.0; var curI = 0.0
+                for (k in 0 until half) {
+                    val ur = re[i + k]; val ui = im[i + k]
+                    val vr = re[i + k + half] * curR - im[i + k + half] * curI
+                    val vi = re[i + k + half] * curI + im[i + k + half] * curR
+                    re[i + k] = ur + vr; im[i + k] = ui + vi
+                    re[i + k + half] = ur - vr; im[i + k + half] = ui - vi
+                    val nr = curR * wr - curI * wi
+                    curI = curR * wi + curI * wr
+                    curR = nr
+                }
+                i += len
+            }
+            len = len shl 1
+        }
+        if (inverse) {
+            for (i in 0 until n) { re[i] /= n; im[i] /= n }
+        }
+    }
+
+    /**
+     * Reusable real-input DFT worker for a FIXED frame length [n] (one instance
+     * per extract() call, shared across all frames). Writes the first [outSize]
+     * complex DFT bins into [outRe]/[outIm].
+     */
+    private class RealDft(n: Int) {
+        private val plan = planFor(n)
+        private val aRe = DoubleArray(plan.m)
+        private val aIm = DoubleArray(plan.m)
+
+        fun transform(x: FloatArray, outRe: DoubleArray, outIm: DoubleArray, outSize: Int) {
+            val n = plan.n
+            val m = plan.m
+            java.util.Arrays.fill(aRe, 0.0)
+            java.util.Arrays.fill(aIm, 0.0)
+            // a[k] = x[k] * chirp[k]
+            val cRe = plan.chirpRe; val cIm = plan.chirpIm
+            for (k in 0 until n) {
+                val v = x[k].toDouble()
+                aRe[k] = v * cRe[k]
+                aIm[k] = v * cIm[k]
+            }
+            fftInPlace(aRe, aIm, false)
+            val bRe = plan.bFftRe; val bIm = plan.bFftIm
+            for (i in 0 until m) {
+                val pr = aRe[i] * bRe[i] - aIm[i] * bIm[i]
+                val pi = aRe[i] * bIm[i] + aIm[i] * bRe[i]
+                aRe[i] = pr; aIm[i] = pi
+            }
+            fftInPlace(aRe, aIm, true)
+            val lim = minOf(outSize, n)
+            for (k in 0 until lim) {
+                // X[k] = chirp[k] * conv[k]
+                outRe[k] = cRe[k] * aRe[k] - cIm[k] * aIm[k]
+                outIm[k] = cRe[k] * aIm[k] + cIm[k] * aRe[k]
+            }
+        }
+    }
+
     data class Features(
         val logmel: Array<FloatArray>,   // [N_MELS][MAX_FRAMES]
         val dur: Float,                   // dur_sec/4 clipped to 4s
@@ -54,16 +180,28 @@ object TajweedFeatures {
     )
 
     /** Full feature extraction for one clip [0..1] mono @16k. */
-    fun extract(clip: FloatArray, durSec: Float): Features {
+    fun extract(clip: FloatArray, durSec: Float): Features =
+        extractImpl(clip, durSec, useFft = true)
+
+    /**
+     * Naive-DFT reference implementation of [extract], kept ONLY for the JVM
+     * parity test (TajweedFeaturesFftParityTest) that proves the FFT-backed
+     * pipeline is numerically identical to the original O(N^2) one. Never
+     * called from the app.
+     */
+    internal fun extractNaive(clip: FloatArray, durSec: Float): Features =
+        extractImpl(clip, durSec, useFft = false)
+
+    private fun extractImpl(clip: FloatArray, durSec: Float, useFft: Boolean): Features {
         val wav = if (clip.isEmpty()) FloatArray(1) { 0f } else clip.copyOf()
-        val lm = computeLogmel(wav)
+        val lm = computeLogmel(wav, useFft)
         val dur = (min(durSec, 4.0f) / 4.0f)
-        val ev = clipEvidenceVector(wav)
+        val ev = clipEvidenceVector(wav, useFft)
         return Features(lm, dur, ev)
     }
 
     // -------------------- log-mel (matches train.py compute_logmel) --------------------
-    private fun computeLogmel(wav: FloatArray): Array<FloatArray> {
+    private fun computeLogmel(wav: FloatArray, useFft: Boolean): Array<FloatArray> {
         var x = wav
         if (x.size > 1) {
             // ensure mono (already mono) — nothing to do
@@ -86,8 +224,19 @@ object TajweedFeatures {
         }
         // rfft magnitude^2 per frame
         val spec = Array(nFrames) { FloatArray(N_FFT / 2 + 1) }
-        for (i in 0 until nFrames) {
-            rfftMag2(frames[i], spec[i])
+        if (useFft) {
+            val dft = RealDft(N_FFT)
+            val re = DoubleArray(N_FFT / 2 + 1)
+            val im = DoubleArray(N_FFT / 2 + 1)
+            for (i in 0 until nFrames) {
+                dft.transform(frames[i], re, im, N_FFT / 2 + 1)
+                val sp = spec[i]
+                for (k in sp.indices) sp[k] = (re[k] * re[k] + im[k] * im[k]).toFloat()
+            }
+        } else {
+            for (i in 0 until nFrames) {
+                rfftMag2(frames[i], spec[i])
+            }
         }
         // mel = filters @ spec.T  -> (n_mels x nFrames)
         val mel = Array(N_MELS) { FloatArray(nFrames) }
@@ -135,8 +284,8 @@ object TajweedFeatures {
     }
 
     // -------------------- rule_acoustics.ev (matches train.py clip_evidence_vector) ----
-    private fun clipEvidenceVector(wav: FloatArray): FloatArray {
-        val f = clipFeatures(wav)
+    private fun clipEvidenceVector(wav: FloatArray, useFft: Boolean): FloatArray {
+        val f = clipFeatures(wav, useFft)
         if (f == null) return FloatArray(5)
         val raw = floatArrayOf(f.nasalRatio, f.lam, f.closure, f.onset, f.tilt)
         val scale = floatArrayOf(10.0f, 2.0f, 1.0f, 1.0f, 5.0f)
@@ -151,7 +300,7 @@ object TajweedFeatures {
     )
 
     /** Matches rule_acoustics.clip_features. */
-    private fun clipFeatures(y: FloatArray): AcousticDesc? {
+    private fun clipFeatures(y: FloatArray, useFft: Boolean): AcousticDesc? {
         var yy = y
         if (yy.isEmpty()) return null
         if (yy.size < 256) return null
@@ -162,7 +311,7 @@ object TajweedFeatures {
             val inv = 1.0f / peak
             yy = FloatArray(yy.size) { yy[it] * inv }
         }
-        val mag = stftMag(yy)            // (nBins x nFrames)
+        val mag = stftMag(yy, useFft)            // (nBins x nFrames)
         val nBins = mag.size
         val nFrames = mag[0].size
         val freqs = FloatArray(nBins) { i -> (i.toFloat() * SR / RA_N_FFT) }
@@ -264,7 +413,7 @@ object TajweedFeatures {
         )
     }
 
-    private fun stftMag(y: FloatArray): Array<FloatArray> {
+    private fun stftMag(y: FloatArray, useFft: Boolean): Array<FloatArray> {
         val n = y.size
         var nn = n
         var yy = y
@@ -281,16 +430,28 @@ object TajweedFeatures {
         }
         val nBins = RA_N_FFT / 2 + 1
         val out = Array(nBins) { FloatArray(nFrames) }
-        for (i in 0 until nFrames) {
-            val frame = frames[i]
-            for (k in 0 until nBins) {
-                var re = 0.0; var im = 0.0
-                for (m in 0 until RA_N_FFT) {
-                    val ang = -2.0 * PI * k * m / RA_N_FFT
-                    re += frame[m] * cos(ang)
-                    im += frame[m] * sin(ang)
+        if (useFft) {
+            val dft = RealDft(RA_N_FFT)
+            val re = DoubleArray(nBins)
+            val im = DoubleArray(nBins)
+            for (i in 0 until nFrames) {
+                dft.transform(frames[i], re, im, nBins)
+                for (k in 0 until nBins) {
+                    out[k][i] = sqrt(re[k] * re[k] + im[k] * im[k]).toFloat() + 1e-8f
                 }
-                out[k][i] = sqrt(re * re + im * im).toFloat() + 1e-8f
+            }
+        } else {
+            for (i in 0 until nFrames) {
+                val frame = frames[i]
+                for (k in 0 until nBins) {
+                    var re = 0.0; var im = 0.0
+                    for (m in 0 until RA_N_FFT) {
+                        val ang = -2.0 * PI * k * m / RA_N_FFT
+                        re += frame[m] * cos(ang)
+                        im += frame[m] * sin(ang)
+                    }
+                    out[k][i] = sqrt(re * re + im * im).toFloat() + 1e-8f
+                }
             }
         }
         return out

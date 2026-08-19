@@ -22,10 +22,17 @@ import org.json.JSONObject
 class RecitationAnalyzer private constructor(context: Context) {
 
     private val net: TajweedNet
+    // ONNX-Runtime backed net (assets/tajweed_net.onnx). Same graph as [net]
+    // but ~20-30x faster on-device (~10-20 ms vs ~370 ms per forward pass on
+    // the A05s). Used when present; the Kotlin net is the fallback so the app
+    // still works if the ONNX asset is missing or ORT fails to load it.
+    private val netOnnx: TajweedNetOnnx?
 
     init {
         val json = context.assets.open("model_weights.json").bufferedReader().use { it.readText() }
         net = TajweedNet(JSONObject(json))
+        netOnnx = TajweedNetOnnx.create(context)
+        android.util.Log.i("RecitationAnalyzer", if (netOnnx != null) "using ONNX TajweedNet" else "using Kotlin TajweedNet (ONNX unavailable)")
     }
 
     data class RuleResult(
@@ -98,7 +105,14 @@ class RecitationAnalyzer private constructor(context: Context) {
     fun analyze(audio: FloatArray, expectedRules: List<String>, threshold: Float = 0.5f): List<RuleResult> {
         val durSec = audio.size / TajweedFeatures.SR.toFloat()
         val feats = TajweedFeatures.extract(audio, durSec)
-        val logits = net.forward(feats.logmel, feats.dur, feats.ev)
+        // Prefer the ONNX net (native kernels, ~10-20 ms); fall back to the
+        // pure-Kotlin port (~370 ms on the A05s) if ONNX isn't available.
+        val onnx = netOnnx
+        val logits = if (onnx != null) {
+            onnx.forward(feats.logmel, feats.dur, feats.ev)
+        } else {
+            net.forward(feats.logmel, feats.dur, feats.ev)
+        }
         val probs = net.sigmoidLogits(logits)
 
         val targets = if (expectedRules == listOf("NONE")) TajweedFeatures.RULES else expectedRules
