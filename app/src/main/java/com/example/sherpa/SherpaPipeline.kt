@@ -421,6 +421,48 @@ class AyahWordMatcher(
         return null
     }
 
+    /**
+     * Restore a window-edge TRUNCATION of a vocabulary word that landed where
+     * [restoreEdgeFragment]'s position gates don't reach (a MIDDLE token, or a
+     * first token whose trailing letters were cut). The CTC decoder slices the
+     * trailing letter(s) of a word at the sliding-window boundary: لِّلَّه
+     * surfaces as لِلَّ (norm "لل"), which the ≤3-letter fragment rule below
+     * would otherwise DROP — permanently losing the word, so the aligner flags
+     * a false SKIPPED and, after the mistake auto-pause, the resumed session
+     * looks "deaf" because every re-decode truncates the same word again.
+     *
+     * Restore is conservative: the fragment must be a STRICT prefix of EXACTLY
+     * ONE distinct vocabulary word with 1-2 letters missing. Uniqueness is the
+     * guard against the phantom-first-word bug — a generic fragment like "ال"
+     * prefixes many words (ٱللَّه, ٱلرَّحْمَٰن, ٱلْعَٰلَمِين…) and must stay
+     * dropped, while "لل" prefixes only لِّلَّه in the active range and is safe
+     * to restore.
+     */
+    private fun restoreTruncatedWord(norm: String): String? {
+        val cp = norm.codePointCount(0, norm.length)
+        if (cp < 2) return null
+        // A 2-letter fragment may only restore a 1-letter cut (لل → لِلَّه):
+        // allowing 2 missing letters from a 2-letter stem (ال → ٱللَّه) would
+        // re-create the phantom-first-word bug. Longer stems (≥3 letters)
+        // carry enough context to allow a 2-letter cut.
+        val maxMissing = if (cp >= 3) 2 else 1
+        var matchIdx = -1
+        var matchCount = 0
+        val seen = HashSet<String>()
+        for (i in normTargets.indices) {
+            val t = normTargets[i]
+            if (t.length > norm.length && t.startsWith(norm)) {
+                val missing = t.length - norm.length
+                if (missing in 1..maxMissing && seen.add(t)) {
+                    matchCount++
+                    matchIdx = i
+                    if (matchCount > 1) return null   // ambiguous — leave to the drop rule
+                }
+            }
+        }
+        return if (matchCount == 1) canonTargets[matchIdx] else null
+    }
+
     @Synchronized
     fun clean(partial: String): List<String> {
         val rawTokens = partial.split(Regex("\\s+")).filter { it.isNotEmpty() }
@@ -477,9 +519,19 @@ class AyahWordMatcher(
                         // of the committed fragments — "the app isn't
                         // listening". Unmatched tokens of ≤3 letters are ALWAYS
                         // fragments here (a real 1-3 letter Arabic word would
-                        // be an exact vocabulary hit); DROP them — the next
-                        // window re-decodes the completed word whole.
-                        if (norm.codePointCount(0, norm.length) >= 4) {
+                        // be an exact vocabulary hit).
+                        //
+                        // BEFORE dropping, try to restore a window-edge
+                        // TRUNCATION of a unique vocabulary word (لِلَّه → لِلَّ):
+                        // the old "drop it, the next window re-decodes it whole"
+                        // assumption FAILS when the same word is truncated on
+                        // every re-decode — the word is permanently lost, the
+                        // aligner flags a false SKIPPED, and the resumed session
+                        // looks deaf. Restoring the canonical word fixes both.
+                        val truncRestored = restoreTruncatedWord(norm)
+                        if (truncRestored != null) {
+                            cleaned.add(truncRestored)
+                        } else if (norm.codePointCount(0, norm.length) >= 4) {
                             // Terminal mismatch in Arabic script: keep the RAW
                             // token so the downstream aligner flags WRONG/SKIPPED
                             // instead of the user hearing nothing happen.
@@ -698,6 +750,19 @@ class SingleAudioPipeline(
     @Volatile var running: Boolean = false
         private set
 
+    /**
+     * Monotone capture-session epoch. Bumped by [pause]/[stop] and by every
+     * (re)start of the read worker. The read loop captures the epoch at launch
+     * and exits the moment it changes — this is the ONLY reliable way to make a
+     * worker that is blocked inside a blocking `AudioRecord.read()` (returns
+     * every ~250 ms) actually stop when the user pauses and then resumes within
+     * that 250 ms window. Without it the old worker sees `running` flipped back
+     * to true, keeps reading from the OLD AudioRecord, holds the single-mic HAL,
+     * and the NEW AudioRecord can never initialize → total deafness after a
+     * quick pause→resume (the "app doesn't listen after pause+restart" bug).
+     */
+    @Volatile private var captureEpoch = 0
+
     private val sampleRate = 16_000
 
     /** Sliding-window decode geometry (tune by latency on-device). */
@@ -788,7 +853,18 @@ class SingleAudioPipeline(
         lastEmitRaw = emptyList()
         lastEmitCleanMs = LongArray(0)
         lastEmitRawMs = LongArray(0)
+        // Bump the utterance generation: any ASYNC final-decode captured from a
+        // PREVIOUS pause() (see pause()'s scope.launch) must recognize that the
+        // utterance has since restarted and skip its emit — otherwise it would
+        // merge the OLD session's words into the NEW session's freshly-reset log
+        // and emit them as an endpoint, corrupting the resumed transcript and
+        // prematurely setting sessionFinalized (the "deaf after resume" bug).
+        utteranceGen++
     }
+
+    /** Monotone utterance generation, bumped by [resetEmitLogs]. Volatile:
+     *  read by the async final-decode (IO scope) and written on the main thread. */
+    @Volatile private var utteranceGen = 0
 
     private fun rebuildVocab(ayahWords: List<String>) {
         vocabNorm = ayahWords.map { normalizeArabicPub(it) }
@@ -1072,6 +1148,10 @@ class SingleAudioPipeline(
         if (!running) return FloatArray(0)
         running = false
         cancelledDuringLoad = true
+        // Bump the capture epoch so the read worker exits even if a fast
+        // resume() flips `running` back to true before its next loop check
+        // (the worker is blocked inside AudioRecord.read() for up to ~250 ms).
+        captureEpoch++
         // The AudioRecord handle will be released by the worker's `finally`
         // block once it observes running=false and exits its loop. [resume]
         // waits on that old job before creating the new AudioRecord (the A05s
@@ -1101,13 +1181,18 @@ class SingleAudioPipeline(
         // committed anything).
         val oldRead = readJob
         val oldDecode = decodeJob
+        // Capture the utterance generation NOW: if the user resumes before this
+        // async decode fires, resume() bumps the generation and the decode must
+        // skip its emit (it belongs to the OLD utterance — emitting it would
+        // merge stale words into the new session's reset log).
+        val gen = utteranceGen
         scope.launch {
             try { oldRead?.join() } catch (_: Throwable) {}
             try {
                 kotlinx.coroutines.withTimeoutOrNull(3000L) { oldDecode?.join() }
             } catch (_: Throwable) {}
             writeDebugWav(out, "pause")
-            finalDecodeAndEmit(endpoint = true, sessionAudio = out)
+            finalDecodeAndEmit(endpoint = true, sessionAudio = out, expectedGen = gen)
         }
         _partials.tryEmit(SherpaPartialEvent(
             partial = emptyList(),
@@ -1148,6 +1233,62 @@ class SingleAudioPipeline(
      * timeline matches the wall-clock word timings. See [rawAudio].
      */
     fun snapshotRawAudio(): FloatArray = synchronized(audioSync) { rawAudio.copyOf(rawAudioSize) }
+
+    /**
+     * One-off high-quality re-decode of the session tail, for MISTAKE
+     * VERIFICATION. Runs the recognizer over up to the trailing 10 s of the
+     * SAME gated speech-only buffer the live sliding windows consume — but as
+     * a single full-context offline pass (exactly what [finalDecodeAndEmit]
+     * does on pause), which recovers words a 4 s window cut at its edge or
+     * folded mid-span.
+     *
+     * Read-only by design: unlike every other decode path it does NOT touch
+     * the monotonic emit logs ([lastEmitClean]/[lastEmitRaw]) and does NOT
+     * emit a partials event — the caller only wants the word list to decide
+     * whether a candidate WRONG/SKIPPED is real. Serialized against the live
+     * decode loop through [decodeBusy]; returns an EMPTY list when
+     * inconclusive (not running, decoder busy, too little audio, blank
+     * result) so the caller can retry later instead of deciding wrongly.
+     *
+     * Blocking (~0.5-2 s per call on-device); invoke from Dispatchers.IO.
+     */
+    fun verifyTailWords(): List<String> {
+        val rec = recognizer ?: return emptyList()
+        if (!running) return emptyList()
+        if (!decodeBusy.compareAndSet(false, true)) return emptyList()
+        val t0 = System.currentTimeMillis()
+        try {
+            val src = synchronized(audioSync) {
+                if (audioSize <= 0 || lastSpeechFrame < 0) return@synchronized null
+                var fromIdx = maxOf(0, audioSize - sampleRate * 10)
+                // Trim leading silence before the session's first speech frame,
+                // same rule as snapshotWindow().
+                if (sessionSpeechStart >= fromIdx && sessionSpeechStart < audioSize) {
+                    fromIdx = sessionSpeechStart
+                }
+                val weight = audioSize - fromIdx
+                // Never decode a sub-word window (< minDecodeFrames ≈ 1.5 s):
+                // a fragment slice produces bogus words (see snapshotWindow).
+                if (weight < minDecodeFrames) return@synchronized null
+                FloatArray(weight).also { System.arraycopy(audio, fromIdx, it, 0, weight) }
+            } ?: return emptyList()
+            Log.i(TAG, "verifyTailWords(): begin window=${"%.1f".format(src.size / 16000f)}s")
+            val rawText = rec.transcribe(src)
+            if (rawText.isBlank()) {
+                Log.w(TAG, "verifyTailWords(): EMPTY after ${System.currentTimeMillis() - t0}ms — inconclusive")
+                return emptyList()
+            }
+            val words = matcher?.clean(rawText)
+                ?: rawText.split(Regex("\\s+")).filter { it.isNotEmpty() }
+            Log.i(TAG, "verifyTailWords(): done ${System.currentTimeMillis() - t0}ms ${words.size}w '${rawText.take(80)}'")
+            return words
+        } catch (t: Throwable) {
+            Log.w(TAG, "verifyTailWords(): error after ${System.currentTimeMillis() - t0}ms", t)
+            return emptyList()
+        } finally {
+            decodeBusy.set(false)
+        }
+    }
 
     /**
      * Resumes the pipeline from a [pause]-flipped idle state by re-spawning
@@ -1259,6 +1400,9 @@ class SingleAudioPipeline(
         running = false
         cancelledDuringLoad = true
         isStopping = true
+        // Bump the capture epoch so the read worker exits even if it is blocked
+        // inside AudioRecord.read() when `running` flips (see pause()).
+        captureEpoch++
         // Snapshot the audio accumulators synchronously. The workers only write
         // to them while running=true; setting running=false above guarantees no
         // further concurrent writes once we enter this @Synchronized block.
@@ -1373,6 +1517,13 @@ class SingleAudioPipeline(
      * [decodeLoop]/[finalDecodeAndEmit].
      */
     private suspend fun runReadLoop() {
+        // Capture the epoch this worker was launched under. If pause()/stop()
+        // bumps it (even while we are blocked inside read()), we must exit —
+        // checking `running` alone is NOT enough: a fast resume() flips
+        // `running` back to true before our next check and we would keep
+        // reading from the OLD AudioRecord, holding the single-mic HAL and
+        // starving the new session's AudioRecord (total deafness).
+        val myEpoch = captureEpoch
         val minBuf = android.media.AudioRecord.getMinBufferSize(
             sampleRate,
             android.media.AudioFormat.CHANNEL_IN_MONO,
@@ -1386,21 +1537,57 @@ class SingleAudioPipeline(
         }
         // Read chunk: ~250 ms of frames so the decode windows move promptly.
         val bufFrames = maxOf(minBuf / 4, sampleRate / 4)
-        val audioRecord = android.media.AudioRecord(
-            android.media.MediaRecorder.AudioSource.MIC,
-            sampleRate,
-            android.media.AudioFormat.CHANNEL_IN_MONO,
-            android.media.AudioFormat.ENCODING_PCM_16BIT,
-            maxOf(bufFrames * 2, minBuf)
-        )
-        Log.i(TAG, "runReadLoop(): AudioRecord state=${audioRecord.state}")
-        if (audioRecord.state != android.media.AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "AudioRecord not initialised")
-            audioRecord.release()
+        // RETRY LOOP: on the A05s single-mic HAL the microphone is often still
+        // held by the PREVIOUS AudioRecord for a few hundred ms after
+        // pause→resume (its release() returns before the hardware frees the
+        // stream). Constructing the new AudioRecord in that window fails to
+        // initialize — and the old code then set running=false and returned,
+        // killing the session PERMANENTLY: the user recited and saw no words
+        // and no mistake popup ("after pause+restart the app doesn't listen").
+        // Retry the construction every 250 ms (up to ~2 s) while the session
+        // is still supposed to run; only give up after every attempt failed.
+        var audioRecord: android.media.AudioRecord? = null
+        var attempt = 0
+        while (running && myEpoch == captureEpoch && attempt < 8) {
+            attempt++
+            val ar = android.media.AudioRecord(
+                android.media.MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                android.media.AudioFormat.CHANNEL_IN_MONO,
+                android.media.AudioFormat.ENCODING_PCM_16BIT,
+                maxOf(bufFrames * 2, minBuf)
+            )
+            var started = false
+            if (ar.state == android.media.AudioRecord.STATE_INITIALIZED) {
+                try {
+                    ar.startRecording()
+                    started = ar.recordingState == android.media.AudioRecord.RECORDSTATE_RECORDING
+                } catch (t: Throwable) {
+                    Log.w(TAG, "runReadLoop(): startRecording attempt $attempt threw", t)
+                }
+            }
+            if (started) {
+                audioRecord = ar
+                break
+            }
+            Log.w(TAG, "runReadLoop(): AudioRecord attempt $attempt not ready (state=${ar.state}) — retrying in 250ms")
+            try { ar.stop() } catch (_: Throwable) {}
+            try { ar.release() } catch (_: Throwable) {}
+            kotlinx.coroutines.delay(250)
+        }
+        if (audioRecord == null) {
+            if (myEpoch != captureEpoch) {
+                // The session was paused/stopped while we were retrying — exit
+                // quietly WITHOUT touching `running` (a new session may own it).
+                Log.i(TAG, "runReadLoop(): epoch changed during AudioRecord retry — exiting")
+                return
+            }
+            Log.e(TAG, "AudioRecord not initialised after $attempt attempts")
             running = false
-            _state.value = State.Failed("AudioRecord not initialised")
+            _state.value = State.Failed("Microphone could not be started — please try again")
             return
         }
+        Log.i(TAG, "runReadLoop(): AudioRecord state=${audioRecord.state} (attempt $attempt)")
         val shortBuf = ShortArray(bufFrames)
         // RMS gate: a read chunk whose RMS stays below [audioFloorRms]
         // (~-40 dBFS) is treated as silence and NEVER enters the accumulator
@@ -1418,12 +1605,12 @@ class SingleAudioPipeline(
         var droppedChunks = 0L
         var droppedSum = 0L
         try {
-            audioRecord.startRecording()
+            // startRecording() already succeeded inside the retry loop above.
             Log.i(TAG, "runReadLoop(): recording started")
-            while (running) {
+            while (running && myEpoch == captureEpoch) {
                 val n = audioRecord.read(shortBuf, 0, shortBuf.size)
                 if (n > 0) {
-                    if (!running) break
+                    if (!running || myEpoch != captureEpoch) break
                     // Convert once; the UN-GATED scorer sink keeps every chunk
                     // (including silence, real time) while the gated STT sink
                     // below keeps only speech chunks.
@@ -1509,7 +1696,7 @@ class SingleAudioPipeline(
         } catch (t: Throwable) {
             Log.e(TAG, "AudioRecord read loop crashed", t)
         } finally {
-            Log.i(TAG, "runReadLoop(): exiting at running=$running")
+            Log.i(TAG, "runReadLoop(): exiting at running=$running epoch=$myEpoch/$captureEpoch")
             try { audioRecord.stop() } catch (_: Throwable) {}
             try { audioRecord.release() } catch (_: Throwable) {}
             Log.i(TAG, "runReadLoop(): AudioRecord released")
@@ -1545,8 +1732,15 @@ class SingleAudioPipeline(
      *   - < [windowSeconds]/2 of speech total → nothing worth decoding yet.
      */
     private suspend fun decodeLoop() {
+        // Capture the epoch this worker was launched under (see runReadLoop for
+        // the same rationale): a fast pause→resume flips `running` back to true
+        // before this loop wakes from its delay, so checking `running` alone
+        // would let the OLD decode loop keep running AND make the NEW decode
+        // coroutine's `oldDecode.join()` hang forever (the new loop never
+        // starts → no decodes → deafness). Exit the moment the epoch changes.
+        val myEpoch = captureEpoch
         var lastHeartMs = 0L
-        while (running) {
+        while (running && myEpoch == captureEpoch) {
             delay(150)
             val nowMs = System.currentTimeMillis()
             // 2 s heartbeat: proves the decode worker is alive and reveals
@@ -1690,9 +1884,17 @@ class SingleAudioPipeline(
      * AFTER the workers have joined, and BEFORE teardown() frees the
      * recognizer.
      */
-    private fun finalDecodeAndEmit(endpoint: Boolean, sessionAudio: FloatArray?) {
+    private fun finalDecodeAndEmit(endpoint: Boolean, sessionAudio: FloatArray?, expectedGen: Int = -1) {
         val rec = recognizer ?: return
         if (decodeBusy.get()) return
+        // Utterance-generation guard: this async decode was captured from a
+        // PREVIOUS pause(); if the utterance has since restarted (resume()
+        // bumped the generation), its words belong to the OLD session and must
+        // NOT be merged into the new session's freshly-reset emit log.
+        if (expectedGen >= 0 && expectedGen != utteranceGen) {
+            Log.i(TAG, "finalDecodeAndEmit(): skip — utterance restarted (gen $expectedGen -> $utteranceGen)")
+            return
+        }
         val src = sessionAudio ?: return
         if (src.size <= 0) return
         var fromIdx = maxOf(0, src.size - 10 * sampleRate)

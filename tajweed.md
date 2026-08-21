@@ -126,29 +126,69 @@ rule-detector tagged. When the model judges `P(correct) < threshold` (after
 the bounded confirmation search, §1 step 5):
 
 - the word's `status` becomes `TAJWEED_ERROR`,
-- a separate piece of UI state (`latestTajweedPopup`) is set to `(ruleLabel, wordIndex)`,
-- a small non-modal non-pausing dialog appears ("Tajweed Mistake — <rule>") for 4 seconds
-  so the user can keep reading without losing their place; a `lastTajweedPopupIndex` guard
-  prevents the same error from re-firing every recomposition,
-- the recitation flow does **not** pause (this is a deliberate change from earlier v1
-  behaviour, in response to the user request: "I want him to continue reading and if there
-  is an error a pop up is shown indicating his tajweed error exactly like the skipped/wrong
-  word mechanism" — the popup mirrors that flow but is tajweed-specific),
-- the per-word chip colouring still displays "Tajweed: <rule>" in the analysis list, so the
-  user can scroll back and see a full audit trail.
+- a separate piece of UI state (`latestTajweedPopup`) is set to `(ruleLabel, wordIndex, score)`,
+- a small auto-dismissing dialog appears — "**Tajweed Mistake — <rule>**, your
+  <rule> score: N%" — and the mic auto-stops so the user can read the feedback;
+  a score-aware guard (`lastTajweedPopupIndex` + `lastTajweedPopupScore`) lets
+  the SAME word re-fire when a later re-read produces a different score,
+- stopping arms the same mistake-resume re-seat as WRONG/SKIPPED: tapping the
+  mic truncates the display transcript to the prefix BEFORE that word, so the
+  re-read passes the collector's count-filter (otherwise it is swallowed as an
+  "already committed" replay copy and nothing shows), gets displayed, gets
+  freshly scored (verdict-cache key includes the utterance timing), and
+  re-popups if still wrong,
+- while the resume latch is armed the collector FREEZES: every post-stop
+  emission (in-flight window decodes plus `pause()`'s own final full-tail
+  decode) is dropped, so dead pre-stop audio can never resurrect the mistake
+  as CORRECT; the fast analysis loop likewise keeps the confirmed verdict if a
+  stale queued pass lands.
+
+**WRONG / SKIPPED mistakes — confirmation + verification gate.** A text-level
+candidate only becomes a *punished* mistake after three gates:
+
+1. **Multi-emission confirmation:** the SAME first-mistake index must survive
+   distinct emissions — 2 for WRONG, 3 for SKIPPED (plus ≥2 s dwell and the
+   transcript advancing ≥3 words past the skip). The visible banner/red word
+   uses this same evidence (`confirmedMistakeUiIdx`) so a transient
+   single-window decode artifact never flashes.
+2. **Early tail verification:** at the SECOND sighting, one full-context
+   offline decode of the trailing ~10 s (`SingleAudioPipeline.verifyTailWords`,
+   read-only, serialized against the live decode loop via `decodeBusy`) looks
+   for the flagged target word:
+   - **found** ⇒ false alarm — the index joins `verifiedSpokenIndices`, counts
+     CORRECT, counters reset, recitation continues untouched;
+   - **absent** ⇒ remembered in `mistakeVerifyAbsentIdx`; confirmation may then
+     proceed to popup + pause;
+   - **inconclusive** (decoder busy / too little audio / blank decode) ⇒ decide
+     nothing; retry on a later emission (3 s cooldown).
+   Punishment REQUIRES the absent verdict — measured on-device, sliding windows
+   can chronically garble/drop a word (e.g. لِلَّهِ رَبِّ lost for ~5 s across
+   two windows, heard by the next window and every full-tail decode).
+3. **Minimum-listen guard:** no auto-stop within the first ~2.5 s of a session.
+
+**Final-decode repair acceptance (positional quality).** When pause()/stop()
+runs the full-tail decode, the collector accepts its "repair swap" only if it
+is at least as GOOD as the live log — scored as the longest LEADING run of
+words matching the target sequence. A monotonic-merge echo can leave the live
+log LONGER but MISORDERED (a premature ٱلْعَٰلَمِينَ emitted before لِلَّهِ
+رَبِّ); the old raw-size rule rejected the correct deduplicated repair in that
+case and locked in phantom mistakes. A short GARBLED repair still scores a low
+prefix and stays rejected.
 
 **Surah / ayah-range change mid-session (state-reset contract).** When the user changes the
 target (different surah, or the start/end ayah pickers), the `LaunchedEffect` on
 viewModel.ayahs / selectedSurah / rangeStart / rangeEnd stops the live recognizer session,
 wipes every speech/analysis variable (`finalSpokenText`, `partialSpokenText`, `spokenTimings`,
 `recognize{dAudio,AudioUri,StartMs}`, `alignment`, `detailedAnalysis`, `latestTajweedPopup`,
-`errorMessage`) and — crucially — flips `recognizerResultsSuppressedUntil` to `now + 500 ms`.
+the verification/forgiveness sets and the display-gate index) and — crucially — flips
+`recognizerResultsSuppressedUntil` to `now + 500 ms`.
 The partial/final recognizer consumers refuse to emit results while that window is live; this
 defeats the previous bug where the recognizer's pending whole-transcript ("Bismillah…" from the
 old range) got re-analyzed against the new/empty target and the UI popped "wrong word + tajweed
 mistakes" before the user had read a single word of the new range. If the user was listening when
 they moved the range, the session auto-resumes ~520 ms later against the new target; otherwise it
-stays stopped and they tap the mic to start cleanly.
+stays stopped and they tap the mic to start cleanly. Every explicit restart
+(repeat/restart buttons, FAB stop, surah dialog, tab switch) clears the same state.
 
 
 **Tajweed (+Tarteel cross-tracking):** the same `TAJWEED_ERROR` row feeds the Stats tab:
@@ -178,6 +218,31 @@ elsewhere, so the rule marking inside it shows the same colour as the card chip.
 network fetch fails (offline, or the surah happens to lack the rule), the card falls back
 to the bundled no-repeat random pick from its curated examples list — same behaviour as
 before, so offline UX is unchanged.
+
+### 4.2 Coach verdict card — multi-rule coverage & shared palette
+
+The practice card's "Acoustic score per rule" panel used to disagree with the example it
+scored, in three ways (all fixed):
+
+1. **Missing rules.** `analyzeRecitationDetails` scores ONE rule per word —
+   `getTajweedRuleForWord` returns the FIRST match and returns immediately, so
+   الْحَمْدُ short-circuits on its Al-Lam article and the Izhar-Shafawi meem inside the SAME
+   word is never scored. After the primary pass, the card now runs a supplemental pass:
+   `TajweedRules.detectRulesForWord` (the training-aligned multi-rule table) detects every
+   rule across the example tokens; heads the primary pass left uncovered are scored directly
+   against `RecitationAnalyzer` on each token's proportional audio slice (silence-trimmed)
+   and appended as extra rows. Rows never duplicate a primary one.
+2. **Wrong row colours.** Row colours resolved via an exact card-title match
+   (`rulesList.firstOrNull { it.name == ruleName }`) — sub-labels like "Madd Muttasil" /
+   "Al-Lam" match no title and fell back to the theme primary (a Madd row rendered TEAL).
+   Colours now resolve through the canonical head palette (`tajweedHeadColor`, tajweed.md
+   §6): head colour first, exact card match second, theme last.
+3. **Status-red word colouring.** The transcript line under the rows painted every
+   TAJWEED_ERROR / WRONG / SKIPPED word flat red, which read as "this word is a Madd
+   mistake" even when the red was a skipped word or a different rule. Each word is now
+   rendered with `buildTajweedAnnotatedString` — the SAME letter-level palette as the
+   example — with two status overrides: WRONG/SKIPPED get error colour + strikethrough,
+   TAJWEED_ERROR keeps its rule colours plus an underline.
 
 ## 5. Why the previous pipeline is gone
 

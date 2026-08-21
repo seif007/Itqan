@@ -155,4 +155,53 @@ class AyahWordMatcherTest {
         val plain = "الْحَمْدُ"
         assertEquals("الحمد", normalizeArabic(plain))
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Window-edge TRUNCATION restore (the false-SKIPPED-on-لِلَّه bug).
+    // The CTC decoder slices the trailing letter(s) of a word at the
+    // sliding-window boundary: لِّلَّه surfaces as لِلَّ (norm "لل"). The old
+    // ≤3-letter fragment rule DROPPED it, so the word never entered the
+    // transcript and the aligner flagged a false SKIPPED — and after the
+    // mistake auto-pause every resumed re-decode truncated the same word
+    // again, so the app looked deaf until Hint injected it.
+    // ───────────────────────────────────────────────────────────────────
+
+    private val fatihah12 = listOf(
+        "بِسْمِ", "ٱللَّه", "ٱلرَّحْمَٰن", "ٱلرَّحِيم", "ٱلْحَمْد", "لِلَّه", "رَبِّ", "ٱلْعَٰلَمِين"
+    )
+
+    @Test
+    fun `truncated لِّلَّه (لِلَّ) is restored to the canonical word`() {
+        val matcher = AyahWordMatcher(fatihah12)
+        // The exact device-log decode: the tail window cut لِّلَّه to لِلَّ.
+        val cleaned = matcher.clean("ٱلْحَمْد لِلَّ رَبِّ")
+        assertEquals(listOf("ٱلْحَمْد", "لِلَّه", "رَبِّ"), cleaned)
+    }
+
+    @Test
+    fun `truncated word at the decode head is restored too`() {
+        val matcher = AyahWordMatcher(fatihah12)
+        val cleaned = matcher.clean("لِلَّ رَبِّ ٱلْعَٰلَمِين")
+        assertEquals(listOf("لِلَّه", "رَبِّ", "ٱلْعَٰلَمِين"), cleaned)
+    }
+
+    @Test
+    fun `ambiguous prefix fragment is NOT restored (phantom guard)`() {
+        val matcher = AyahWordMatcher(fatihah12)
+        // "ال" is a strict prefix of MANY vocab words (ٱللَّه, ٱلرَّحْمَٰن,
+        // ٱلرَّحِيم, ٱلْعَٰلَمِين) — restoring it would re-create the
+        // phantom-first-word bug. It must stay dropped.
+        val cleaned = matcher.clean("ٱلْحَمْد ال رَبِّ")
+        assertEquals(listOf("ٱلْحَمْد", "رَبِّ"), cleaned)
+    }
+
+    @Test
+    fun `single-letter fragment is still dropped`() {
+        val matcher = AyahWordMatcher(fatihah12)
+        // The device log also showed a lone "رَ" (a cut رَبِّ) — 1 letter is
+        // too short to restore unambiguously; it stays dropped and the next
+        // window re-decodes the whole word.
+        val cleaned = matcher.clean("لِلَّه رَ ٱلْعَٰلَمِين")
+        assertEquals(listOf("لِلَّه", "ٱلْعَٰلَمِين"), cleaned)
+    }
 }
