@@ -24,12 +24,18 @@ import org.junit.Test
  *  4. the final transcript after a resume contains each word exactly once,
  *  5. repeated words within an ayah survive recommit across emissions,
  *  6. a mic re-tap without a mistake CONTINUES from the committed frontier
- *     (no jump back to the start, no wipe of a partially-read range).
+ *     (no jump back to the start, no wipe of a partially-read range),
+ *  7. the CONFIRMED-MISTAKE FREEZE drops every non-fresh emission while the
+ *     resume latch is armed (dead pre-stop audio cannot resurrect a flagged
+ *     word as CORRECT),
+ *  8. final-decode repair swaps are accepted by POSITIONAL PREFIX QUALITY
+ *     vs the live transcript — never by raw word count.
  *
- * The harness below is a VERBATIM MIRROR of the collector: filterMemorizeWords
- * (committed-count suppression + target-count cap) and the freshSession
- * conditional wipe + re-seat. If you change the collector, update this
- * harness and re-run `gradlew testDebugUnitTest`.
+ * The harness below drives [CollectorSim] — the VERBATIM MIRROR of the
+ * collector (filterMemorizeWords, freshSession conditional wipe + re-seat,
+ * freeze gate, repair-quality acceptance, overlap-strip commit). If you
+ * change the collector, update that fixture and re-run `gradlew
+ * testDebugUnitTest`.
  */
 class MemorizeTranscriptTrackerTest {
 
@@ -185,6 +191,79 @@ class MemorizeTranscriptTrackerTest {
         sim.onEmission(listOf("ٱلْحَمْدُ"), endpoint = false, freshSession = true)
         assertEquals(5, sim.spokenText.size)
         assertEquals(target.take(5).map { norm(it) }, sim.spokenText.map { norm(it) })
+    }
+
+    // ── Test 7: CONFIRMED-MISTAKE FREEZE — while the resume latch is armed,
+    // every non-fresh emission (in-flight window decodes + pause()'s own
+    // final-tail decode) is DROPPED. This is the guard that stops dead
+    // pre-stop audio from resurrecting a flagged word as CORRECT ("judged
+    // correct after the fact"). The fresh-session event IS the resume: it
+    // consumes the latch and re-seats the prefix.
+    @Test
+    fun mistakeFreeze_dropsEmissionsWhileResumeLatchArmed() {
+        val sim = CollectorSim(riwayah, target)
+        sim.onEmission(target.take(6), endpoint = false, freshSession = true)
+        sim.onEmission(target.take(6), endpoint = true, freshSession = false)
+        assertEquals(6, sim.spokenText.size)
+        // mistakeStop confirms at index 5 and pauses the mic.
+        sim.mistakeResumeLiveText = sim.spokenText.joinToString(" ")
+        sim.mistakeResumeIndex = 5
+        // Post-stop emissions — an in-flight window decode replaying committed
+        // words plus a "recovered" copy of the mistake word — must be dropped.
+        sim.onEmission(
+            listOf("بِسْمِ", "ٱللَّهِ", "ٱلرَّحْمَٰنِ", "ٱلرَّحِيمِ", "ٱلْحَمْدُ", "لِلَّهِ"),
+            endpoint = false, freshSession = false
+        )
+        assertEquals("frozen transcript must not grow", 6, sim.spokenText.size)
+        sim.onEmission(emptyList(), endpoint = true, freshSession = false)
+        assertEquals(6, sim.spokenText.size)
+        // (sessionFinalized stays whatever it was before the freeze — the
+        // dropped emission must not touch ANY collector state.)
+        // The user taps the mic: fresh session consumes the latch and re-seats.
+        sim.onEmission(emptyList(), endpoint = false, freshSession = true)
+        assertEquals(5, sim.spokenText.size)
+        // ...and the re-read now passes through normally.
+        sim.onEmission(listOf("لِلَّهِ"), endpoint = false, freshSession = false)
+        assertEquals(6, sim.spokenText.size)
+    }
+
+    // ── Test 8: final-decode repair acceptance by POSITIONAL PREFIX QUALITY.
+    // A monotonic-merge echo can leave the live log LONGER but MISORDERED
+    // (a premature ٱلْعَٰلَمِينَ emitted before لِلَّهِ رَبِّ); the correct
+    // deduplicated repair is then SHORTER but positionally better — it must
+    // be ACCEPTED. A garbled repair with a WORSE prefix must still be
+    // REJECTED (live tail committed instead).
+    @Test
+    fun repairSwap_acceptedByPrefixQuality_notRawSize() {
+        // Case 1: live log longer-but-misordered; correct repair shorter.
+        val t = target
+        val sim = CollectorSim(riwayah, t)
+        // Live windows produced words 0..3 correctly, then the echo scrambled
+        // positions 4..7 into [ٱلْحَمْدُ, ٱلْعَٰلَمِينَ, لِلَّهِ, رَبِّ].
+        val misordered = t.take(4) + listOf(t[4], t[7], t[5], t[6])
+        sim.onEmission(misordered, endpoint = false, freshSession = true)
+        sim.onEmission(misordered, endpoint = true, freshSession = false)
+        assertEquals(misordered.map { norm(it) }, sim.spokenText.map { norm(it) })
+        // The full-tail decode re-hears everything in the TRUE order — 8 words
+        // vs 8 live (equal size, higher prefix) → accepted either way; make it
+        // strictly SHORTER to pin the regression: repair drops one echo word.
+        val repaired = t.take(7) // true order minus the last word
+        sim.onEmission(repaired, endpoint = true, freshSession = false, repaired = true)
+        assertEquals("correct-but-shorter repair must replace the misordered log",
+            repaired.map { norm(it) }, sim.spokenText.map { norm(it) })
+        assertTrue(sim.sessionFinalized)
+
+        // Case 2: garbled repair with a WORSE prefix → rejected; the uncommitted
+        // live tail is committed as-is and the session finalizes.
+        val sim2 = CollectorSim(riwayah, t)
+        val goodLive = t.take(5)
+        sim2.onEmission(goodLive, endpoint = false, freshSession = true)
+        sim2.onEmission(goodLive, endpoint = true, freshSession = false)
+        val garbled = listOf(t[1], t[0], t[0], t[2]) // wrong order at position 0 already
+        sim2.onEmission(garbled, endpoint = true, freshSession = false, repaired = true)
+        assertEquals("garbled repair must be rejected — keep the live transcript",
+            goodLive.map { norm(it) }, sim2.spokenText.map { norm(it) })
+        assertTrue(sim2.sessionFinalized)
     }
 
     // ── Test 6: pause/resume WITHOUT a mistake still shows the re-read words ──

@@ -5,12 +5,17 @@ package com.example.ui
  * (the `pipe.partials.collect` section): filterMemorizeWords with the
  * unified committed-count suppression (a) + target-count cap (b) +
  * non-endpoint trailing fragment drop (c), the freshSession wipe +
- * resume-from-mistake re-seat, and the cumulative endpoint commit.
+ * resume-from-mistake re-seat, the CONFIRMED-MISTAKE FREEZE (non-fresh
+ * emissions dropped while the resume latch is armed), the final-decode
+ * repair-swap acceptance by POSITIONAL PREFIX QUALITY vs the live
+ * transcript (never raw size), and the endpoint commit's overlap-strip of
+ * duplicated committed replays.
  *
  * Shared by:
  *  - MemorizeTranscriptTrackerTest (deterministic emission-stream scenarios)
- *  - PcQuranSttEndToEndTest (REAL recitation audio replayed through the real
- *    QuranSttEngine + matcher, then through this same collector)
+ *  - PcQuranSttEndToEndTest / PcTajweedFalsePositiveTest (REAL recitation
+ *    audio replayed through the real QuranSttEngine + matcher, then through
+ *    this same collector)
  *
  * If you change the collector, update this fixture and re-run
  * `gradlew testDebugUnitTest`.
@@ -43,6 +48,9 @@ class CollectorSim(
             .filter { it.isNotEmpty() }
 
     private fun normalize(w: String) = normalizeForComparison(w, riwayah)
+
+    /** Pre-normalized target sequence for positional prefix scoring (repair acceptance). */
+    private val targetNormSequence: List<String> = targetNorms.map { normalize(it) }
 
     /**
      * Mirrors filterMemorizeWords: ONE unified count rule for LIVE and
@@ -110,6 +118,16 @@ class CollectorSim(
                 }
             }
         }
+        // CONFIRMED-MISTAKE FREEZE (mirrors RecitationApp): while a confirmed
+        // WRONG/SKIPPED stop has armed the resume latch, every non-fresh
+        // emission is dead pre-stop audio (in-flight window decodes +
+        // pause()'s own final-tail decode) and MUST be dropped — committing
+        // it would resurrect the flagged word as CORRECT. The fresh-session
+        // event IS the resume and was consumed just above.
+        if (!freshSession && mistakeResumeIndex >= 0) {
+            lastFilteredWords = emptyList()
+            return
+        }
         val words = filterMemorizeWords(partial, endpoint)
         lastFilteredWords = words
         val wordsLength = words.size
@@ -118,24 +136,79 @@ class CollectorSim(
             // FINAL-DECODE REPAIR SWAP (mirrors RecitationApp): the pipeline
             // flagged this endpoint as a merge REPAIR — the final tail decode
             // re-heard the whole session and REPLACED the scrambled live log,
-            // so [partial] is the authoritative transcript in reading order.
-            // Overwrite the committed transcript with it.
+            // so [partial] claims to be the authoritative transcript. Accept
+            // it only when it is at least as GOOD as the live transcript,
+            // scored as the LONGEST LEADING RUN of words matching the target
+            // sequence (positional quality), never by raw word count: a
+            // monotonic-merge echo can leave the live log LONGER but
+            // MISORDERED, which used to make the correct deduplicated repair
+            // get rejected. On reject, commit the uncommitted live tail and
+            // finalize — never shrink the transcript.
             if (repaired && partial.isNotEmpty()) {
-                finalSpokenText = partial.joinToString(" ").trim()
-                partialSpokenText = ""
-                committedWordCount = partial.size
-                lastCommittedWords = partial
-                sessionFinalized = true
-                return
+                fun targetPrefixLen(words: List<String>): Int {
+                    var i = 0
+                    while (i < words.size && i < targetNormSequence.size &&
+                        targetNormSequence[i].isNotEmpty() &&
+                        normalize(words[i]) == targetNormSequence[i]
+                    ) i++
+                    return i
+                }
+                val liveWords = spokenText
+                val livePrefix = targetPrefixLen(liveWords)
+                val repairPrefix = targetPrefixLen(partial)
+                if (repairPrefix > livePrefix ||
+                    (repairPrefix == livePrefix && partial.size >= liveWords.size)) {
+                    finalSpokenText = partial.joinToString(" ").trim()
+                    partialSpokenText = ""
+                    committedWordCount = partial.size
+                    lastCommittedWords = partial
+                    sessionFinalized = true
+                    return
+                } else {
+                    val tailWords = partialSpokenText.trim()
+                        .split(Regex("\\s+")).filter { it.isNotEmpty() }
+                    if (tailWords.isNotEmpty()) {
+                        finalSpokenText = "$finalSpokenText ${tailWords.joinToString(" ")}".trim()
+                        partialSpokenText = ""
+                        committedWordCount = tailWords.size
+                        lastCommittedWords = lastCommittedWords + tailWords
+                    }
+                    sessionFinalized = true
+                    return
+                }
             }
             val commitText = partialStr.ifEmpty { partialSpokenText.trim() }
-            val commitWords = commitText.split(Regex("\\s+")).filter { it.isNotEmpty() }
+            var commitWords = commitText.split(Regex("\\s+")).filter { it.isNotEmpty() }
             if (commitWords.isNotEmpty()) {
-                finalSpokenText = "$finalSpokenText ${commitWords.joinToString(" ")}".trim()
-                committedWordCount = commitWords.size
-                lastCommittedWords = lastCommittedWords + commitWords
+                // DOUBLE-COUNT GUARD (mirrors RecitationApp): the final tail
+                // decode re-hears the whole session, so its merged log can
+                // RE-EMIT words a previous endpoint already committed — the
+                // count-filter strips one copy per committed word, but when
+                // the merge duplicated them a replay survives in the delta.
+                // Strip any leading run of commitWords that duplicates the
+                // tail of the already-committed transcript.
+                val existing = finalSpokenText.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                if (existing.isNotEmpty()) {
+                    val exNorm = existing.map { normalize(it) }
+                    val cmNorm = commitWords.map { normalize(it) }
+                    var overlap = 0
+                    val maxOv = minOf(exNorm.size, cmNorm.size)
+                    for (k in maxOv downTo 1) {
+                        var match = true
+                        for (i in 0 until k) {
+                            if (exNorm[exNorm.size - k + i] != cmNorm[i]) { match = false; break }
+                        }
+                        if (match) { overlap = k; break }
+                    }
+                    if (overlap > 0) commitWords = commitWords.drop(overlap)
+                }
+                if (commitWords.isNotEmpty()) {
+                    finalSpokenText = "$finalSpokenText ${commitWords.joinToString(" ")}".trim()
+                    committedWordCount = commitWords.size
+                    lastCommittedWords = lastCommittedWords + commitWords
+                }
             }
-            if (words.isNotEmpty()) sessionFinalized = true
+            if (wordsLength > 0) sessionFinalized = true
             partialSpokenText = ""
         } else {
             if (partialStr.isNotEmpty()) partialSpokenText = partialStr
