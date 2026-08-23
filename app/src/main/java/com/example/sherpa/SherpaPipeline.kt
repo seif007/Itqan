@@ -1205,6 +1205,22 @@ class SingleAudioPipeline(
     }
 
     /**
+     * Invalidates any IN-FLIGHT final commit decode launched by an earlier
+     * [pause]/[stop]. Their async job captured the utterance generation at
+     * call time; bumping it now makes [finalDecodeAndEmit]'s generation guard
+     * silently drop the emit instead of merging words into whatever session
+     * is active when the decode finally finishes (~3-4 s later on slow
+     * phones). Called by RecitationApp when the ayah range / surah changes
+     * right after a manual stop: the decoded words belong to the OLD target
+     * and must never surface against the new one ("popup before I even
+     * recited").
+     */
+    fun invalidateInFlightCommit() {
+        utteranceGen++
+        Log.i(TAG, "invalidateInFlightCommit(): utteranceGen bumped -> $utteranceGen")
+    }
+
+    /**
      * True iff the pipeline has been paused via [pause] (the recognizer is
      * still live and can be resumed). Distinguishes "never started" from
      * "started and paused". Cleared by [resume], [stop] (via teardown), and
@@ -1236,31 +1252,45 @@ class SingleAudioPipeline(
 
     /**
      * One-off high-quality re-decode of the session tail, for MISTAKE
-     * VERIFICATION. Runs the recognizer over up to the trailing 10 s of the
-     * SAME gated speech-only buffer the live sliding windows consume — but as
-     * a single full-context offline pass (exactly what [finalDecodeAndEmit]
-     * does on pause), which recovers words a 4 s window cut at its edge or
-     * folded mid-span.
+     * VERIFICATION / TRANSCRIPT RECONCILIATION. Runs the recognizer over up to
+     * [trailingSeconds] of the SAME gated speech-only buffer the live sliding
+     * windows consume — but as a single full-context offline pass (exactly what
+     * [finalDecodeAndEmit] does on pause), which recovers words a 4 s window
+     * cut at its edge or folded mid-span.
      *
      * Read-only by design: unlike every other decode path it does NOT touch
      * the monotonic emit logs ([lastEmitClean]/[lastEmitRaw]) and does NOT
-     * emit a partials event — the caller only wants the word list to decide
-     * whether a candidate WRONG/SKIPPED is real. Serialized against the live
-     * decode loop through [decodeBusy]; returns an EMPTY list when
-     * inconclusive (not running, decoder busy, too little audio, blank
-     * result) so the caller can retry later instead of deciding wrongly.
+     * emit a partials event — the caller only wants the word list.
      *
-     * Blocking (~0.5-2 s per call on-device); invoke from Dispatchers.IO.
+     * SERIALIZATION — bounded wait, not instant bail-out: the live decode loop
+     * re-decodes every ~1.5 s and each decode takes 1-2.5 s on slow phones, so
+     * an unconditional [decodeBusy] grab used to lose nearly every race
+     * (measured: two consecutive verifications returned EMPTY while the user
+     * waited stuck at one word). We now wait up to ~2.5 s for a free slot.
+     * Returns an EMPTY list when still inconclusive (not running, no
+     * recognizer, slot never freed, too little audio, blank result).
+     *
+     * Blocking (~0.5-3 s per call on-device); invoke from Dispatchers.IO.
      */
-    fun verifyTailWords(): List<String> {
+    fun verifyTailWords(trailingSeconds: Int = 10): List<String> {
         val rec = recognizer ?: return emptyList()
         if (!running) return emptyList()
-        if (!decodeBusy.compareAndSet(false, true)) return emptyList()
+        var waitedMs = 0
+        while (!decodeBusy.compareAndSet(false, true)) {
+            if (!running) return emptyList()
+            if (waitedMs >= 2500) {
+                Log.w(TAG, "verifyTailWords(): decode slot never freed in ${waitedMs}ms — inconclusive")
+                return emptyList()
+            }
+            Thread.sleep(100)
+            waitedMs += 100
+        }
         val t0 = System.currentTimeMillis()
         try {
+            val spanSec = trailingSeconds.coerceIn(4, 45)
             val src = synchronized(audioSync) {
                 if (audioSize <= 0 || lastSpeechFrame < 0) return@synchronized null
-                var fromIdx = maxOf(0, audioSize - sampleRate * 10)
+                var fromIdx = maxOf(0, audioSize - sampleRate * spanSec)
                 // Trim leading silence before the session's first speech frame,
                 // same rule as snapshotWindow().
                 if (sessionSpeechStart >= fromIdx && sessionSpeechStart < audioSize) {

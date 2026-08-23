@@ -1358,7 +1358,11 @@ data class AnalyzeRequest(
     val finalized: Boolean,
     val mode: String,
     val riwayah: String,
-    val timings: List<SpokenWordTiming>
+    val timings: List<SpokenWordTiming>,
+    /** Analysis epoch at queue time — requests from an older epoch are
+     *  dropped unread after a range/surah change or tab switch, so verdicts
+     *  for the OLD target can never surface against the new one. */
+    val epoch: Long = 0L
 ) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
@@ -1375,6 +1379,13 @@ data class WordAnalysis(
     val tajweedAcousticFeedback: String? = null,
     val tajweedScore: Int? = null
 )
+
+/**
+ * MULTI-RULE SAFE lookup: detailedAnalysis holds ONE ROW PER (word, rule), so
+ * a list-position getOrNull(targetIndex) is wrong the moment any word carries
+ * two rules. Always resolve rows by their WORD INDEX.
+ */
+fun List<WordAnalysis>.forWordIndex(idx: Int): WordAnalysis? = firstOrNull { it.wordIndex == idx }
 
 data class TajweedExample(
     val arabic: String,
@@ -1538,6 +1549,29 @@ fun tajweedHeadColor(head: String?): Color? = when (head) {
 }
 
 /**
+ * Canonical friendly label for a trained-model head — the inverse of
+ * [ruleLabelToHead]. Used by MULTI-RULE scoring to name extra score rows
+ * (e.g. a word carrying BOTH Al-Lam and a natural madd gets an "Al-Lam" row
+ * and a "Madd (Vowel Extension)" row).
+ */
+fun headToFriendlyLabel(head: String): String? = when (head) {
+    "ALLAM" -> "Al-Lam"
+    "GHUNNAH" -> "Ghunnah & Shaddah"
+    "MADD" -> "Madd (Vowel Extension)"
+    "QALQALAH" -> "Qalqalah (Echo & Bounce)"
+    "MEEM_SAKINAH" -> "Meem Sakinah (Labial Rules)"
+    "IDGHAM" -> "Idgham (Merging)"
+    "IKHFA" -> "Iqlab & Ikhfa"
+    "IZHAR" -> "Izhar (Clarity)"
+    else -> null
+}
+
+/** True when the word carries an EXPLICIT maddah mark (آ / U+0653 / U+06E4) —
+ *  the only madd cue the MADD head judges reliably. */
+fun wordHasExplicitMaddMark(word: String): Boolean =
+    word.contains('\u0653') || word.contains('\u06E4') || word.contains('آ')
+
+/**
  * Per-head decision thresholds for the "rule applied correctly?" verdict.
  *
  * These were derived by sweeping the pass/fail cutoff on the model's held-out
@@ -1588,6 +1622,13 @@ fun getTajweedRuleForWord(word: String, nextWord: String?, riwayah: String): Str
     val len = word.length
     var i = 0
     
+    // NOTE — NATURAL MADD IS DELIBERATELY NOT DETECTED HERE. The MADD head was
+    // calibrated on STRETCHED madds (4-6 counts, explicit marks آ/ٓ/dagger in
+    // strong contexts). Ordinary 2-count vowels (fatha+alif, kasra+yaa,
+    // damma+waw, dagger alif mid-word) scored 23-51% EVEN FOR ALAFASY'S
+    // PERFECT RECITATION in the PC harness — enabling them accused every
+    // correct reader of a madd mistake. Only EXPLICIT marks route to MADD;
+    // everything else keeps its prior verdict (Al-Lam / null).
     // Check Al-Laam Rules (Solar / Lunar). alifLamStartIndex handles bare (ٱل/ال) and prefixed
     // (بِٱل / وَٱل / فَٱل / كَٱل) forms, and firstBaseLetterFrom skips any Sukoon / Harakah that
     // sits between the Lam and the next letter (e.g. ٱلْقَمَرُ, ٱلْحَمْدُ).
@@ -2007,15 +2048,41 @@ suspend fun analyzeRecitationDetails(
         
         if (matchInSpokenAhead != -1) {
             consecutiveGarbageSkips = 0
-            var finalStatus = RecitationStatus.CORRECT
-            var acousticFeedback: String? = null
-            var tScore: Int? = null
-            
+
+            // ── MULTI-RULE LABELS ── one score row per rule the word carries.
+            // The primary detector label comes first, then any additional
+            // training-table heads the word also contains (e.g. ٱلرَّحِيمِ
+            // carries BOTH its Al-Lam article AND a natural madd; إِيَّاكَ has
+            // a madd even though the primary detector alone returns null).
+            // Deduped by model head so a rule never scores twice.
+            val labels = LinkedHashMap<String, String>() // friendly label -> head
+            if (rule != null) ruleLabelToHead(rule)?.let { labels[rule] = it }
+            if (!isHintedWord) {
+                // FULL MULTI-RULE COVERAGE — with ONE exception aligned to the
+                // colourizer: MADD is scored ONLY where the app PAINTS RED
+                // (explicit maddah marks آ / U+0653 / U+06E4 — exactly the
+                // buildTajweedAnnotatedString red branches). Natural 2-count
+                // vowels (fatha+alif, kasra+yaa, dagger alif…) are NOT red and
+                // are NOT scored: the current MADD head judges them 23-51% even
+                // on perfect recitations, and the user asked for madd feedback
+                // exclusively on the red-highlighted words.
+                val hasRedMadd = wordHasExplicitMaddMark(targetWordOrig)
+                com.example.ml.TajweedRules.detectRulesForWord(targetWordOrig, nextWordOrig).forEach { h ->
+                    if (h == "MADD" && !hasRedMadd) return@forEach
+                    val friendly = headToFriendlyLabel(h) ?: return@forEach
+                    val fh = ruleLabelToHead(friendly) ?: return@forEach
+                    if (labels.values.none { it == fh }) labels[friendly] = fh
+                }
+            }
+
+            // Per-label scored entries (populated only in the deferred pass).
+            val scoredEntries = ArrayList<WordAnalysis>()
+
             // Step 3 - Measure Audio: Validate Tajweed Acoustic properties on the user's REAL voice.
             // Gated on [scoreTajweed]: the fast display loop passes false so the
             // expensive TajweedNet scoring never blocks the near-real-time
             // highlight; the deferred tajweed loop passes true.
-            if (scoreTajweed && rule != null && hasRealAudio && isTajweedMode && !isHintedWord) {
+            if (scoreTajweed && labels.isNotEmpty() && hasRealAudio && isTajweedMode && !isHintedWord) {
                 // Find timing by exact index, or fallback to the closest matched word text
                 val timing = spokenTimings.find { it.startIndex == matchInSpokenAhead }
                     ?: spokenTimings.findLast { isWordMatch(it.word, targetWordNorm) }
@@ -2085,217 +2152,155 @@ suspend fun analyzeRecitationDetails(
                     // the word's slot always swallows a neighbour's speech, which
                     // trimSilence cannot remove (it only cuts leading/trailing
                     // silence, not a glued neighbour).
-                    val head0 = ruleLabelToHead(rule)
-                    val isCrossWord = head0 != null &&
-                        head0 in setOf("IDGHAM", "IKHFA", "IZHAR", "MEEM_SAKINAH")
-                    val (ctxStartMs, ctxEndMs) = if (isCrossWord) {
-                        // Forward-leaning window: trigger word start -> next word end
-                        // (+ a small margin each side), exactly the training cut.
-                        val sCnt = spoken.size.coerceAtLeast(1)
-                        val nextIdx = (matchInSpokenAhead + matchedSpokenAdvance)
-                            .coerceAtMost(sCnt - 1)
-                        val nextTiming = spokenTimings.find { it.startIndex == nextIdx }
-                        val nextEndMs = if (nextTiming != null && nextTiming.endMs > nextTiming.startMs) {
-                            nextTiming.endMs - recordingStartMs
+                    //
+                    // The geometry is computed PER LABEL: a cross-word rule needs the
+                    // trigger->next-word cut while a single-word rule needs the word's
+                    // own span, and one word can carry both kinds at once.
+                    for ((label, head0) in labels) {
+                        val isCrossWord = head0 in setOf("IDGHAM", "IKHFA", "IZHAR", "MEEM_SAKINAH")
+                        val (ctxStartMs, ctxEndMs) = if (isCrossWord) {
+                            // Forward-leaning window: trigger word start -> next word end
+                            // (+ a small margin each side), exactly the training cut.
+                            val sCnt = spoken.size.coerceAtLeast(1)
+                            val nextIdx = (matchInSpokenAhead + matchedSpokenAdvance)
+                                .coerceAtMost(sCnt - 1)
+                            val nextTiming = spokenTimings.find { it.startIndex == nextIdx }
+                            val nextEndMs = if (nextTiming != null && nextTiming.endMs > nextTiming.startMs) {
+                                nextTiming.endMs - recordingStartMs
+                            } else {
+                                ((nextIdx + 1).toLong() * recordingDurationMs / sCnt)
+                            }
+                            val st = (segStartMs - 100L).coerceAtLeast(0L)
+                            val en = (nextEndMs + 100L)
+                                .coerceAtMost(capturedMs)
+                                .coerceAtMost(recordingDurationMs)
+                                .coerceAtLeast(st + 30L)
+                            st to en
                         } else {
-                            ((nextIdx + 1).toLong() * recordingDurationMs / sCnt)
+                            // Single-word rule: the word's own span + a small margin,
+                            // widened symmetrically to a minimum clip length (very short
+                            // timing spans) and capped at the model's 2 s feature view.
+                            val margin = 100L
+                            var st = (segStartMs - margin).coerceAtLeast(0L)
+                            var en = (clampedEnd + margin)
+                                .coerceAtMost(capturedMs)
+                                .coerceAtMost(recordingDurationMs)
+                            val minClipMs = 600L
+                            if (en - st < minClipMs) {
+                                val grow = (minClipMs - (en - st) + 1) / 2
+                                st = (st - grow).coerceAtLeast(0L)
+                                en = (en + grow).coerceAtMost(capturedMs)
+                                    .coerceAtMost(recordingDurationMs)
+                            }
+                            val maxClip = 2000L
+                            if (en - st > maxClip) {
+                                val mid = (st + en) / 2
+                                st = (mid - maxClip / 2).coerceAtLeast(0L)
+                                en = (st + maxClip).coerceAtMost(capturedMs)
+                                    .coerceAtMost(recordingDurationMs)
+                            }
+                            st to en.coerceAtLeast(st + 30L)
                         }
-                        val st = (segStartMs - 100L).coerceAtLeast(0L)
-                        val en = (nextEndMs + 100L)
-                            .coerceAtMost(capturedMs)
-                            .coerceAtMost(recordingDurationMs)
-                            .coerceAtLeast(st + 30L)
-                        st to en
-                    } else {
-                        // Single-word rule: the word's own span + a small margin,
-                        // widened symmetrically to a minimum clip length (very short
-                        // timing spans) and capped at the model's 2 s feature view.
-                        val margin = 100L
-                        var st = (segStartMs - margin).coerceAtLeast(0L)
-                        var en = (clampedEnd + margin)
-                            .coerceAtMost(capturedMs)
-                            .coerceAtMost(recordingDurationMs)
-                        val minClipMs = 600L
-                        if (en - st < minClipMs) {
-                            val grow = (minClipMs - (en - st) + 1) / 2
-                            st = (st - grow).coerceAtLeast(0L)
-                            en = (en + grow).coerceAtMost(capturedMs).coerceAtMost(recordingDurationMs)
+                        val startSample = (ctxStartMs * 16000 / 1000).toInt().coerceAtLeast(0)
+                        val endSample = (ctxEndMs * 16000 / 1000).toInt()
+                            .coerceAtMost(fullAudio.size)
+                        val rawSeg = if (endSample > startSample) {
+                            fullAudio.sliceArray(startSample until endSample)
+                        } else {
+                            fullAudio
                         }
-                        val maxClipMs = 2000L
-                        if (en - st > maxClipMs) {
-                            val mid = (st + en) / 2
-                            st = (mid - maxClipMs / 2).coerceAtLeast(0L)
-                            en = (st + maxClipMs).coerceAtMost(capturedMs).coerceAtMost(recordingDurationMs)
-                        }
-                        st to en.coerceAtLeast(st + 30L)
-                    }
-                    val startSample = (ctxStartMs * 16000 / 1000).toInt().coerceAtLeast(0)
-                    val endSample = (ctxEndMs * 16000 / 1000).toInt()
-                        .coerceAtMost(fullAudio.size)
-                    val rawSeg = if (endSample > startSample) {
-                        fullAudio.sliceArray(startSample until endSample)
-                    } else {
-                        fullAudio
-                    }
-                    // Drop leading/trailing silence (RMS-gated, loudness-independent)
-                    // so the model sees a speech clip, not a silence-padded one.
-                    val seg = trimSilence(rawSeg)
+                        // Drop leading/trailing silence (RMS-gated, loudness-independent)
+                        // so the model sees a speech clip, not a silence-padded one.
+                        val seg = trimSilence(rawSeg)
 
-                    // Map the app's friendly tajweed label to the trained model head.
-                    val head = ruleLabelToHead(rule)
-                    if (head != null && seg.size >= 256) {
-                        // Per-head calibrated threshold (see decisionThresholdForHead) -- a flat 0.5
-                        // wrongly fails ~12% of CORRECT Qalqalah recitations because that head's
-                        // output for correct clips spans 0.09-0.97 (std 0.19). The displayed % stays
-                        // the raw prob*100; only the verdict uses the calibrated bar.
-                        val thr = decisionThresholdForHead(head)
-                        // VERDICT CACHE: the conflated analysis loop re-runs this
-                        // pass on every STT emission, but a word's audio position
-                        // is fixed once spoken and the capture buffer only GROWS —
-                        // so a verdict decided in an earlier pass stays valid.
-                        // Reuse it instead of re-scoring (and re-running the
-                        // confirmation search) every cycle: steady-state analysis
-                        // cost drops to ~0 once all heard words are cached.
-                        // Keyed by the utterance's timing.startMs so a RE-uttered
-                        // word (mistake-resume re-read) gets a fresh score instead
-                        // of a stale verdict.
-                        val cacheKey = "$targetIndex:$targetWordNorm:$head:${timing?.startMs ?: 0L}"
-                        val cachedProb = verdictCache?.get(cacheKey)
-                        var prob: Float
-                        if (cachedProb != null) {
-                            prob = cachedProb
-                        } else {
-                        val results = analyzer.analyze(seg, listOf(head), thr)
-                        prob = results.firstOrNull()?.prob ?: 0f
-                        // BOUNDED CONFIRMATION SEARCH. The spokenTimings wall clock
-                        // is the EMISSION time of the word, which LAGS the word's
-                        // real audio position by the decode latency (up to the 4 s
-                        // sliding window). A single window placed at the emission
-                        // time therefore often lands on the WRONG audio and scores
-                        // a correct recitation below threshold (false TAJWEED_ERROR
-                        // — the E2E probe measured e.g. falaq وَمِن at 6% nominal
-                        // but 0.80 at its true position). Before flagging a mistake
-                        // we slide the SAME-width window over a bounded
-                        // neighbourhood and take the best score: a genuine
-                        // mispronunciation stays below threshold at every nearby
-                        // position, while a timing misalignment recovers. Extra
-                        // cost is paid ONLY for words about to be flagged.
-                        //
-                        // Range: the emission-clock position is unreliable in BOTH
-                        // directions. Decode latency pushes a word's audio BEFORE
-                        // its emission time (up to the 4 s window, ~6 s for words
-                        // at the very start of a recitation), while merge/repair
-                        // re-emissions can shift a word's recorded position AFTER
-                        // its true audio (measured +4.2 s in the E2E harness). So
-                        // the search covers ±6 s around the nominal position —
-                        // but OUTWARD from the nominal position, not linearly from
-                        // -6 s: the typical lag is 0.5-2 s, so the true position
-                        // is found within a handful of steps and the search breaks
-                        // as soon as any position clears the threshold. Worst case
-                        // (a genuine mistake) is still ~80 forward passes, and it
-                        // runs ONLY for words about to be flagged.
-                        // COST NOTE. The confirmation search below costs one
-                        // TajweedNet forward pass per probed position (~370 ms each
-                        // on the A05s in pure Kotlin). It is SAFE to run here
-                        // because this whole acoustic block only executes in the
-                        // DEFERRED tajweed loop (scoreTajweed=true), which is off
-                        // the display's critical path — the fast text-only loop
-                        // (scoreTajweed=false) never reaches it. The dedupe + 24-
-                        // position budget below keeps even a genuine mistake bounded.
-                        if (prob < thr) {
-                            // Sweep a window sized to the TRAINING clips, not the
-                            // rule-geometry window. Cross-word rule windows span
-                            // trigger→next-word-end (3-5 s), but the model's log-mel
-                            // view is capped at MAX_FRAMES=200 (~2 s), so a wide
-                            // window is truncated and misaligned.
-                            //  - single-word rules (MADD/GHUNNAH/QALQALAH/ALLAM)
-                            //    were trained on the word's own span (~1.1 s median):
-                            //    sweep the word span (clamped 0.4-1.6 s).
-                            //  - CROSS-WORD rules (IDGHAM/IKHFA/IZHAR/MEEM_SAKINAH)
-                            //    were trained on [trigger_start, next_word_end]
-                            //    (~1.8-2.1 s median): sweep a 2.0 s window. The E2E
-                            //    probe proved a 1.0 s word-span window peaks at 0.14
-                            //    for humazah هُمَزَةٍ while the 2.0 s window scores
-                            //    0.83 — the narrow window misses the boundary cue the
-                            //    head was trained to hear.
-                            val spanLen = if (isCrossWord) 2000L
-                                else (segEndMs - segStartMs).coerceIn(400L, 1600L)
-                            var best = prob
-                            val maxStart = (capturedMs - spanLen).coerceAtLeast(0L)
-                                .coerceAtMost((recordingDurationMs - spanLen).coerceAtLeast(0L))
-                            // DEDUPE: both probe sides clamp into [0, maxStart], so
-                            // once the offsets exceed the buffer most of them map to
-                            // the SAME window starts. Without dedupe the loop re-scored
-                            // the same positions ~80x — measured as a 29.7 s analysis on
-                            // the A05s Kotlin net, which left matchedWordCount at 0 for
-                            // the whole recitation. Scoring each distinct start once
-                            // bounds the cost naturally (<= ~80 distinct positions) while
-                            // preserving the full ±6 s reach the emission-clock lag can
-                            // require. On the ONNX net (~15 ms/pass) even the worst case
-                            // is ~1 s; this runs only in the deferred tajweed loop.
-                            val visited = HashSet<Long>()
-                            var off = 150L
-                            var found = false
-                            while (!found && off <= 6000L) {
-                                // Alternate backward/forward at each offset: the
-                                // decode lag puts the true audio BEFORE the nominal
-                                // position most of the time, so try that side first.
-                                for (st0 in longArrayOf(segStartMs - off, segStartMs + off)) {
-                                    val st = st0.coerceIn(0L, maxStart)
-                                    if (!visited.add(st)) continue
-                                    val a = (st * 16000 / 1000).toInt().coerceIn(0, fullAudio.size)
-                                    val b = ((st + spanLen) * 16000 / 1000).toInt()
-                                        .coerceIn(a, fullAudio.size)
-                                    if (b - a >= 256) {
-                                        val cand = trimSilence(fullAudio.sliceArray(a until b))
-                                        if (cand.size >= 256) {
-                                            val p = analyzer.analyze(cand, listOf(head), thr)
-                                                .firstOrNull()?.prob ?: 0f
-                                            if (p > best) best = p
-                                            if (best >= thr) { found = true; break }
+                        val head = head0
+                        if (seg.size >= 256) {
+                            // Per-head calibrated threshold (see decisionThresholdForHead) -- a flat 0.5
+                            // wrongly fails ~12% of CORRECT Qalqalah recitations because that head's
+                            // output for correct clips spans 0.09-0.97 (std 0.19). The displayed % stays
+                            // the raw prob*100; only the verdict uses the calibrated bar.
+                            val thr = decisionThresholdForHead(head)
+                            // VERDICT CACHE: keyed per head so two rules on the same
+                            // word cache independently.
+                            val cacheKey = "$targetIndex:$targetWordNorm:$head:${timing?.startMs ?: 0L}"
+                            val cachedProb = verdictCache?.get(cacheKey)
+                            var prob: Float
+                            if (cachedProb != null) {
+                                prob = cachedProb
+                            } else {
+                            val results = analyzer.analyze(seg, listOf(head), thr)
+                            prob = results.firstOrNull()?.prob ?: 0f
+                            // BOUNDED CONFIRMATION SEARCH (see the long comment in
+                            // history): slide the SAME-width window ±6 s around the
+                            // nominal position, best score wins; runs ONLY when the
+                            // nominal position failed.
+                            if (prob < thr) {
+                                val spanLen = if (isCrossWord) 2000L
+                                    else (segEndMs - segStartMs).coerceIn(400L, 1600L)
+                                var best = prob
+                                val maxStart = (capturedMs - spanLen).coerceAtLeast(0L)
+                                    .coerceAtMost((recordingDurationMs - spanLen).coerceAtLeast(0L))
+                                val visited = HashSet<Long>()
+                                var off = 150L
+                                var found = false
+                                while (!found && off <= 6000L) {
+                                    for (st0 in longArrayOf(segStartMs - off, segStartMs + off)) {
+                                        val st = st0.coerceIn(0L, maxStart)
+                                        if (!visited.add(st)) continue
+                                        val a = (st * 16000 / 1000).toInt().coerceIn(0, fullAudio.size)
+                                        val b = ((st + spanLen) * 16000 / 1000).toInt()
+                                            .coerceIn(a, fullAudio.size)
+                                        if (b - a >= 256) {
+                                            val cand = trimSilence(fullAudio.sliceArray(a until b))
+                                            if (cand.size >= 256) {
+                                                val p = analyzer.analyze(cand, listOf(head), thr)
+                                                    .firstOrNull()?.prob ?: 0f
+                                                if (p > best) best = p
+                                                if (best >= thr) { found = true; break }
+                                            }
                                         }
                                     }
+                                    off += 150L
                                 }
-                                off += 150L
+                                prob = best
                             }
-                            prob = best
-                        }
-                        // Cache PASSING verdicts only. A pass is stable (the word's
-                        // audio is fixed and the buffer only grows), so reusing it
-                        // is safe and removes nearly all steady-state scoring cost.
-                        // A FAIL is deliberately NOT cached: the first pass may run
-                        // while the word's timing span is still settling, and a
-                        // cached fail would lock in a false TAJWEED_ERROR. Failing
-                        // words are re-scored each pass (the popup auto-stops the
-                        // mic right after, so this costs at most a couple of extra
-                        // searches before the session pauses).
-                        if (prob >= thr) verdictCache?.put(cacheKey, prob)
-                        } // end verdict-cache miss branch
-                        tScore = (prob * 100).toInt().coerceIn(0, 100)
-                        acousticFeedback = if (prob >= thr) {
-                            "Good $rule application"
-                        } else {
-                            "Review your $rule"
-                        }
-                        // The model head outputs P(correct); below the head's calibrated
-                        // threshold the rule was not applied correctly, so flag a Tajweed error.
-                        if (prob < thr) {
-                            finalStatus = RecitationStatus.TAJWEED_ERROR
+                            // Cache PASSING verdicts only (fails are re-scored — see history).
+                            if (prob >= thr) verdictCache?.put(cacheKey, prob)
+                            } // end verdict-cache miss branch
+                            val tScoreL = (prob * 100).toInt().coerceIn(0, 100)
+                            val feedbackL = if (prob >= thr) "Good $label application" else "Review your $label"
+                            val statusL = if (prob < thr) RecitationStatus.TAJWEED_ERROR else RecitationStatus.CORRECT
+                            scoredEntries.add(WordAnalysis(
+                                wordIndex = targetIndex,
+                                text = targetWordOrig,
+                                normalizedText = targetWordNorm,
+                                status = statusL,
+                                spokenText = spoken[matchInSpokenAhead],
+                                tajweedRule = label,
+                                tajweedAcousticFeedback = feedbackL,
+                                tajweedScore = tScoreL
+                            ))
                         }
                     }
                 }
             }
-            
-            result.add(WordAnalysis(
-                wordIndex = targetIndex,
-                text = targetWordOrig,
-                normalizedText = targetWordNorm,
-                status = finalStatus,
-                spokenText = spoken[matchInSpokenAhead],
-                tajweedRule = rule,
-                tajweedAcousticFeedback = acousticFeedback,
-                tajweedScore = tScore
-            ))
+
+            if (scoredEntries.isNotEmpty()) {
+                scoredEntries.forEach { result.add(it) }
+            } else {
+                // Fast display pass / no audio / nothing scorable: a single
+                // positional entry carrying the primary label (no score yet).
+                result.add(WordAnalysis(
+                    wordIndex = targetIndex,
+                    text = targetWordOrig,
+                    normalizedText = targetWordNorm,
+                    status = RecitationStatus.CORRECT,
+                    spokenText = spoken[matchInSpokenAhead],
+                    tajweedRule = rule,
+                    tajweedAcousticFeedback = null,
+                    tajweedScore = null
+                ))
+            }
             spokenIndex = matchInSpokenAhead + matchedSpokenAdvance
             targetIndex++
             continue
@@ -2325,7 +2330,10 @@ suspend fun analyzeRecitationDetails(
                 normalizedText = targetWordNorm,
                 status = RecitationStatus.SKIPPED,
                 spokenText = null,
-                tajweedRule = rule
+                // A skipped word is only ever a skipped word: never attach a
+                // tajweed label — the user sees EITHER a wrong/skipped popup
+                // OR a tajweed popup with a rule + score, never a mix.
+                tajweedRule = null
             ))
             targetIndex++
             continue
@@ -2385,7 +2393,9 @@ suspend fun analyzeRecitationDetails(
                 normalizedText = targetWordNorm,
                 status = RecitationStatus.WRONG,
                 spokenText = spoken[spokenIndex],
-                tajweedRule = rule
+                // Same rule as SKIPPED above: a wrong word is only ever a
+                // wrong word — never mixed with a score-less tajweed tag.
+                tajweedRule = null
             ))
             // A confirmed WRONG word ends the verification walk: the user
             // asked that the app STOP at the mistake instead of counting the
@@ -2745,6 +2755,29 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // popup/pause; -1 = no decided candidate. Reset whenever the first-mistake
     // candidate changes or the session explicitly restarts.
     var mistakeVerifyAbsentIdx by remember { mutableStateOf(-1) }
+    // STUCK-RECONCILE cooldown (see the watcher): when a candidate survives
+    // many emissions even after verification, one long-span tail decode may
+    // replace the echo-poisoned live transcript wholesale.
+    var lastReconcileMs by remember { mutableStateOf(0L) }
+    // EPISODE-STABLE candidate tracking: noisy merges make the first-mistake
+    // index flicker ±few words between emissions (echoes appear/vanish), which
+    // used to reset the confirmation counters forever — no verification ever
+    // fired and the cursor froze until a manual pause healed the transcript.
+    // An ANCHOR index tolerates ±3 drift as the SAME episode; the episode only
+    // closes after TWO consecutive clean emissions.
+    var mistakeEpisodeAnchor by remember { mutableStateOf(-1) }
+    var mistakeCleanStreak by remember { mutableStateOf(0) }
+
+    // DETACHED verification machinery: the tail re-decode takes 1-3 s on-device,
+    // while every emission restarts the mistake watcher effect — a verification
+    // awaited INSIDE the effect was cancelled before its verdict landed (the
+    // result was logged by the pipeline but never applied), and the cooldown
+    // then blocked retries: slow phones livelocked with the cursor frozen on
+    // one word. These hold the single in-flight job + its candidate index so
+    // the verdict survives restarts and lands in state regardless.
+    val verifyJobRef = remember { java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job?>(null) }
+    val verifyInFlightIdx = remember { java.util.concurrent.atomic.AtomicInteger(-1) }
+    val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
 
     // Display gate for WRONG/SKIPPED mistakes in Tajweed mode. The analysis
     // pass recomputes verdicts on EVERY emission, and a single sliding-window
@@ -2843,6 +2876,17 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         try { tajweedPipelineHolder.pipeline?.prewarm() } catch (e: Throwable) {}
     }
 
+    // Analysis request channels + epoch. Declared BEFORE the range-reset
+    // effect so that effect can drain them: requests queued by the OLD range
+    // must never be processed against the NEW one.
+    val analyzeRequests = remember { kotlinx.coroutines.channels.Channel<AnalyzeRequest>(kotlinx.coroutines.channels.Channel.UNLIMITED) }
+    val tajweedRequests = remember { kotlinx.coroutines.channels.Channel<AnalyzeRequest>(kotlinx.coroutines.channels.Channel.UNLIMITED) }
+    // Bumped on every range/surah change (and tab switch): requests carrying an
+    // older epoch are dropped unread by both analysis loops, and the deferred
+    // tajweed loop refuses to apply stale verdicts — killing the "popup before
+    // I even recited" class of bugs after a mid-session target change.
+    var analysisEpoch by remember { mutableStateOf(0L) }
+
     // State-reset on target change. Changing the surah or the ayah pickers at ~3874/3881 reloads
     // `viewModel.ayahs` and so flips `targetNorm`/`targetOrig` below, which would normally
     // re-run the Memorize analysis loop. Without this reset, the stale `finalSpokenText` and
@@ -2892,6 +2936,8 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         verifiedSpokenIndices.clear()
         lastMistakeVerifyMs = 0L
         mistakeVerifyAbsentIdx = -1
+        mistakeEpisodeAnchor = -1
+        mistakeCleanStreak = 0
         latestTajweedPopup = null
         sessionFinalized = false
         errorMessage = null
@@ -2899,11 +2945,25 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         // fresh session re-scores from scratch (stale verdicts from the previous
         // range's words must never leak into the new one).
         tajweedVerdictCache.clear()
+        // ── EPOCH BUMP + STALE-WORK DRAIN ── Everything queued for the OLD
+        // range dies here: pending analysis requests are drained unread, both
+        // loops drop anything carrying an older epoch, and pause()'s async
+        // final-tail decode (which can still be running for ~3-4 s after a
+        // manual stop) is invalidated so its words — belonging to the OLD
+        // target — can never be committed or scored against the new range.
+        // This kills the "popup before I even recited" bug after changing the
+        // range (measured: madd popup with 51% immediately after switching,
+        // then a second one seconds later, with zero recitation).
+        analysisEpoch++
+        try { tajweedPipelineHolder.pipeline?.invalidateInFlightCommit() } catch (_: Throwable) {}
+        while (analyzeRequests.tryReceive().isSuccess) { /* drain */ }
+        while (tajweedRequests.tryReceive().isSuccess) { /* drain */ }
         // Cancel is async: one more onPartial/onResults with the OLD whole-transcript can still
-        // arrive before the engine fully stops. Suppress recognizer output for the next 500 ms so
-        // that stale transcript isn't re-analyzed against the fresh range (the exact bug the user
+        // arrive before the engine fully stops. Suppress recognizer output for the next 4 s so
+        // that stale transcript isn't re-analyzed against the fresh range AND pause()'s async
+        // final decode (which lands within this window) stays inert (the exact bug the user
         // hit: mistakes appear immediately after changing the ayah range with nothing read).
-        recognizerResultsSuppressedUntil = System.currentTimeMillis() + 500L
+        recognizerResultsSuppressedUntil = System.currentTimeMillis() + 4000L
         // Resume automatically: if the user was mid-recitation when they moved the range, start
         // listening again (once the suppression window has elapsed) so they can keep going without
         // a manual mic tap. Guard on the recognizer being alive and the tab still being Memorize.
@@ -2965,8 +3025,8 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // emission because the growing audio snapshot was a key, so NO run ever
     // completed and matchedWordCount stayed at 0: words were heard but never
     // highlighted, "the app is not listening".)
-    val analyzeRequests = remember { kotlinx.coroutines.channels.Channel<AnalyzeRequest>(kotlinx.coroutines.channels.Channel.UNLIMITED) }
-    val tajweedRequests = remember { kotlinx.coroutines.channels.Channel<AnalyzeRequest>(kotlinx.coroutines.channels.Channel.UNLIMITED) }
+    // (analyzeRequests / tajweedRequests / analysisEpoch are declared ABOVE the
+    // range-reset effect so that effect can drain them and bump the epoch.)
     LaunchedEffect(spokenText, currentTab, recitationMode, targetNorm, targetOrig, targetFormGroups, recognizedAudioUri, recognizedAudio, hintedIndicesSnapshot, sessionFinalized) {
         if (currentTab != "Memorize") {
             alignment = Pair(targetOrig.size, false)
@@ -2983,7 +3043,8 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 finalized = sessionFinalized,
                 mode = recitationMode,
                 riwayah = viewModel.riwayah,
-                timings = spokenTimings.toList()
+                timings = spokenTimings.toList(),
+                epoch = analysisEpoch
             )
             analyzeRequests.trySend(req)
             // Tajweed acoustic pass only applies in Tajweed mode with real audio.
@@ -2992,6 +3053,41 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             }
         }
     }
+    // (item 5e) DONE-READING ⇒ PENDING BECOMES SKIPPED. While a session is
+    // live, unheard words stay PENDING (the frontier lags; self-heal may still
+    // render them). But once the session has FINALIZED — the user stopped and
+    // pause()'s full-tail decode already had its best chance — any remaining
+    // PENDING word is a real gap the recognizer never produced across the
+    // ENTIRE session. Surface it as SKIPPED (banner + popup + resume point),
+    // exactly like a mid-session skip.
+    LaunchedEffect(detailedAnalysis, sessionFinalized, isListening, currentTab, recitationMode) {
+        if (currentTab == "Memorize" && recitationMode == "Tajweed" &&
+            sessionFinalized && !isListening && detailedAnalysis.isNotEmpty()
+        ) {
+            val pendingRows = detailedAnalysis.filter { it.status == RecitationStatus.PENDING }
+            if (pendingRows.isNotEmpty()) {
+                detailedAnalysis = detailedAnalysis.map { w ->
+                    if (w.status == RecitationStatus.PENDING)
+                        w.copy(status = RecitationStatus.SKIPPED, spokenText = null)
+                    else w
+                }
+                val first = detailedAnalysis.firstOrNull { it.status == RecitationStatus.SKIPPED }
+                if (first != null) {
+                    latestPopupKind = "skipped"
+                    latestTajweedPopup = Pair(first.text, first.wordIndex)
+                    // Arm the resume re-seat so tapping the mic continues FROM
+                    // this word (same contract as a mid-session skip).
+                    mistakeResumeLiveText = (finalSpokenText + " " + partialSpokenText).trim()
+                    mistakeResumeIndex = first.wordIndex
+                }
+                android.util.Log.i(
+                    "ItqanSherpa",
+                    "finalizeSkip(): ${pendingRows.size} PENDING word(s) -> SKIPPED at session end (first idx=${first?.wordIndex})"
+                )
+            }
+        }
+    }
+
     // FAST loop: text-only verdicts for the near-real-time display.
     LaunchedEffect(Unit) {
         for (req in analyzeRequests) {
@@ -3001,6 +3097,10 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 val newer = analyzeRequests.tryReceive().getOrNull() ?: break
                 latest = newer
             }
+            // EPOCH GUARD: a request queued before the last range/surah/tab
+            // change belongs to the OLD target — drop it instead of scoring
+            // stale audio against words the user never reached.
+            if (latest.epoch != analysisEpoch) continue
             val analyzeT0 = System.currentTimeMillis()
             kotlinx.coroutines.delay(200) // Debounce rapid speech recognition partial updates to avoid UI thread ANRs
             try {
@@ -3044,7 +3144,13 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // lands in verifiedSpokenIndices and any WRONG/SKIPPED verdict
                 // for that index counts CORRECT — the cursor advances instead
                 // of sticking on a phantom the live windows never heard.
-                val prevByIndex = detailedAnalysis.associateBy { it.wordIndex }
+                // MULTI-RULE SAFE lookups: detailedAnalysis now holds ONE ROW PER
+                // (word, rule), so index-position lookups and wordIndex-keyed maps
+                // must never assume a single row per word.
+                val prevByKey = detailedAnalysis.associateBy { "${it.wordIndex}:${it.tajweedRule ?: "-"}" }
+                val prevMistakeByIdx = detailedAnalysis
+                    .filter { it.status == RecitationStatus.WRONG || it.status == RecitationStatus.SKIPPED }
+                    .associateBy { it.wordIndex }
                 val armedMistakeIdx = mistakeResumeIndex
                 val verifiedIdxSet = verifiedSpokenIndices.toHashSet()
                 val effective = analysis.map { w ->
@@ -3055,7 +3161,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         w2 = w2.copy(status = RecitationStatus.CORRECT)
                     }
                     if (w2.status == RecitationStatus.CORRECT && armedMistakeIdx >= 0 && w2.wordIndex == armedMistakeIdx) {
-                        val pw = prevByIndex[w2.wordIndex]
+                        val pw = prevMistakeByIdx[w2.wordIndex]
                         if (pw != null && (pw.status == RecitationStatus.WRONG || pw.status == RecitationStatus.SKIPPED)) w2 = pw
                     }
                     w2
@@ -3063,6 +3169,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
 
                 var newMatchedWordCount = 0
                 var newHasError = false
+                val seenIdx = HashSet<Int>()
 
                 // TAJWEED-only errors (rule-acoustic failed but the WORD was spoken correctly)
                 // no longer pause the recitation. The user explicitly asked the app to "continue
@@ -3070,27 +3177,31 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // and skipped words still pause as before -- they are detection failures that
                 // would otherwise silently let the user babble ahead.
                 for (word in effective) {
+                    if (word.status == RecitationStatus.WRONG || word.status == RecitationStatus.SKIPPED) {
+                        newHasError = true
+                        break
+                    }
                     if (word.status == RecitationStatus.CORRECT || word.status == RecitationStatus.TAJWEED_ERROR || word.status == RecitationStatus.HINTED) {
                         // TAJWEED_ERROR and HINTED both continue advancing -- TAJWEED_ERROR only
                         // matters via its popup, and HINTING is the user's own reveal, so we must
                         // not pause waiting for a word they'll never need to say.
-                        newMatchedWordCount++
-                    } else if (word.status == RecitationStatus.WRONG || word.status == RecitationStatus.SKIPPED) {
-                        newHasError = true
-                        break
+                        // MULTI-RULE: several rows can share one wordIndex — count each WORD once.
+                        if (seenIdx.add(word.wordIndex)) newMatchedWordCount++
                     }
                 }
 
                 alignment = Pair(newMatchedWordCount, newHasError)
                 // Carry over any tajweed verdict the deferred acoustic loop already
-                // flagged for a word this (text-only) pass sees as CORRECT, so the
-                // fast loop doesn't wipe a TAJWEED_ERROR the moment after it's shown
-                // (which would make the popup flicker off and back on).
+                // flagged, keyed by (word, rule) so each rule's verdict on the same
+                // word survives independently — the fast loop must not wipe a
+                // TAJWEED_ERROR the moment after it's shown.
                 val merged = effective.map { w ->
-                    if (w.status == RecitationStatus.CORRECT) {
-                        val pw = prevByIndex[w.wordIndex]
-                        if (pw != null && (pw.status == RecitationStatus.TAJWEED_ERROR || pw.tajweedScore != null)) pw else w
-                    } else w
+                    var w2 = w
+                    if (w2.status == RecitationStatus.CORRECT && w2.tajweedScore == null) {
+                        val pk = prevByKey["${w2.wordIndex}:${w2.tajweedRule ?: "-"}"]
+                        if (pk != null && (pk.status == RecitationStatus.TAJWEED_ERROR || pk.tajweedScore != null)) w2 = pk
+                    }
+                    w2
                 }
                 detailedAnalysis = merged
                 android.util.Log.i("ItqanSherpa", "analyze(fast): done ${System.currentTimeMillis() - analyzeT0}ms matched=$newMatchedWordCount hasError=$newHasError targetWords=${latest.targetNorm.size}")
@@ -3109,6 +3220,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 latest = newer
             }
             if (latest.mode != "Tajweed" || latest.audio == null) continue
+            // EPOCH GUARD (same as the fast loop): stale-range requests die here —
+            // their verdicts must never update detailedAnalysis after the switch.
+            if (latest.epoch != analysisEpoch) continue
             val tjT0 = System.currentTimeMillis()
             // User-accepted tajweed latency: wait ~2 s so the word's audio span
             // has settled before scoring, and so a burst of emissions collapses
@@ -3139,21 +3253,41 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 }
                 // Merge acoustic verdicts into the current display analysis. Never
                 // downgrade a text-detected WRONG/SKIPPED to a tajweed verdict.
+                // MULTI-RULE SAFE: keyed by (word, rule) — two rules on the same
+                // word merge independently instead of collapsing into one row.
                 val cur = detailedAnalysis
-                val byIdx = cur.associateBy { it.wordIndex }.toMutableMap()
+                val keyOf: (WordAnalysis) -> String = { "${it.wordIndex}:${it.tajweedRule ?: "-"}" }
+                val byKey = cur.associateBy(keyOf).toMutableMap()
                 var changed = 0
                 for (w in acoustic) {
                     if (w.status == RecitationStatus.TAJWEED_ERROR || w.tajweedScore != null) {
-                        val existing = byIdx[w.wordIndex]
+                        val k = keyOf(w)
+                        val existing = byKey[k]
                         if (existing == null ||
                             (existing.status != RecitationStatus.WRONG && existing.status != RecitationStatus.SKIPPED)) {
                             if (existing?.status != w.status || existing?.tajweedScore != w.tajweedScore) changed++
-                            byIdx[w.wordIndex] = w
+                            byKey[k] = w
                         }
                     }
                 }
                 if (changed > 0) {
-                    detailedAnalysis = byIdx.values.sortedBy { it.wordIndex }
+                    // MISTAKE EXCLUSIVITY: if a word's live verdict is a text
+                    // mistake (WRONG/SKIPPED), drop every OTHER row for that word —
+                    // stale scored rows from earlier emissions must not sit next
+                    // to it ("wrong word + Tajweed Al-Lam without score"). The
+                    // user sees EITHER the wrong/skipped popup OR a tajweed
+                    // popup naming rule + score, never both.
+                    val mistakeIdxs = byKey.values
+                        .filter { it.status == RecitationStatus.WRONG || it.status == RecitationStatus.SKIPPED }
+                        .map { it.wordIndex }
+                        .toHashSet()
+                    val kept = byKey.values
+                        .filter { w ->
+                            !(w.wordIndex in mistakeIdxs &&
+                                w.status != RecitationStatus.WRONG && w.status != RecitationStatus.SKIPPED)
+                        }
+                        .sortedWith(compareBy({ it.wordIndex }, { it.tajweedRule ?: "" }))
+                    detailedAnalysis = kept
                 }
                 android.util.Log.i("ItqanSherpa", "analyze(tajweed): done ${System.currentTimeMillis() - tjT0}ms scored=${acoustic.count { it.tajweedScore != null }} tajweedErrors=${acoustic.count { it.status == RecitationStatus.TAJWEED_ERROR }} changed=$changed")
             } catch (t: Throwable) {
@@ -3248,7 +3382,17 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             verifiedSpokenIndices.clear()
             lastMistakeVerifyMs = 0L
             mistakeVerifyAbsentIdx = -1
+            mistakeEpisodeAnchor = -1
+            mistakeCleanStreak = 0
             confirmedMistakeUiIdx = -1
+            mistakeEpisodeAnchor = -1
+            mistakeCleanStreak = 0
+            // Same stale-work guard as the range change: nothing queued for the
+            // old surface may apply after the switch.
+            analysisEpoch++
+            try { tajweedPipelineHolder.pipeline?.invalidateInFlightCommit() } catch (_: Throwable) {}
+            while (analyzeRequests.tryReceive().isSuccess) { /* drain */ }
+            while (tajweedRequests.tryReceive().isSuccess) { /* drain */ }
         }
     }
 
@@ -3299,25 +3443,45 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             // A new emission is one whose transcript text differs from the one
             // that produced the previous sighting (the same emission can
             // re-trigger this effect when other state changes).
+            // EPISODE-STABLE identity: noisy merges make mistakeIdx flicker a
+            // few words between emissions (echoes appear/vanish); treating each
+            // flicker as a NEW candidate reset the confirmation counters
+            // forever - nothing ever fired and the cursor froze ("stuck at
+            // ayah 2"). Drift within +-3 of the anchor = SAME episode; the
+            // episode closes only after TWO consecutive clean emissions.
+            val sameEpisode = mistakeIdx >= 0 &&
+                mistakeEpisodeAnchor >= 0 &&
+                kotlin.math.abs(mistakeIdx - mistakeEpisodeAnchor) <= 3
             val isNewEmission = mistakeIdx >= 0 &&
                 currentSpoken != lastWrongStopSpokenText
             if (mistakeIdx < 0) {
-                lastWrongStopIndex = -1
-                lastWrongStopSpokenText = ""
-                lastWrongStopSightings = 0
-                lastWrongStopFirstSeenMs = 0L
-                confirmedMistakeUiIdx = -1
-                mistakeVerifyAbsentIdx = -1
-            } else if (mistakeIdx != lastWrongStopIndex) {
-                // A different word is now the first mistake: restart the
-                // confirmation counters for the new candidate.
+                mistakeCleanStreak += 1
+                if (mistakeCleanStreak >= 2 || lastWrongStopIndex == -1) {
+                    lastWrongStopIndex = -1
+                    lastWrongStopSpokenText = ""
+                    lastWrongStopSightings = 0
+                    lastWrongStopFirstSeenMs = 0L
+                    confirmedMistakeUiIdx = -1
+                    mistakeEpisodeAnchor = -1
+                    mistakeCleanStreak = 0
+                    mistakeVerifyAbsentIdx = -1
+                    mistakeEpisodeAnchor = -1
+                    mistakeCleanStreak = 0
+                }
+            } else if (!sameEpisode && mistakeIdx != lastWrongStopIndex) {
+                // A genuinely different region is now the first mistake:
+                // restart the confirmation counters for the new candidate.
+                mistakeEpisodeAnchor = mistakeIdx
+                mistakeCleanStreak = 0
                 lastWrongStopIndex = mistakeIdx
                 lastWrongStopSpokenText = currentSpoken
                 lastWrongStopSightings = 1
                 lastWrongStopFirstSeenMs = System.currentTimeMillis()
-                // New candidate: not yet confirmed — hide any previous
+                // New candidate: not yet confirmed - hide any previous
                 // mistake UI until THIS index earns the evidence too.
                 confirmedMistakeUiIdx = -1
+                mistakeEpisodeAnchor = -1
+                mistakeCleanStreak = 0
                 mistakeVerifyAbsentIdx = -1
             } else {
                 if (isNewEmission) {
@@ -3339,52 +3503,209 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 //   absent     ⇒ REAL — remembered in mistakeVerifyAbsentIdx,
                 //                confirmation proceeds toward popup/pause;
                 //   inconclusive (empty: decoder busy / too little audio /
-                //   blank) ⇒ retry on a later emission (3 s cooldown).
-                // Punishing below REQUIRES this absent verdict — no pause on
-                // unverified evidence.
-                if (mistakeIdx != mistakeVerifyAbsentIdx &&
+                //   blank) ⇒ retry on a later emission (cooldown).
+                //
+                // CRITICAL — DETACHED JOB, NOT an effect-child coroutine. The
+                // full-tail decode takes 1-3 s on-device, and EVERY new
+                // emission restarts this LaunchedEffect, cancelling any child
+                // that is awaiting the result — the verdict was lost, the
+                // cooldown blocked retries, and slow phones livelocked with
+                // the cursor stuck on one word forever ("stuck on ayah 2").
+                // Launching on the composition scope lets the result survive
+                // restarts and write its verdict into state regardless.
+                if (!(mistakeVerifyAbsentIdx >= 0 &&
+                        kotlin.math.abs(mistakeIdx - mistakeVerifyAbsentIdx) <= 3) &&
                     mistakeIdx !in verifiedSpokenIndices &&
+                    mistakeIdx != verifyInFlightIdx.get() &&
                     lastWrongStopSightings >= 2 &&
                     isListening && tajweedPipelineHolder.running &&
-                    System.currentTimeMillis() - lastMistakeVerifyMs >= 3000L
+                    System.currentTimeMillis() - lastMistakeVerifyMs >= 3000L &&
+                    (verifyJobRef.get() == null || !verifyJobRef.get()!!.isActive)
                 ) {
                     lastMistakeVerifyMs = System.currentTimeMillis()
-                    val targetNormText = detailedAnalysis[mistakeIdx].normalizedText
-                    val verifiedWords = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        try {
-                            tajweedPipelineHolder.pipeline?.verifyTailWords() ?: emptyList()
-                        } catch (t: Throwable) {
-                            android.util.Log.w("ItqanSherpa", "mistakeStop(): verifyTailWords threw", t)
-                            emptyList<String>()
+                    val idxToVerify = mistakeIdx
+                    val normText = detailedAnalysis[mistakeIdx].normalizedText
+                    val kindStr = if (isSkipped) "SKIPPED" else "WRONG"
+                    val wordText = detailedAnalysis[mistakeIdx].text
+                    // Episode-aware span: cover the WHOLE time since this
+                    // candidate first appeared (+8 s margin) so a word read a
+                    // while ago is still inside the decoded audio.
+                    val spanSec = ((System.currentTimeMillis() - lastWrongStopFirstSeenMs) / 1000L + 8L)
+                        .toInt().coerceIn(10, 45)
+                    verifyInFlightIdx.set(idxToVerify)
+                    verifyJobRef.set(coroutineScope.launch {
+                        val verifiedWords = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            try {
+                                tajweedPipelineHolder.pipeline?.verifyTailWords(spanSec) ?: emptyList()
+                            } catch (t: Throwable) {
+                                android.util.Log.w("ItqanSherpa", "mistakeStop(): verifyTailWords threw", t)
+                                emptyList<String>()
+                            }
                         }
-                    }
-                    val found = verifiedWords.any { vw -> isWordMatch(vw, targetNormText) }
-                    android.util.Log.i(
-                        "ItqanSherpa",
-                        "mistakeStop(): verify idx=$mistakeIdx ${if (isSkipped) "SKIPPED" else "WRONG"} word='${detailedAnalysis[mistakeIdx].text}' verified=${verifiedWords.size}w found=$found"
-                    )
-                    if (verifiedWords.isEmpty()) {
-                        // Inconclusive — decide nothing; retry on a later emission.
-                        return@LaunchedEffect
-                    }
-                    if (found) {
-                        // FALSE ALARM. The full-context decode heard the flagged
-                        // word even though the sliding windows missed it — the
-                        // user said it correctly. Count it as spoken (the fast
-                        // loop flips its verdict to CORRECT and the cursor
-                        // advances past it) and continue without interruption.
-                        verifiedSpokenIndices.add(mistakeIdx)
-                        mistakeVerifyAbsentIdx = -1
-                        lastWrongStopIndex = -1
-                        lastWrongStopSpokenText = ""
-                        lastWrongStopSightings = 0
-                        lastWrongStopFirstSeenMs = 0L
-                        confirmedMistakeUiIdx = -1
-                        return@LaunchedEffect
-                    }
-                    // Verified ABSENT: the word genuinely was not said. Remember
-                    // the verdict for this episode so we never re-decode it.
-                    mistakeVerifyAbsentIdx = mistakeIdx
+                        verifyInFlightIdx.set(-1)
+                        // MATCH ON NORMALIZED FORMS. matcher.clean() returns the
+                        // vocab's canonical DISPLAY words (fully diacritized), while
+                        // detailedAnalysis.normalizedText is normalizeForComparison
+                        // output (diacritics stripped). isWordMatch does NOT strip
+                        // them itself: "رَبِّ" vs "رب" scored distance 3 on a short
+                        // word -> found=false even when the decode contained the
+                        // exact word (measured on-device: a false SKIPPED popup on
+                        // a correctly-read ayah). Normalize the decoded side too.
+                        val found = verifiedWords.any { vw ->
+                            isWordMatch(normalizeForComparison(vw, viewModel.riwayah), normText)
+                        }
+                        android.util.Log.i(
+                            "ItqanSherpa",
+                            "mistakeStop(): verify idx=$idxToVerify $kindStr word='$wordText' verified=${verifiedWords.size}w found=$found"
+                        )
+                        if (verifiedWords.isEmpty()) {
+                            // Inconclusive — clear the cooldown so a later emission retries promptly.
+                            lastMistakeVerifyMs = 0L
+                            return@launch
+                        }
+                        if (found) {
+                            // FALSE ALARM. The full-context decode heard the flagged
+                            // word even though the sliding windows missed it — the
+                            // user said it correctly. Count it as spoken (the fast
+                            // loop flips its verdict to CORRECT and the cursor
+                            // advances past it) and continue without interruption.
+                            verifiedSpokenIndices.add(idxToVerify)
+                            mistakeVerifyAbsentIdx = -1
+                            mistakeEpisodeAnchor = -1
+                            mistakeCleanStreak = 0
+                            lastWrongStopIndex = -1
+                            lastWrongStopSpokenText = ""
+                            lastWrongStopSightings = 0
+                            lastWrongStopFirstSeenMs = 0L
+                            confirmedMistakeUiIdx = -1
+                            mistakeEpisodeAnchor = -1
+                            mistakeCleanStreak = 0
+                            // ── TRANSCRIPT RECONCILIATION ── A "found" verdict is
+                            // direct evidence that the LIVE transcript diverged from
+                            // reality in this region: noisy decodes leave displaced
+                            // echoes/duplicates (measured on-device on a slower
+                            // phone: …الرحيم، الحمدِّ، العالمين، الرحمن، الرحيم، لله…
+                            // — الحمد/العالمين echoed BEFORE الرحمن الرحيم لله), so
+                            // forgiving one word only reveals the next phantom
+                            // candidate. Reuse THIS SAME decode: if its word
+                            // sequence matches the target's leading run BETTER than
+                            // the live transcript, adopt it wholesale — identical
+                            // semantics to the collector's endpoint repair-swap,
+                            // applied mid-session.
+                            fun targetPrefixLen(words: List<String>): Int {
+                                var i = 0
+                                while (i < words.size && i < targetNorm.size &&
+                                    targetNorm[i].isNotEmpty() &&
+                                    normalizeForComparison(words[i], viewModel.riwayah) == targetNorm[i]
+                                ) i++
+                                return i
+                            }
+                            val liveNow = (finalSpokenText + " " + partialSpokenText).trim()
+                                .split(Regex("\\s+")).filter { it.isNotEmpty() }
+                            val livePrefix = targetPrefixLen(liveNow)
+                            val verifyPrefix = targetPrefixLen(verifiedWords)
+                            if (verifyPrefix > livePrefix && verifiedWords.size <= targetNorm.size + 4) {
+                                finalSpokenText = verifiedWords.joinToString(" ").trim()
+                                partialSpokenText = ""
+                                committedWordCount = verifiedWords.size
+                                lastCommittedWords = verifiedWords.toList()
+                                android.util.Log.i(
+                                    "ItqanSherpa",
+                                    "mistakeStop(): reconcile adopted tail decode (${verifiedWords.size}w prefix=$verifyPrefix) over live (${liveNow.size}w prefix=$livePrefix)"
+                                )
+                            }
+                        } else {
+                            // Verified ABSENT: the word genuinely was not said. Remember
+                            // the verdict for this episode so we never re-decode it.
+                            mistakeVerifyAbsentIdx = idxToVerify
+                        }
+                    })
+                }
+
+                // ── STUCK RECONCILE ── When a candidate survives MANY emissions
+                // even after its verdict landed, the live transcript itself is
+                // echo-poisoned in that region: forgiving single words just
+                // reveals the next phantom candidate, and the cursor stays
+                // frozen until the user pauses — whose own full-tail repair
+                // then heals everything at once (measured repeatedly on a slow
+                // device: "stuck at ayah 2, paused the mic, all words displayed
+                // + popup"). Fire a LONG-span tail decode proactively instead;
+                // if its sequence aligns to the target with MORE leading
+                // matches than the live transcript, adopt it wholesale (same
+                // semantics as the collector's repair swap, mid-session).
+                val stuckCandidate =
+                    lastWrongStopSightings >= 6 &&
+                        (mistakeIdx in verifiedSpokenIndices || mistakeIdx == mistakeVerifyAbsentIdx)
+                if (stuckCandidate &&
+                    isListening && tajweedPipelineHolder.running &&
+                    System.currentTimeMillis() - lastReconcileMs >= 12000L &&
+                    (verifyJobRef.get() == null || !verifyJobRef.get()!!.isActive)
+                ) {
+                    lastReconcileMs = System.currentTimeMillis()
+                    val idxAtLaunch = mistakeIdx
+                    val spanSec = ((System.currentTimeMillis() - lastWrongStopFirstSeenMs) / 1000L + 8L)
+                        .toInt().coerceIn(10, 45)
+                    verifyJobRef.set(coroutineScope.launch {
+                        val words = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            try {
+                                tajweedPipelineHolder.pipeline?.verifyTailWords(spanSec) ?: emptyList()
+                            } catch (t: Throwable) {
+                                android.util.Log.w("ItqanSherpa", "stuck-reconcile(): verifyTailWords threw", t)
+                                emptyList<String>()
+                            }
+                        }
+                        if (words.isEmpty()) return@launch
+                        fun nrm(s: String) = normalizeForComparison(s, viewModel.riwayah)
+                        val targetSet = targetNorm.filter { it.isNotEmpty() }.toHashSet()
+                        // Leading-match walk mirroring the display cursor: count
+                        // target positions satisfied before the first hard stop.
+                        fun leadingMatches(seq: List<String>): Int {
+                            var ti = 0
+                            var si = 0
+                            var good = 0
+                            var garbage = 0
+                            while (ti < targetNorm.size && si < seq.size) {
+                                var f = -1
+                                val scanEnd = minOf(si + 3, seq.size)
+                                for (k in si until scanEnd) {
+                                    if (targetNorm[ti].isNotEmpty() && nrm(seq[k]) == targetNorm[ti]) { f = k; break }
+                                }
+                                if (f != -1) { good++; ti++; si = f + 1; garbage = 0 }
+                                else {
+                                    val curN = nrm(seq[si])
+                                    if (curN.isNotEmpty() && curN !in targetSet && garbage < 2) { garbage++; si++; continue }
+                                    break
+                                }
+                            }
+                            return good
+                        }
+                        val newMatched = leadingMatches(words)
+                        val liveMatchedNow = alignment.first
+                        android.util.Log.i(
+                            "ItqanSherpa",
+                            "mistakeStop(): stuck-reconcile idx=$idxAtLaunch decode=${words.size}w matched=$newMatched vs live=$liveMatchedNow"
+                        )
+                        if (newMatched > liveMatchedNow && words.size <= targetNorm.size + 4) {
+                            finalSpokenText = words.joinToString(" ").trim()
+                            partialSpokenText = ""
+                            committedWordCount = words.size
+                            lastCommittedWords = words.toList()
+                            lastWrongStopIndex = -1
+                            lastWrongStopSpokenText = ""
+                            lastWrongStopSightings = 0
+                            lastWrongStopFirstSeenMs = 0L
+                            mistakeVerifyAbsentIdx = -1
+                            mistakeEpisodeAnchor = -1
+                            mistakeCleanStreak = 0
+                            confirmedMistakeUiIdx = -1
+                            mistakeEpisodeAnchor = -1
+                            mistakeCleanStreak = 0
+                            android.util.Log.i(
+                                "ItqanSherpa",
+                                "mistakeStop(): stuck-reconcile ADOPTED ${words.size}w (matched $liveMatchedNow -> $newMatched)"
+                            )
+                        }
+                    })
                 }
 
                 // WRONG: a word the user actually spoke that does not match the
@@ -3398,11 +3719,15 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 val dwellOk = if (isSkipped)
                     (System.currentTimeMillis() - lastWrongStopFirstSeenMs) >= 2000L
                 else true
-                // DISPLAY GATE: once this index has survived the same evidence
-                // the auto-pause requires AND verification has judged it real,
-                // the banner + red word may show. Re-asserted on every later
-                // pass so frozen sessions keep their mistake visible.
-                if (lastWrongStopSightings >= sightingsNeeded && (!isSkipped || dwellOk)) {
+                // DISPLAY GATE — VERIFIED-REAL ONLY. Transient candidates stay
+                // INVISIBLE until the tail verification has spoken: if it
+                // forgives, nothing was ever shown; if it says absent, the
+                // banner + red word appear for a genuinely-wrong word. The old
+                // sightings-based gate still flashed false mistakes during the
+                // self-heal window (user: "only true mistakes should be seen").
+                val episodeAbsent = mistakeVerifyAbsentIdx >= 0 &&
+                    kotlin.math.abs(mistakeIdx - mistakeVerifyAbsentIdx) <= 3
+                if (episodeAbsent) {
                     confirmedMistakeUiIdx = mistakeIdx
                 }
                 val isConfirmed = isNewEmission &&
@@ -3411,7 +3736,10 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     (!isSkipped || skipAdvancedPast) &&
                     // Evidence requirement: only a VERIFIED-absent candidate may
                     // stop the recitation (see the early-verification block).
-                    mistakeIdx == mistakeVerifyAbsentIdx
+                    // Drift-tolerant: the candidate index may shift ±3 inside the
+                    // episode while the echo tokens flicker.
+                    (mistakeVerifyAbsentIdx >= 0 &&
+                        kotlin.math.abs(mistakeIdx - mistakeVerifyAbsentIdx) <= 3)
                 if (isListening && tajweedPipelineHolder.running && isConfirmed) {
                     val sessionElapsed =
                         (System.currentTimeMillis() - tajweedRecordingStartMs).coerceAtLeast(0L)
@@ -4662,7 +4990,7 @@ spokenTimings.clear()
             // it (mistakeResumeIndex / mistakeResumeLiveText), so the word
             // counts again and the final transcript isn't duplicated.
             val popupScore = if (latestPopupKind == "tajweed") {
-                detailedAnalysis.getOrNull(wordIdx)?.tajweedScore
+                detailedAnalysis.forWordIndex(wordIdx)?.tajweedScore
             } else null
             val localizedRule = getAppString(isArabic, ruleLabel)
             val popupTitle = when (latestPopupKind) {
@@ -5566,10 +5894,12 @@ spokenTimings.clear()
                                                         // acoustically failed word keeps its rule colours but
                                                         // gains an underline.
                                                         val feedbackText = buildAnnotatedString {
-                                                            localAnalysisSnap.forEachIndexed { wi, wordInfo ->
+                                                            // MULTI-RULE: one row per (word, rule) — render each WORD once.
+                                                            val feedbackWords = localAnalysisSnap.distinctBy { it.wordIndex }
+                                                            feedbackWords.forEachIndexed { wi, wordInfo ->
                                                                 val ann = buildTajweedAnnotatedString(
                                                                     wordInfo.text,
-                                                                    localAnalysisSnap.getOrNull(wi + 1)?.text,
+                                                                    feedbackWords.getOrNull(wi + 1)?.text,
                                                                     viewModel.riwayah
                                                                 )
                                                                 val start = length
@@ -5578,8 +5908,9 @@ spokenTimings.clear()
                                                                     addStyle(s.item, start + s.start, start + s.end)
                                                                 }
                                                                 val end = length
-                                                                when (wordInfo.status) {
-                                                                    RecitationStatus.WRONG, RecitationStatus.SKIPPED ->
+                                                                val rows = localAnalysisSnap.filter { it.wordIndex == wordInfo.wordIndex }
+                                                                when {
+                                                                    rows.any { it.status == RecitationStatus.WRONG || it.status == RecitationStatus.SKIPPED } ->
                                                                         addStyle(
                                                                             SpanStyle(
                                                                                 color = MaterialTheme.colorScheme.error,
@@ -5587,7 +5918,7 @@ spokenTimings.clear()
                                                                             ),
                                                                             start, end
                                                                         )
-                                                                    RecitationStatus.TAJWEED_ERROR ->
+                                                                    rows.any { it.status == RecitationStatus.TAJWEED_ERROR } ->
                                                                         addStyle(
                                                                             SpanStyle(textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline),
                                                                             start, end
@@ -6244,6 +6575,16 @@ spokenTimings.clear()
                                     verifiedSpokenIndices.clear()
                                     lastMistakeVerifyMs = 0L
                                     mistakeVerifyAbsentIdx = -1
+                                    mistakeEpisodeAnchor = -1
+                                    mistakeCleanStreak = 0
+                                    // Same stale-work guard as a range change: queued
+                                    // analysis requests + any in-flight pause() final
+                                    // decode belong to the PRE-restart attempt and must
+                                    // never surface against the fresh one.
+                                    analysisEpoch++
+                                    try { tajweedPipelineHolder.pipeline?.invalidateInFlightCommit() } catch (_: Throwable) {}
+                                    while (analyzeRequests.tryReceive().isSuccess) { /* drain */ }
+                                    while (tajweedRequests.tryReceive().isSuccess) { /* drain */ }
                                     // Drop any hint-charges for words in this ayah: we're re-reading
                                     // it, so those injected words must come out of the transcript too.
                                     // (Avoid SnapshotStateSet#removeAll-with-predicate overload
@@ -6300,6 +6641,15 @@ spokenTimings.clear()
                                 verifiedSpokenIndices.clear()
                                 lastMistakeVerifyMs = 0L
                                 mistakeVerifyAbsentIdx = -1
+                                mistakeEpisodeAnchor = -1
+                                mistakeCleanStreak = 0
+                                // Same stale-work guard as a range change: queued
+                                // requests + any in-flight pause()/stop() final decode
+                                // belong to the pre-restart attempt.
+                                analysisEpoch++
+                                try { tajweedPipelineHolder.pipeline?.invalidateInFlightCommit() } catch (_: Throwable) {}
+                                while (analyzeRequests.tryReceive().isSuccess) { /* drain */ }
+                                while (tajweedRequests.tryReceive().isSuccess) { /* drain */ }
                                 if (isListening) {
                                     try { speechRecognizer?.stopListening(); isListening = false } catch (e: Throwable) {}
                                     errorMessage = null
@@ -6323,13 +6673,13 @@ spokenTimings.clear()
                 // confirmation search. Tarteel mode: unchanged instant banner.
                 val bannerIdx = if (recitationMode == "Tajweed") {
                     if (confirmedMistakeUiIdx >= 0) confirmedMistakeUiIdx
-                    else detailedAnalysis.getOrNull(errorIndex)
+                    else detailedAnalysis.forWordIndex(errorIndex)
                         ?.takeIf { it.status == RecitationStatus.TAJWEED_ERROR }
                         ?.let { errorIndex }
                         ?: -1
                 } else errorIndex
                 if (currentTab == "Memorize" && bannerIdx >= 0) {
-                    val currentAnalysis = detailedAnalysis.getOrNull(bannerIdx)
+                    val currentAnalysis = detailedAnalysis.forWordIndex(bannerIdx)
                     if (currentAnalysis != null) {
                         val isTajweedError = currentAnalysis.status == RecitationStatus.TAJWEED_ERROR && recitationMode == "Tajweed"
                         val isWrongWord = currentAnalysis.status == RecitationStatus.WRONG
@@ -6439,7 +6789,7 @@ spokenTimings.clear()
                                             // styling (orange underline) even after we've advanced past
                                             // them -- the user never actually said them, and the mistake
                                             // counter already charged 1 wrong.
-                                            val isHintedWord = detailedAnalysis.getOrNull(globalWordIndex)?.status == RecitationStatus.HINTED
+                                            val isHintedWord = detailedAnalysis.forWordIndex(globalWordIndex)?.status == RecitationStatus.HINTED
                                             if (isHintedWord) {
                                                 withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.tertiary, fontWeight = FontWeight.Bold, textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline, background = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.3f))) {
                                                     if (wordTajweed != null) {
@@ -6475,9 +6825,9 @@ spokenTimings.clear()
                                             // its instant highlight. Tarteel: unchanged.
                                             (!isTajweed ||
                                                 globalWordIndex == confirmedMistakeUiIdx ||
-                                                detailedAnalysis.getOrNull(globalWordIndex)?.status == RecitationStatus.TAJWEED_ERROR)
+                                                detailedAnalysis.forWordIndex(globalWordIndex)?.status == RecitationStatus.TAJWEED_ERROR)
                                         ) {
-                                            val currentAnalysis = detailedAnalysis.getOrNull(globalWordIndex)
+                                            val currentAnalysis = detailedAnalysis.forWordIndex(globalWordIndex)
                                             val isTajweedError = isTajweed && currentAnalysis?.status == RecitationStatus.TAJWEED_ERROR
                                             val errorBg = if (isTajweedError) Color(0xFFFBC02D).copy(alpha = 0.3f) else MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
                                             val errorDecoration = androidx.compose.ui.text.style.TextDecoration.Underline
@@ -6779,6 +7129,8 @@ spokenTimings.clear()
                             verifiedSpokenIndices.clear()
                             lastMistakeVerifyMs = 0L
                             mistakeVerifyAbsentIdx = -1
+                            mistakeEpisodeAnchor = -1
+                            mistakeCleanStreak = 0
                             // Reminder: Memorize+Tajweed does NOT run our own AudioRecord here.
                             // Two simultanous mic clients on the user's Samsung A05s starve the
                             // SpeechRecognizer of partial results (matchedWordCount never
@@ -6981,6 +7333,8 @@ spokenTimings.clear()
                                              verifiedSpokenIndices.clear()
                                              lastMistakeVerifyMs = 0L
                                              mistakeVerifyAbsentIdx = -1
+                                             mistakeEpisodeAnchor = -1
+                                             mistakeCleanStreak = 0
                                              showSurahSelectionDialog = false
                                         },
                                     colors = CardDefaults.cardColors(

@@ -164,7 +164,54 @@ candidate only becomes a *punished* mistake after three gates:
    Punishment REQUIRES the absent verdict — measured on-device, sliding windows
    can chronically garble/drop a word (e.g. لِلَّهِ رَبِّ lost for ~5 s across
    two windows, heard by the next window and every full-tail decode).
-3. **Minimum-listen guard:** no auto-stop within the first ~2.5 s of a session.
+ 3. **Minimum-listen guard:** no auto-stop within the first ~2.5 s of a session.
+
+**Episode-stable candidates.** Noisy merges make the first-mistake index flicker
+±few words between emissions (echo tokens appear/vanish); treating each flicker
+as a NEW candidate reset the confirmation counters forever, so on slow phones
+nothing ever fired and the cursor froze. The watcher now tracks an ANCHOR index:
+drift within ±3 words counts as the same episode (verification and punishment
+gates are drift-tolerant too), and an episode closes only after TWO consecutive
+clean emissions.
+
+**Verification slot-wait + episode span.** `verifyTailWords(trailingSeconds)`
+waits up to ~2.5 s for the live decoder's slot instead of bailing instantly
+(the live loop re-decodes every ~1.5 s and each pass takes 1-2.5 s on slow
+phones — an unconditional grab lost nearly every race), and its window spans
+the WHOLE candidate episode (+8 s margin, clamped 10-45 s) so a word read a
+while ago is still inside the decoded audio.
+
+**Stuck-reconcile.** If a candidate STILL survives ≥6 emissions after its
+verdict, the live transcript itself is echo-poisoned; one long-span tail decode
+is then adopted WHOLESALE when it aligns to the target with more leading
+matches than the live log — the same heal a manual pause used to trigger,
+applied automatically mid-session.
+
+**Verified-only display.** The wrong/skipped banner + red word appear ONLY after
+the tail verification says the word truly was not said. Transient candidates
+stay invisible while self-heal has a chance; "only true mistakes should be seen
+by the user".
+
+**Exclusive popups.** WRONG/SKIPPED rows carry no tajweed rule (and stale scored
+rows for that word are purged): the user sees either a recitation-mistake popup
+OR a tajweed popup naming rule + score — never both.
+
+**Multi-rule scoring rows.** A word carrying several rules gets ONE SCORE ROW
+PER RULE (Al-Lam + Madd on ٱلضَّالِّينَ, etc.), each judged against its own
+head threshold; alignment counts each WORD once. MADD is only attached where
+the app PAINTS RED (explicit maddah marks آ/U+0653/U+06E4) — natural 2-count
+vowels score 23-51% even on perfect recitations with the current head and stay
+excluded until a recalibrated model ships.
+
+**Epoch guards.** Range/surah changes, tab switches and both restart buttons
+bump an analysis epoch: queued requests from older epochs are drained/dropped,
+and `invalidateInFlightCommit()` makes any in-flight pause()/stop() final-tail
+decode discard its emit instead of landing old-range words into the new session.
+
+**Finalize ⇒ PENDING becomes SKIPPED.** When a session finalizes (user stopped;
+the full-tail decode already had its best chance), remaining PENDING words were
+never produced by the recognizer across the entire session — they surface as
+SKIPPED with banner/popup/resume point instead of vanishing silently.
 
 **Final-decode repair acceptance (positional quality).** When pause()/stop()
 runs the full-tail decode, the collector accepts its "repair swap" only if it
