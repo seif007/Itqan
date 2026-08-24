@@ -1961,6 +1961,16 @@ suspend fun analyzeRecitationDetails(
     // surfaces as a mistake.
     val targetNormSet = targetWordsNormalized.filter { it.isNotEmpty() }.toHashSet()
     var consecutiveGarbageSkips = 0
+    // ECHO-ABSORPTION bookkeeping: noisy merges re-emit ALREADY-SPOKEN words
+    // later in the transcript (e.g. ٱلرَّحْمَٰنِ echoing after الْحَمْدُ on a
+    // slow phone). Such tokens ARE vocabulary words, so the OOV-garbage skip
+    // cannot catch them — yet they steal the alignment slot of the REAL
+    // upcoming word and cascade false SKIPPED/W RONG verdicts (measured
+    // on-device on Al-Baqarah). A spoken token matching an ALREADY-CONSUMED
+    // target word is absorbed (stepped over) instead, capped at 3 consecutive
+    // so pathological repeat runs still surface as mistakes.
+    val consumedNorms = HashSet<String>()
+    var consecutiveEchoSkips = 0
     
     // Process-wide singleton: the ~1 MB weights are parsed once and reused across
     // every recitation, so per-word analysis no longer re-decodes the JSON blob.
@@ -1990,6 +2000,7 @@ suspend fun analyzeRecitationDetails(
                 spokenText = if (spokenIndex < spoken.size) spoken[spokenIndex] else null,
                 tajweedRule = null  // never scored (see below)
             ))
+            consumedNorms.add(targetWordNorm)
             targetIndex++; spokenIndex++
             continue
         }
@@ -2048,6 +2059,8 @@ suspend fun analyzeRecitationDetails(
         
         if (matchInSpokenAhead != -1) {
             consecutiveGarbageSkips = 0
+            consumedNorms.add(targetWordNorm)
+            consecutiveEchoSkips = 0
 
             // ── MULTI-RULE LABELS ── one score row per rule the word carries.
             // The primary detector label comes first, then any additional
@@ -2308,6 +2321,29 @@ suspend fun analyzeRecitationDetails(
         
         var matchInTargetAhead = -1
         val spokenCurrent = spoken[spokenIndex]
+        // ECHO ABSORPTION (see bookkeeping above): a spoken token that matches
+        // an ALREADY-CONSUMED target word is a merge echo of the past, not the
+        // user moving on — step over it so it cannot steal the upcoming slot
+        // and cascade false SKIPPED verdicts.
+        // REFINEMENT: only absorb when the word does NOT also occur in the
+        // REMAINING target ahead — legitimate repeats (الله in الإخلاص,
+        // أَلَا in الماعون) must still align normally.
+        val spokenCurrentNormPre = normalizeForComparison(spokenCurrent, riwayah)
+        if (spokenCurrentNormPre.isNotEmpty() &&
+            consumedNorms.contains(spokenCurrentNormPre) &&
+            consecutiveEchoSkips < 3
+        ) {
+            var appearsAhead = false
+            for (j in targetIndex + 1 until limit) {
+                if (targetWordsNormalized[j] == spokenCurrentNormPre) { appearsAhead = true; break }
+            }
+            if (!appearsAhead) {
+                consecutiveEchoSkips++
+                spokenIndex++
+                continue
+            }
+        }
+        consecutiveEchoSkips = 0
         for (j in targetIndex + 1 until minOf(targetIndex + 4, limit)) {
             if (isWordMatch(spokenCurrent, targetWordsNormalized[j])) {
                 matchInTargetAhead = j
@@ -2331,10 +2367,11 @@ suspend fun analyzeRecitationDetails(
                 status = RecitationStatus.SKIPPED,
                 spokenText = null,
                 // A skipped word is only ever a skipped word: never attach a
-                // tajweed label — the user sees EITHER a wrong/skipped popup
+                // tajweed label - the user sees EITHER a wrong/skipped popup
                 // OR a tajweed popup with a rule + score, never a mix.
                 tajweedRule = null
             ))
+            consumedNorms.add(targetWordNorm)
             targetIndex++
             continue
         }
@@ -3053,13 +3090,12 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             }
         }
     }
-    // (item 5e) DONE-READING ⇒ PENDING BECOMES SKIPPED. While a session is
-    // live, unheard words stay PENDING (the frontier lags; self-heal may still
-    // render them). But once the session has FINALIZED — the user stopped and
-    // pause()'s full-tail decode already had its best chance — any remaining
-    // PENDING word is a real gap the recognizer never produced across the
-    // ENTIRE session. Surface it as SKIPPED (banner + popup + resume point),
-    // exactly like a mid-session skip.
+    // (item 5e — REVISED per user) DONE-READING ⇒ PENDING COUNTS CORRECT.
+    // When the session finalizes (user stopped; the full-tail decode already
+    // had its best chance), remaining PENDING words are counted as READ
+    // CORRECTLY and displayed green: the recognizer simply never rendered
+    // them, and the user should not be charged for the decoder's gaps. No
+    // popup, no resume point — the recitation is simply complete.
     LaunchedEffect(detailedAnalysis, sessionFinalized, isListening, currentTab, recitationMode) {
         if (currentTab == "Memorize" && recitationMode == "Tajweed" &&
             sessionFinalized && !isListening && detailedAnalysis.isNotEmpty()
@@ -3068,21 +3104,12 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             if (pendingRows.isNotEmpty()) {
                 detailedAnalysis = detailedAnalysis.map { w ->
                     if (w.status == RecitationStatus.PENDING)
-                        w.copy(status = RecitationStatus.SKIPPED, spokenText = null)
+                        w.copy(status = RecitationStatus.CORRECT, spokenText = null)
                     else w
-                }
-                val first = detailedAnalysis.firstOrNull { it.status == RecitationStatus.SKIPPED }
-                if (first != null) {
-                    latestPopupKind = "skipped"
-                    latestTajweedPopup = Pair(first.text, first.wordIndex)
-                    // Arm the resume re-seat so tapping the mic continues FROM
-                    // this word (same contract as a mid-session skip).
-                    mistakeResumeLiveText = (finalSpokenText + " " + partialSpokenText).trim()
-                    mistakeResumeIndex = first.wordIndex
                 }
                 android.util.Log.i(
                     "ItqanSherpa",
-                    "finalizeSkip(): ${pendingRows.size} PENDING word(s) -> SKIPPED at session end (first idx=${first?.wordIndex})"
+                    "finalizeCorrect(): ${pendingRows.size} PENDING word(s) counted CORRECT at session end (first idx=${pendingRows.first().wordIndex})"
                 )
             }
         }

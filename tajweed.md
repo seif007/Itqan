@@ -208,10 +208,28 @@ bump an analysis epoch: queued requests from older epochs are drained/dropped,
 and `invalidateInFlightCommit()` makes any in-flight pause()/stop() final-tail
 decode discard its emit instead of landing old-range words into the new session.
 
-**Finalize ⇒ PENDING becomes SKIPPED.** When a session finalizes (user stopped;
+**Finalize ⇒ PENDING counts CORRECT.** When a session finalizes (user stopped;
 the full-tail decode already had its best chance), remaining PENDING words were
-never produced by the recognizer across the entire session — they surface as
-SKIPPED with banner/popup/resume point instead of vanishing silently.
+never rendered by the recognizer — they are counted as READ CORRECTLY and
+displayed green. The user is not charged for the decoder's gaps (revised per
+user: "count it as the user read it correctly and display it").
+
+**Merge echo guard (target-count).** The merge's tail-append path drops a word
+whose target multiplicity is already fully satisfied by the log (Māʿūn's 4th
+أَلَا, Fātiḥah's echoing الرَّحْمَٰنِ) — echoes are stopped at the source
+instead of stealing alignment slots. Counts come from a vocab MULTISET (with
+duplicates); with only a Set the guard is disabled (a Set would flatten
+قُلْ ×2 and drop the real second occurrence).
+
+**Echo absorption (alignment walk).** As a second layer, the verdict walk steps
+over a spoken token that matches an ALREADY-CONSUMED target word — but only
+when that word does NOT also occur in the remaining target ahead (legitimate
+repeats like الله ×2 align normally), capped at 3 consecutive.
+
+**Harness parity.** The PC E2E harness's verdict walk is a VERBATIM mirror of
+the app's (same isWordMatch fuzzy matching, echo absorption, annotation-sign
+handling, wrong-stops-walk), plus Al-Baqarah scenarios (Ayat al-Kursi 255 ✓,
+285-286) exercising long-session echo/annotation edge cases.
 
 **Final-decode repair acceptance (positional quality).** When pause()/stop()
 runs the full-tail decode, the collector accepts its "repair swap" only if it

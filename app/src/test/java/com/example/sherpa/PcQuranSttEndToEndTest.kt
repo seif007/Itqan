@@ -1,6 +1,7 @@
-﻿package com.example.sherpa
+package com.example.sherpa
 
 import com.example.ui.CollectorSim
+import com.example.ui.isWordMatch
 import com.example.ui.normalizeArabic
 import com.example.ui.normalizeForComparison
 import javazoom.jl.decoder.Bitstream
@@ -177,7 +178,7 @@ class PcQuranSttEndToEndTest {
 
     // ── the pipeline replay ────────────────────────────────────────────────
 
-    private class MonoMerge(vocab: Set<String>) {
+    private class MonoMerge(vocab: Set<String>, vocabMultiset: List<String>) {
         /**
          * Uses the REAL pipeline merge (SherpaPipeline.monotonicMergeWords)
          * with the SAME metadata the wired pipeline passes: per-word first-
@@ -191,12 +192,13 @@ class PcQuranSttEndToEndTest {
         var lastClean: List<String> = emptyList()
         private var lastMs: LongArray = LongArray(0)
         private val vocabNorm: Set<String> = vocab
+        private val vocabMultisetNorm: List<String> = vocabMultiset
         /** True when the latest merge REPLACED the log (final-decode repair). */
         var lastRepair = false
             private set
 
         fun merge(n: List<String>, nowMs: Long, windowMs: Long, fullReRender: Boolean = false, coversSession: Boolean = false): List<String>? {
-            val merged = monotonicMergeWords(lastClean, n, lastMs, nowMs, windowMs, vocabNorm, fullReRender, coversSession)
+            val merged = monotonicMergeWords(lastClean, n, lastMs, nowMs, windowMs, vocabNorm, vocabMultisetNorm, fullReRender, coversSession)
             if (merged == lastClean) { lastRepair = false; return null }
             lastRepair = merged.size <= lastClean.size
             if (merged.size != lastClean.size) {
@@ -240,21 +242,37 @@ class PcQuranSttEndToEndTest {
     }
 
     /**
-     * Mirrors the app's per-word verdict walk (RecitationApp.analyzeRecitationDetails)
-     * WITHOUT the form groups / acoustic scoring: 3-ahead spoken match →
-     * CORRECT; spoken word matches a target AHEAD → SKIPPED; an out-of-
-     * vocabulary garbage word (no target slot) is stepped over, capped at 2
-     * consecutive; unmatched word at the transcript frontier → PENDING;
-     * otherwise WRONG (the analysis ends there in the app). Returns
-     * (targetIndex, targetNorm, verdict).
+     * VERBATIM mirror of the app's per-word verdict walk
+     * (RecitationApp.analyzeRecitationDetails, text-verdict path) so harness
+     * results are trustworthy for WRONG/SKIPPED:
+     *  - empty target norms (Quranic annotation signs ۚ ۖ — Baqarah has many)
+     *    count CORRECT without consuming speech;
+     *  - 3-ahead spoken match -> CORRECT (consumes the spoken tokens);
+     *  - ECHO ABSORPTION: a spoken token matching an ALREADY-CONSUMED target
+     *    word is a merge echo of the past — stepped over (cap 3), exactly like
+     *    the app, because on slow phones these echoes cascade false SKIPPED;
+     *  - spoken word matches a target AHEAD -> SKIPPED;
+     *  - out-of-vocabulary garbage (no target slot) stepped over, cap 2;
+     *  - unmatched word at the transcript frontier with spoken remaining <
+     *    target remaining -> PENDING;
+     *  - otherwise WRONG — and the walk ENDS there: everything after stays
+     *    PENDING (the app returns at the first WRONG).
      */
     private fun alignVerdicts(spokenNorms: List<String>, targetNorms: List<String>): List<Triple<Int, String, String>> {
         val out = ArrayList<Triple<Int, String, String>>()
         val targetSet = targetNorms.filter { it.isNotEmpty() }.toHashSet()
+        val consumedNorms = HashSet<String>()
         var garbageSkips = 0
+        var echoSkips = 0
         var ti = 0
         var si = 0
         while (ti < targetNorms.size) {
+            // Annotation signs normalize to "" — never recited, never charged.
+            if (targetNorms[ti].isEmpty()) {
+                out.add(Triple(ti, targetNorms[ti], "R"))
+                ti++
+                continue
+            }
             if (si >= spokenNorms.size) {
                 out.add(Triple(ti, targetNorms[ti], "PENDING"))
                 ti++
@@ -263,43 +281,67 @@ class PcQuranSttEndToEndTest {
             var found = -1
             val scanEnd = min(si + 3, spokenNorms.size)
             for (i in si until scanEnd) {
-                if (spokenNorms[i] == targetNorms[ti]) { found = i; break }
+                if (isWordMatch(spokenNorms[i], targetNorms[ti])) { found = i; break }
             }
             if (found != -1) {
                 garbageSkips = 0
+                echoSkips = 0
+                consumedNorms.add(targetNorms[ti])
                 out.add(Triple(ti, targetNorms[ti], "R"))
                 si = found + 1
                 ti++
                 continue
             }
+            val spokenCurrent = spokenNorms[si]
+            // ECHO ABSORPTION (mirrors the app): already-said word re-emitted,
+            // but ONLY when the word does not also occur in the remaining
+            // target ahead (legitimate repeats like الله / أَلَا align
+            // normally).
+            if (spokenCurrent.isNotEmpty() && consumedNorms.contains(spokenCurrent) && echoSkips < 3) {
+                var appearsAhead = false
+                for (j in ti + 1 until targetNorms.size) {
+                    if (targetNorms[j] == spokenCurrent) { appearsAhead = true; break }
+                }
+                if (!appearsAhead) {
+                    echoSkips++
+                    si++
+                    continue
+                }
+            }
+            echoSkips = 0
             var skip = false
             val aheadEnd = min(ti + 4, targetNorms.size)
             for (j in ti + 1 until aheadEnd) {
-                if (spokenNorms[si] == targetNorms[j]) { skip = true; break }
+                if (isWordMatch(spokenNorms[si], targetNorms[j])) { skip = true; break }
             }
             if (skip) {
+                consumedNorms.add(targetNorms[ti])
                 out.add(Triple(ti, targetNorms[ti], "SKIPPED"))
                 ti++
                 continue
             }
-            // OOV-garbage skip (mirrors the app): a word with no target slot
-            // is a decode artifact — step over it, capped so an alien
-            // utterance still trips WRONG.
-            val cur = spokenNorms[si]
+            // OOV-garbage skip (mirrors the app).
+            val cur = spokenCurrent
             if (cur.isNotEmpty() && cur !in targetSet && garbageSkips < 2) {
                 garbageSkips++
                 si++
                 continue
             }
             garbageSkips = 0
-            if (si == spokenNorms.size - 1) {
+            val spokenRemaining = spokenNorms.size - si
+            val targetRemaining = targetNorms.size - ti
+            val isTranscriptFrontier = si == spokenNorms.size - 1
+            if (spokenRemaining < targetRemaining && isTranscriptFrontier) {
                 out.add(Triple(ti, targetNorms[ti], "PENDING"))
                 ti++
                 continue
             }
             out.add(Triple(ti, targetNorms[ti], "WRONG"))
-            si++
-            ti++
+            // The app ENDS the walk at the first WRONG; the rest stays PENDING.
+            for (k in ti + 1 until targetNorms.size) {
+                out.add(Triple(k, targetNorms[k], "PENDING"))
+            }
+            return out
         }
         return out
     }
@@ -361,7 +403,7 @@ class PcQuranSttEndToEndTest {
         val captured = if (phoneRealism) deviceCaptured(samples) else samples
         val windowFrames = (windowSeconds * sampleRate).toInt()
         val hopFrames = (hopSeconds * sampleRate).toInt()
-        val mm = MonoMerge(targetNorms.toHashSet())
+        val mm = MonoMerge(targetNorms.toHashSet(), targetNorms)
         report.append("-- window decodes (gated ${"%.1f".format(captured.size / sampleRate.toDouble())}s) --\n")
         var hopEnd = hopFrames
         val mergedLog = StringBuilder()
@@ -702,5 +744,23 @@ class PcQuranSttEndToEndTest {
         // 90s oracle cap and the repeated إِذَا / يَوْمَئِذٍ / يَصْدُرُ
         // patterns over a long live-window sequence.
         runSurahE2E(99, 1..8, phoneRealism = false, stopAfterAyah = null, reportName = "e2e_zalzalah")
+    }
+
+    @Test
+    fun `al-baqarah ayat al-kursi 255 end to end`() {
+        // The most-recited single LONG ayah (~70s): one utterance with many
+        // repeated patterns (إِيَّاكَ ×2, وَإِيَّاكَ, الَّذِينَ, هُمْ فِيهَا)
+        // plus Quranic annotation signs — stresses echo-absorption and the
+        // empty-norm sign handling over a long merge log. WRONG/SKIPPED only:
+        // tajweed verdicts are out of scope for this harness.
+        runSurahE2E(2, 255..255, phoneRealism = false, stopAfterAyah = null, reportName = "e2e_baqarah_kursi")
+    }
+
+    @Test
+    fun `al-baqarah last two ayahs 285-286 end to end`() {
+        // The surah's closing pair (~60s): heavy الَّذِينَ / رَسُولُهُ /
+        // لَا يُكَلِّفُ repetition plus the لا نُفرِّقُ pattern — the exact
+        // region the user reported false WRONG/SKIPPED on-device.
+        runSurahE2E(2, 285..286, phoneRealism = false, stopAfterAyah = null, reportName = "e2e_baqarah_285_286")
     }
 }

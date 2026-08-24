@@ -196,7 +196,7 @@ class PcTajweedFalsePositiveTest {
             private set
 
         fun merge(n: List<String>, nowMs: Long, windowMs: Long, fullReRender: Boolean = false, coversSession: Boolean = false): List<String>? {
-            val merged = monotonicMergeWords(lastClean, n, lastMs, nowMs, windowMs, vocabNorm, fullReRender, coversSession)
+            val merged = monotonicMergeWords(lastClean, n, lastMs, nowMs, windowMs, vocabNorm, null, fullReRender, coversSession)
             if (merged == lastClean) { lastRepair = false; return null }
             lastRepair = merged.size <= lastClean.size
             if (merged.size != lastClean.size) {

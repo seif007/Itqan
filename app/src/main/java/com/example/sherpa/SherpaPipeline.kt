@@ -847,6 +847,10 @@ class SingleAudioPipeline(
     // of [monotonicMergeWords]: a log word NOT in this set is treated as an
     // OOV decode artifact the next decode may legally overwrite.
     private var vocabNorm: Set<String> = emptySet()
+    // MULTISET of the same vocabulary (normalized, WITH duplicates) — the echo
+    // guard counts target multiplicity against it (a Set would flatten
+    // الله x2 to x1 and drop the real second occurrence).
+    private var vocabMultiset: List<String> = emptyList()
 
     private fun resetEmitLogs() {
         lastEmitClean = emptyList()
@@ -870,6 +874,8 @@ class SingleAudioPipeline(
         vocabNorm = ayahWords.map { normalizeArabicPub(it) }
             .filter { it.isNotEmpty() }
             .toSet()
+        vocabMultiset = ayahWords.map { normalizeArabicPub(it) }
+            .filter { it.isNotEmpty() }
     }
 
     /** Grow/shrink the per-word timestamp log to match a merge result. */
@@ -890,7 +896,7 @@ class SingleAudioPipeline(
      * have re-heard (the trailing window, or the final tail's length).
      */
     private fun mergeClean(cleaned: List<String>, windowMs: Long, nowMs: Long, fullReRender: Boolean = false, coversSession: Boolean = false): List<String> {
-        val merged = monotonicMergeWords(lastEmitClean, cleaned, lastEmitCleanMs, nowMs, windowMs, vocabNorm, fullReRender, coversSession)
+        val merged = monotonicMergeWords(lastEmitClean, cleaned, lastEmitCleanMs, nowMs, windowMs, vocabNorm, vocabMultiset, fullReRender, coversSession)
         lastEmitCleanMs = updatedEmitMs(lastEmitCleanMs, lastEmitClean.size, merged.size, nowMs)
         return merged
     }
@@ -2068,6 +2074,7 @@ internal fun monotonicMergeWords(
     nowMs: Long = Long.MAX_VALUE,
     windowMs: Long = Long.MAX_VALUE,
     vocab: Set<String>? = null,
+    vocabMultiset: List<String>? = null,
     fullReRender: Boolean = false,
     coversSession: Boolean = false
 ): List<String> {
@@ -2199,6 +2206,34 @@ internal fun monotonicMergeWords(
         // collector drops them anyway (target-count cap 0), so never let them
         // into the emission log.
         tail = tail.filter { normalizeArabicPub(it).let { nn -> nn.isNotEmpty() && nn in vocab } }
+    }
+    if (vocab != null && vocabMultiset != null && tail.isNotEmpty()) {
+        // ECHO GUARD (target-count): a tail word whose vocab count is ALREADY
+        // fully satisfied by the log is a re-render echo of SPENT audio, not
+        // new speech (measured on Māʿūn: a 4th أَلَا appended after the target's
+        // three; on Fātiḥah: الرَّحْمَٰنِ echoing after الْحَمْدُ). Dropping it at
+        // the source stops the cascade where the echo steals the alignment
+        // slot of the real upcoming occurrence and the collector then strips
+        // the REAL word as over-count. Legitimate repeats (target count not
+        // yet spent) pass through untouched.
+        // Counts come from vocabMultiset — the MULTISET of the normalized
+        // target. With only a Set (legacy callers) the guard is DISABLED: a
+        // set flattens قُلْ ×2 to ×1 and would drop the REAL second قُلْ of
+        // الإخلاص (measured).
+        val logCounts = HashMap<String, Int>()
+        for (w in lastNorm) if (w.isNotEmpty()) logCounts[w] = (logCounts[w] ?: 0) + 1
+        val vocabCounts = HashMap<String, Int>()
+        for (v in vocabMultiset) {
+            val nn = normalizeArabicPub(v)
+            if (nn.isNotEmpty()) vocabCounts[nn] = (vocabCounts[nn] ?: 0) + 1
+        }
+        tail = tail.filter { w ->
+            val nn = normalizeArabicPub(w)
+            if (nn.isEmpty()) return@filter false
+            val vc = vocabCounts[nn] ?: return@filter false
+            val lc = logCounts[nn] ?: 0
+            if (lc >= vc) false else { logCounts[nn] = lc + 1; true }
+        }
     }
     if (bestAnchor == -1 && tail.isEmpty()) return last
     val out = ArrayList<String>(last.size + tail.size)
