@@ -71,7 +71,7 @@ class PcTajweedFalsePositiveTest {
     private val riwayah = "Hafs"
     private val cacheDir = File(System.getProperty("java.io.tmpdir"), "quran_stt_e2e")
 
-    private val modelFile = File("src/main/assets/quran_stt/model_int8.onnx")
+    private val modelFile = File("src/main/assets/quran_stt/model.q8.onnx")
     private val tokensFile = File("src/main/assets/quran_stt/tokens.txt")
 
     private val engine: QuranSttEngine get() = sharedEngine
@@ -88,7 +88,7 @@ class PcTajweedFalsePositiveTest {
             // 2 intra-op threads: this 4-core box also runs the Gradle daemon +
             // test JVM; 4 threads here froze the machine under load.
             QuranSttEngine.create(
-                File("src/main/assets/quran_stt/model_int8.onnx"),
+                File("src/main/assets/quran_stt/model.q8.onnx"),
                 File("src/main/assets/quran_stt/tokens.txt"),
                 threads = 2
             ) ?: error("engine failed to load")
@@ -255,7 +255,7 @@ class PcTajweedFalsePositiveTest {
     }
 
     /** Bump to invalidate the replay cache after any STT pipeline change. */
-    private val REPLAY_CACHE_VERSION = 8
+    private val REPLAY_CACHE_VERSION = 9  // bump: swapped to Muno459/fastconformer-quran (new model.q8.onnx + Slaney mel recipe)
 
     /**
      * The deterministic ONNX STT replay (steps 3-4 of runTajweedE2E): sliding

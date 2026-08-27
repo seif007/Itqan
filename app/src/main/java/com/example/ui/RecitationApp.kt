@@ -12,6 +12,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -48,6 +49,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.sherpa.SherpaModelDownloader
 import com.example.sherpa.SingleAudioPipeline
 import com.example.sherpa.isSherpaModelReady
+import com.example.data.MistakeEntry
 import com.example.quran.QuranApi
 import com.example.quran.SurahData
 import com.example.quran.formGroupsFor
@@ -96,6 +98,36 @@ class MainViewModel(application: Application) : androidx.lifecycle.AndroidViewMo
     
     var completedGoalToCelebrate by mutableStateOf<Goal?>(null)
         internal set
+
+    /**
+     * Session-completion summary. Set to a non-null value exactly when the
+     * user has finished reciting the selected range of ayahs (target fully
+     * covered after the finalize-to-CORRECT pass) and the session has
+     * finalized. The RecitationApp composable observes this and pops a
+     * dedicated dialog showing the per-word mistake breakdown. Cleared by
+     * [dismissSessionSummary] when the user closes the dialog.
+     *
+     * The list is per-WordAnalysis row (not per-RecitationStatus kind) so the
+     * dialog can render each word in its own line. Tajweed rows are deduped
+     * per (word, rule) so the dialog doesn't show "Madd" twice for the same
+     * word on the same recitation.
+     */
+    var sessionSummaryToShow by mutableStateOf<SessionSummary?>(null)
+        internal set
+
+    /** Snapshot of the user's just-finished recitation for the summary dialog. */
+    data class SessionSummary(
+        val surahNumber: Int,
+        val rangeStart: Int,
+        val rangeEnd: Int,
+        val entries: List<MistakeEntry>,
+        val recitedAyahCount: Int,
+        val totalAyahCount: Int,
+    )
+
+    fun dismissSessionSummary() {
+        sessionSummaryToShow = null
+    }
 
     fun setGoal(type: String, target: Int, surahNumber: Int = 0, rangeStart: Int = 0, rangeEnd: Int = 0) {
         viewModelScope.launch {
@@ -156,7 +188,14 @@ class MainViewModel(application: Application) : androidx.lifecycle.AndroidViewMo
         // like the legacy behavior -- the goal accepts progress from any recitation.
         surahNumber: Int = 0,
         rangeStart: Int = 0,
-        rangeEnd: Int = 0
+        rangeEnd: Int = 0,
+        // Per-word mistake entries collected at session-finalize. Persisted as
+        // JSON on the goal so the Stats tab can show WHICH specific words were
+        // wrong / skipped / had which tajweed rule, in addition to the
+        // aggregate counts. Empty when this delta comes from a path that has
+        // no per-word detail (e.g. the hint button) — those count 1 wrong
+        // but the user already saw the mistake live.
+        mistakeEntries: List<MistakeEntry> = emptyList()
     ) {
         viewModelScope.launch {
             try {
@@ -186,13 +225,13 @@ class MainViewModel(application: Application) : androidx.lifecycle.AndroidViewMo
                     val updatedWrong = goal.wrongWordsCount + wrongDelta
                     val updatedSkipped = goal.skippedWordsCount + skippedDelta
                     val updatedTajweed = goal.tajweedMistakesCount + tajweedDelta
-                    
+
                     val updatedBreakdown = if (encounteredRules.isNotEmpty()) {
                         // DB format expected: "Madd: mistakes/total, Ghunnah: mistakes/total"
-                        // Or if legacy "Madd: mistakes", we upgrade it to "Madd: mistakes/mistakes" initially 
+                        // Or if legacy "Madd: mistakes", we upgrade it to "Madd: mistakes/mistakes" initially
                         val map = goal.tajweedMistakesBreakdown.split(",")
                             .filter { it.contains(":") }
-                            .associate { 
+                            .associate {
                                 val parts = it.split(":")
                                 val key = parts.getOrNull(0)?.trim() ?: ""
                                 val valuePart = parts.getOrNull(1)?.trim() ?: ""
@@ -202,29 +241,41 @@ class MainViewModel(application: Application) : androidx.lifecycle.AndroidViewMo
                             }
                             .filter { it.key.isNotEmpty() }
                             .toMutableMap()
-                            
+
                         for (rule in encounteredRules) {
                             val current = map[rule] ?: Pair(0, 0)
                             map[rule] = Pair(current.first, current.second + 1)
                         }
-                        
+
                         for (rule in violatedRules) {
                             val current = map[rule] ?: Pair(0, 0)
                             map[rule] = Pair(current.first + 1, current.second)
                         }
-                        
+
                         map.entries.joinToString(", ") { "${it.key}: ${it.value.first}/${it.value.second}" }
                     } else {
                         goal.tajweedMistakesBreakdown
                     }
-                    
+
+                    // Append the per-word mistake entries to the existing JSON
+                    // blob. We don't deduplicate here -- multiple recitation
+                    // sessions on the same goal can each contribute their own
+                    // entries; the Stats tab groups them by kind when rendering.
+                    val updatedMistakeEntriesJson = if (mistakeEntries.isNotEmpty()) {
+                        val existing = parseMistakeEntries(goal.mistakeEntriesJson)
+                        (existing + mistakeEntries).encodeToJson()
+                    } else {
+                        goal.mistakeEntriesJson
+                    }
+
                     val updatedGoal = goal.copy(
                         recitedAyahs = updatedRecited,
                         mistakesCount = updatedMistakes,
                         wrongWordsCount = updatedWrong,
                         skippedWordsCount = updatedSkipped,
                         tajweedMistakesCount = updatedTajweed,
-                        tajweedMistakesBreakdown = updatedBreakdown
+                        tajweedMistakesBreakdown = updatedBreakdown,
+                        mistakeEntriesJson = updatedMistakeEntriesJson
                     )
                     
                     if (updatedRecited >= goal.targetAyahs) {
@@ -1333,6 +1384,190 @@ enum class RecitationStatus {
     HINTED       // User tapped the Hint button for this word (counts as a mistake, but recitation advances)
 }
 
+/**
+ * Top-level MistakeEntry -> JSON (de)serialization. Stored as a JSON array
+ * string on [com.example.data.Goal.mistakeEntriesJson] — we use a hand-rolled
+ * encoder instead of Moshi/ksp to keep this hot path dependency-free
+ * (MistakeEntry has a fixed shape and a small fixed vocabulary of fields, so
+ * the risk of encoder drift is minimal). Strings are JSON-escaped with a
+ * minimal escaper (handles backslash, quote, and the two C0 controls that
+ * can actually appear in user-generated Arabic + tashkeel: \n and \r).
+ */
+private fun jsonEscape(s: String?): String {
+    if (s == null) return ""
+    val sb = StringBuilder(s.length + 2)
+    for (c in s) {
+        when (c) {
+            '\\' -> sb.append("\\\\")
+            '"'  -> sb.append("\\\"")
+            '\n' -> sb.append("\\n")
+            '\r' -> sb.append("\\r")
+            '\t' -> sb.append("\\t")
+            else -> sb.append(c)
+        }
+    }
+    return sb.toString()
+}
+
+private fun jsonUnescape(s: String): String {
+    val sb = StringBuilder(s.length)
+    var i = 0
+    while (i < s.length) {
+        val c = s[i]
+        if (c == '\\' && i + 1 < s.length) {
+            when (s[i + 1]) {
+                '\\' -> { sb.append('\\'); i += 2 }
+                '"'  -> { sb.append('"');  i += 2 }
+                'n'  -> { sb.append('\n'); i += 2 }
+                'r'  -> { sb.append('\r'); i += 2 }
+                't'  -> { sb.append('\t'); i += 2 }
+                else -> { sb.append(c); i++ }
+            }
+        } else {
+            sb.append(c)
+            i++
+        }
+    }
+    return sb.toString()
+}
+
+/** Serialize a list of [MistakeEntry] as a JSON array string. */
+fun List<MistakeEntry>.encodeToJson(): String {
+    val sb = StringBuilder(64 + size * 64)
+    sb.append('[')
+    forEachIndexed { i, e ->
+        if (i > 0) sb.append(',')
+        sb.append("{\"kind\":\"").append(jsonEscape(e.kind)).append('"')
+        sb.append(",\"word\":\"").append(jsonEscape(e.word)).append('"')
+        if (e.rule != null) sb.append(",\"rule\":\"").append(jsonEscape(e.rule)).append('"')
+        if (e.score != null) sb.append(",\"score\":").append(e.score)
+        sb.append(",\"surah\":").append(e.surah)
+        sb.append(",\"ayah\":").append(e.ayah)
+        sb.append(",\"wordIndex\":").append(e.wordIndex)
+        sb.append('}')
+    }
+    sb.append(']')
+    return sb.toString()
+}
+
+/** Parse a JSON array string back into a list of [MistakeEntry]. Tolerant of
+ *  whitespace and missing optional fields. Returns an empty list on any parse
+ *  failure (we never want a corrupt blob to break the Stats tab). */
+fun parseMistakeEntries(json: String): List<MistakeEntry> {
+    if (json.isBlank() || json == "[]") return emptyList()
+    val out = ArrayList<MistakeEntry>()
+    // Find each top-level {...} object. We don't use a full JSON parser
+    // because the shape is fixed and we control the writer.
+    var i = 0
+    while (i < json.length) {
+        val objStart = json.indexOf('{', i)
+        if (objStart < 0) break
+        val objEnd = matchBrace(json, objStart)
+        if (objEnd < 0) break
+        val body = json.substring(objStart + 1, objEnd)
+        out.add(parseMistakeEntry(body))
+        i = objEnd + 1
+    }
+    return out
+}
+
+private fun matchBrace(s: String, start: Int): Int {
+    // Find the matching '}' for the '{' at [start], respecting JSON string
+    // quoting and backslash escapes (so a '}' inside a quoted value is not
+    // mistaken for the object terminator).
+    var depth = 0
+    var inString = false
+    var i = start
+    while (i < s.length) {
+        val c = s[i]
+        if (inString) {
+            if (c == '\\' && i + 1 < s.length) { i += 2; continue }
+            if (c == '"') inString = false
+        } else {
+            when (c) {
+                '"' -> inString = true
+                '{' -> depth++
+                '}' -> { depth--; if (depth == 0) return i }
+            }
+        }
+        i++
+    }
+    return -1
+}
+
+private fun parseMistakeEntry(body: String): MistakeEntry {
+    // body is the inside of a {...} object; tokens are "key":value pairs
+    // separated by commas. Tokenize by walking character-by-character.
+    val fields = LinkedHashMap<String, String>()
+    var i = 0
+    while (i < body.length) {
+        i = skipWs(body, i)
+        if (i >= body.length) break
+        val keyStart = i
+        while (i < body.length && body[i] != ':') i++
+        val key = body.substring(keyStart, i).trim().removePrefix("\"").removeSuffix("\"")
+        i++
+        i = skipWs(body, i)
+        val valStart = i
+        if (i < body.length && body[i] == '"') {
+            // string value — read until matching unescaped quote
+            i++
+            val sb = StringBuilder()
+            while (i < body.length) {
+                val c = body[i]
+                if (c == '\\' && i + 1 < body.length) { sb.append(body[i + 1]); i += 2; continue }
+                if (c == '"') { i++; break }
+                sb.append(c); i++
+            }
+            fields[key] = sb.toString()
+        } else {
+            // numeric / null value
+            while (i < body.length && body[i] != ',') i++
+            fields[key] = body.substring(valStart, i).trim()
+        }
+        i = skipWs(body, i)
+        if (i < body.length && body[i] == ',') i++
+    }
+    return MistakeEntry(
+        kind = fields["kind"]?.let { jsonUnescape(it) } ?: "",
+        word = fields["word"]?.let { jsonUnescape(it) } ?: "",
+        rule = fields["rule"]?.let { jsonUnescape(it) },
+        score = fields["score"]?.toFloatOrNull(),
+        surah = fields["surah"]?.toIntOrNull() ?: 0,
+        ayah = fields["ayah"]?.toIntOrNull() ?: 0,
+        wordIndex = fields["wordIndex"]?.toIntOrNull() ?: 0,
+    )
+}
+
+private fun skipWs(s: String, i: Int): Int {
+    var j = i
+    while (j < s.length && s[j].isWhitespace()) j++
+    return j
+}
+
+/**
+ * Map a per-word index in the concatenated target to its ayah id. The
+ * target is the concatenation of all [viewModel.ayahs] (AyahDisplay rows)
+ * in order, each contributing [ayah.words.size] entries starting at
+ * [ayah.wordStartIndex]. Returns 1 (the first ayah of the surah) when
+ * the index doesn't fall in any ayah range, e.g. an out-of-range
+ * analysis row. We use [AyahDisplay.ayahId] (the alquran.cloud number)
+ * for the MistakeEntry's per-ayah reference; the displayed ayah number
+ * in the surah is roughly ayahId - firstAyahId + 1, but the user-facing
+ * UI already shows the full ayah reference so we keep the raw id.
+ */
+private fun ayahIndexForWordIndex(
+    wordIndex: Int,
+    ayahs: List<com.example.ui.MainViewModel.AyahDisplay>,
+): Int {
+    for (ayah in ayahs) {
+        if (wordIndex in ayah.wordStartIndex until ayah.wordStartIndex + ayah.words.size) {
+            return ayah.ayahId
+        }
+    }
+    return 1
+}
+
 data class SpokenWordTiming(
     val word: String,
     val startIndex: Int,
@@ -1377,7 +1612,12 @@ data class WordAnalysis(
     val spokenText: String? = null,
     val tajweedRule: String? = null,
     val tajweedAcousticFeedback: String? = null,
-    val tajweedScore: Int? = null
+    val tajweedScore: Int? = null,
+    /** Audio position (ms from recording start) where this word's span ENDS —
+     *  set for acoustically-scored rows. Lets a tajweed popup rewind the
+     *  injection to the exact mistake word instead of wherever the deferred
+     *  scoring latency happened to stop. */
+    val tajweedAudioEndMs: Long? = null
 )
 
 /**
@@ -2028,6 +2268,21 @@ suspend fun analyzeRecitationDetails(
         if (spokenIndex >= spoken.size) {
             break
         }
+        consecutiveEchoSkips = 0
+        // RESYNC ABSORPTION: the current target word appears further ahead in
+        // the spoken stream, but unmatched garbage sits in front of it
+        // (decoder warm-up wrecks like ٱلصِّيَامُ الم أَلَدُّ before
+        // ذَٰلِكَ ٱلْكِتَٰبُ, merge echoes) — absorb the garbage prefix and
+        // let the match land. Without this the head poison charged an instant
+        // WRONG at word 0 and froze the session. Capped at 6 absorbed tokens.
+        var resyncAt = -1
+        val resyncEnd = minOf(spokenIndex + 15, spoken.size)
+        for (k in spokenIndex until resyncEnd) {
+            if (isWordMatch(spoken[k], targetWordNorm)) { resyncAt = k; break }
+        }
+        if (resyncAt > spokenIndex && (resyncAt - spokenIndex) <= 6) {
+            spokenIndex = resyncAt
+        }
         
         var matchInSpokenAhead = -1
         var matchedSpokenAdvance = 1
@@ -2291,7 +2546,8 @@ suspend fun analyzeRecitationDetails(
                                 spokenText = spoken[matchInSpokenAhead],
                                 tajweedRule = label,
                                 tajweedAcousticFeedback = feedbackL,
-                                tajweedScore = tScoreL
+                                tajweedScore = tScoreL,
+                                tajweedAudioEndMs = clampedEnd
                             ))
                         }
                     }
@@ -2344,7 +2600,17 @@ suspend fun analyzeRecitationDetails(
             }
         }
         consecutiveEchoSkips = 0
-        for (j in targetIndex + 1 until minOf(targetIndex + 4, limit)) {
+        // HEAD GRACE: the first windows often produce garbage tokens (fused
+        // wrecks like يُمِلَّ/هُمْ for ذَٰلِكَ ٱلْكِتَٰبُ) that charge an
+        // immediate WRONG at word 0 and freeze the whole session before the
+        // decoder settles. For the first 3 target words, scan further ahead
+        // (8 tokens): a match there means the user is on-track and the
+        // intervening garbage is absorbed by the rules above on the way.
+        val aheadLimit = minOf(
+            targetIndex + if (targetIndex < 3) 8 else 4,
+            limit
+        )
+        for (j in targetIndex + 1 until aheadLimit) {
             if (isWordMatch(spokenCurrent, targetWordsNormalized[j])) {
                 matchInTargetAhead = j
                 break
@@ -2619,6 +2885,142 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             }
         )
     }
+
+    // SESSION-SUMMARY DIALOG: pops every time the user finishes reciting the
+    // selected range (target fully covered + session finalized). Shows the
+    // per-word breakdown regardless of whether a goal is configured, so a
+    // user who hasn't set a goal still sees which words went wrong / were
+    // skipped / had which tajweed mistake.
+    val sessionSummary = viewModel.sessionSummaryToShow
+    if (sessionSummary != null) {
+        AlertDialog(
+            onDismissRequest = { viewModel.dismissSessionSummary() },
+            title = {
+                val perfect = sessionSummary.entries.isEmpty()
+                Text(
+                    text = if (perfect)
+                        getAppString(isArabic, "Perfect recitation! 🌟")
+                    else
+                        getAppString(isArabic, "Recitation Summary"),
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (perfect)
+                        MaterialTheme.colorScheme.primary
+                    else
+                        MaterialTheme.colorScheme.onSurface,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp)
+                        .heightIn(max = 480.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    // Header line: which surah + range was just finished.
+                    Text(
+                        text = if (isArabic) {
+                            "سورة ${sessionSummary.surahNumber}، الآيات ${sessionSummary.rangeStart} - ${sessionSummary.rangeEnd}"
+                        } else {
+                            "Surah ${sessionSummary.surahNumber}, Ayahs ${sessionSummary.rangeStart} - ${sessionSummary.rangeEnd}"
+                        },
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    val wrongs = sessionSummary.entries.filter { it.kind == "wrong" }
+                    val skippeds = sessionSummary.entries.filter { it.kind == "skipped" }
+                    // Group tajweed entries by (word, rule) so a multi-rule
+                    // word doesn't display the same rule twice.
+                    val tajweedPairs = sessionSummary.entries
+                        .filter { it.kind == "tajweed" }
+                        .groupBy { it.wordIndex to (it.rule ?: "") }
+                        .map { (_, group) -> group.first() }
+
+                    if (wrongs.isNotEmpty()) {
+                        SessionSummarySection(
+                            title = if (isArabic) "الكلمات الخاطئة (${wrongs.size})" else "Wrong Words (${wrongs.size})",
+                            icon = Icons.Filled.Close,
+                            iconTint = MaterialTheme.colorScheme.error,
+                            isArabic = isArabic
+                        ) {
+                            wrongs.forEach { entry ->
+                                SessionSummaryRow(
+                                    word = entry.word,
+                                    suffix = if (isArabic) " (الآية ${entry.ayah})" else " (Ayah ${entry.ayah})",
+                                    textColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    isArabic = isArabic
+                                )
+                            }
+                        }
+                    }
+
+                    if (skippeds.isNotEmpty()) {
+                        SessionSummarySection(
+                            title = if (isArabic) "الكلمات المتخطاة (${skippeds.size})" else "Skipped Words (${skippeds.size})",
+                            icon = Icons.AutoMirrored.Filled.ArrowForward,
+                            iconTint = Color(0xFFFB8C00),
+                            isArabic = isArabic
+                        ) {
+                            skippeds.forEach { entry ->
+                                SessionSummaryRow(
+                                    word = entry.word,
+                                    suffix = if (isArabic) " (الآية ${entry.ayah})" else " (Ayah ${entry.ayah})",
+                                    textColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    isArabic = isArabic
+                                )
+                            }
+                        }
+                    }
+
+                    if (tajweedPairs.isNotEmpty()) {
+                        SessionSummarySection(
+                            title = if (isArabic) "أخطاء التجويد (${tajweedPairs.size})" else "Tajweed Mistakes (${tajweedPairs.size})",
+                            icon = Icons.Filled.Warning,
+                            iconTint = Color(0xFF7E57C2),
+                            isArabic = isArabic
+                        ) {
+                            tajweedPairs.forEach { entry ->
+                                SessionSummaryTajweedRow(
+                                    word = entry.word,
+                                    rule = entry.rule ?: "",
+                                    isArabic = isArabic
+                                )
+                            }
+                        }
+                    }
+
+                    if (wrongs.isEmpty() && skippeds.isEmpty() && tajweedPairs.isEmpty()) {
+                        Text(
+                            text = if (isArabic)
+                                "ما شاء الله! لا أخطاء في هذه التلاوة."
+                            else
+                                "Masha'Allah — no mistakes in this recitation.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    Button(
+                        onClick = { viewModel.dismissSessionSummary() },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) {
+                        Text(getAppString(isArabic, "Close"))
+                    }
+                }
+            }
+        )
+    }
     
     LaunchedEffect(Unit) {
         viewModel.initStats(
@@ -2723,6 +3125,19 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // to local functions). The effect body runs asynchronously (after its
     // 520 ms delay), by which time composition has assigned this ref.
     val startTajweedSessionRef = remember { arrayOfNulls<() -> Unit>(1) }
+    // Snapshot of the active (surah, range) the LAST time the user STARTED a
+    // recitation session. The final-decode commit + goal-stats charge run
+    // against THIS snapshot, never against [viewModel.selectedSurah] /
+    // [viewModel.rangeStart] / [viewModel.rangeEnd] read at recomposition
+    // time. Reason: a user can change the surah/range BETWEEN the final
+    // decode landing and the next recomposition -- if we read the view
+    // model state, the OLD recitation's mistakes would be charged to the
+    // NEW range's goals (silent mis-attribution). The snapshot is updated
+    // inside [startTajweedSession] on every fresh start and cleared on the
+    // range-change reset (line ~3377) so a new recitation always charges
+    // its own goals.
+    data class ActiveScope(val surah: Int, val rangeStart: Int, val rangeEnd: Int)
+    val activeSessionScope = remember { mutableStateOf<ActiveScope?>(null) }
     // Compose-observable mirror of the pipeline's internal StateFlow (plain
     // getters like `holder.running` are NOT observed by Compose, which left the
     // FAB caption frozen on "Warming up…" forever). Re-collects whenever a new
@@ -2977,6 +3392,19 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         mistakeCleanStreak = 0
         latestTajweedPopup = null
         sessionFinalized = false
+        // New session: clear the just-completed summary so a fresh recitation
+        // can build and pop its own dialog (the previous one stays dismissed
+        // for the rest of the app's lifetime unless the user explicitly clears
+        // it via the dialog's Close button).
+        viewModel.dismissSessionSummary()
+        // Clear the scope snapshot too. A fresh [startTajweedSession] will
+        // re-snapshot the NEW range, so the OLD recitation's final-decode
+        // commit (if it lands late) sees the new snapshot and charges the
+        // NEW range's goals — but since the OLD session's audio was wiped
+        // above (finalSpokenText="", committedWordCount=0, etc.), the
+        // collector's filter drops the stale words and no mistake gets
+        // charged. Defense in depth.
+        activeSessionScope.value = null
         errorMessage = null
         // New range = new target words: drop every cached tajweed verdict so the
         // fresh session re-scores from scratch (stale verdicts from the previous
@@ -3101,15 +3529,27 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             sessionFinalized && !isListening && detailedAnalysis.isNotEmpty()
         ) {
             val pendingRows = detailedAnalysis.filter { it.status == RecitationStatus.PENDING }
-            if (pendingRows.isNotEmpty()) {
+            // BOUND THE CONVERSION (measured disaster: a whole-Baqarah target
+            // with 2.5 ayahs recited converted 6115 PENDING rows green). Only
+            // convert when the user genuinely NEARLY finished the range: some
+            // real progress (matched >= 3) and only the trailing tail region
+            // (wordIndex <= matched + 8) is undecoded. Anything beyond is not
+            // part of this session and stays PENDING (silent).
+            val matchedSoFar = detailedAnalysis.count {
+                it.status == RecitationStatus.CORRECT || it.status == RecitationStatus.TAJWEED_ERROR ||
+                    it.status == RecitationStatus.HINTED
+            }
+            val convertible = pendingRows.filter { it.wordIndex <= matchedSoFar + 8 }
+            if (matchedSoFar >= 3 && convertible.isNotEmpty()) {
+                val convertIdx = convertible.map { it.wordIndex }.toHashSet()
                 detailedAnalysis = detailedAnalysis.map { w ->
-                    if (w.status == RecitationStatus.PENDING)
+                    if (w.status == RecitationStatus.PENDING && w.wordIndex in convertIdx)
                         w.copy(status = RecitationStatus.CORRECT, spokenText = null)
                     else w
                 }
                 android.util.Log.i(
                     "ItqanSherpa",
-                    "finalizeCorrect(): ${pendingRows.size} PENDING word(s) counted CORRECT at session end (first idx=${pendingRows.first().wordIndex})"
+                    "finalizeCorrect(): ${convertible.size} trailing PENDING word(s) counted CORRECT (matched=$matchedSoFar, total pending=${pendingRows.size})"
                 )
             }
         }
@@ -3362,9 +3802,16 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     // aren't colored anymore when I read"). This defeats the
                     // step-event; the popup still fires, just doesn't yank the
                     // mic until the recitation has been going for a beat.
+                    //
+                    // INJECTION TEST MODE: when the pipeline is PC-driven
+                    // (inject.pcm present), tajweed popups are DISPLAY-ONLY —
+                    // the automated run focuses on wrong/skipped words, and
+                    // stopping at every model-verdict madd would fragment the
+                    // run. Real-mic sessions keep the full stop behavior.
                     if (!isListening) return@LaunchedEffect
+                    val injectionRun = tajweedPipelineHolder.pipeline?.isInjecting() == true
                     val sessionElapsed = (System.currentTimeMillis() - tajweedRecordingStartMs).coerceAtLeast(0L)
-                    if (sessionElapsed >= 2500L) {
+                    if (!injectionRun && sessionElapsed >= 2500L) {
                         if (tajweedPipelineHolder.running) {
                             try { tajweedPipelineHolder.pipeline?.pause() } catch (_: Throwable) {}
                         }
@@ -3380,7 +3827,13 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         // filter, get displayed, get re-scored with a fresh
                         // timing key, and re-popup if still wrong.
                         mistakeResumeLiveText = (finalSpokenText + " " + partialSpokenText).trim()
-                        mistakeResumeIndex = tajweedError.wordIndex
+                        // TAJWEED resume continues from the CURRENT display
+                        // frontier (the next ayah): the mistake word's tajweed
+                        // verdict is already recorded, and the display has
+                        // usually advanced past it by popup time (deferred
+                        // scoring latency). Re-seating to the frontier keeps
+                        // every displayed word and continues seamlessly.
+                        mistakeResumeIndex = alignment.first
                         // Post-pause pipeline emissions are dead audio from
                         // BEFORE the stop; freeze them exactly like the
                         // WRONG/SKIPPED stop does (the gate above reads
@@ -3511,6 +3964,12 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 mistakeCleanStreak = 0
                 mistakeVerifyAbsentIdx = -1
             } else {
+                // DIAGNOSTIC: one line per candidate pass — reveals why the
+                // early verification did or did not launch on-device.
+                android.util.Log.i(
+                    "ItqanSherpa",
+                    "mistakeStop(): candidate idx=$mistakeIdx sightings=$lastWrongStopSightings absentIdx=$mistakeVerifyAbsentIdx verified=${mistakeIdx in verifiedSpokenIndices} listening=$isListening running=${tajweedPipelineHolder.running} sinceVerify=${System.currentTimeMillis() - lastMistakeVerifyMs}ms jobActive=${verifyJobRef.get()?.isActive == true}"
+                )
                 if (isNewEmission) {
                     lastWrongStopSightings += 1
                     lastWrongStopSpokenText = currentSpoken
@@ -3823,6 +4282,22 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // `targetOrig` above).
     fun startTajweedSession() {
         android.util.Log.i("ItqanSherpa", "startTajweedSession(): holder.pipeline=${tajweedPipelineHolder.pipeline?.pipelineId} holder.running=${tajweedPipelineHolder.running} holder.paused=${tajweedPipelineHolder.paused} isListening=$isListening")
+        // SCOPE SNAPSHOT: capture (surah, range) the user is about to recite
+        // against. The final-decode / goal-stats code path reads this snapshot
+        // instead of [viewModel.selectedSurah] / [viewModel.rangeStart] /
+        // [viewModel.rangeEnd], which can change between the final decode
+        // landing and the next recomposition (a user tap on the surah/range
+        // picker while the pipeline is still finalizing). Charging the OLD
+        // recitation's mistakes to the NEW range's goals is the bug this
+        // snapshot fixes.
+        // (Captured on every entry: a resume fast-path keeps the prior
+        // snapshot, so a recitation that started under the old range stays
+        // attributed to it even if the user changes the range while paused.)
+        activeSessionScope.value = ActiveScope(
+            surah = viewModel.selectedSurah?.number ?: 0,
+            rangeStart = viewModel.rangeStart,
+            rangeEnd = viewModel.rangeEnd,
+        )
         // Toggle semantics: if the pipeline is ALREADY running when this is
         // invoked (e.g. the mic FAB recomposed with a stale `isListening=false`
         // while running=true on the second tap — the "tap to pause started
@@ -6203,6 +6678,72 @@ spokenTimings.clear()
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                                             )
                                         }
+
+                                        // ── Per-word mistake breakdown ─────────────
+                                        // Persisted on the goal as JSON. We show the
+                                        // list so the user can SEE which words were
+                                        // wrong / skipped / had which tajweed rule
+                                        // (not just the count). Grouped by kind,
+                                        // deduped by (word, rule) within a kind.
+                                        val entries = parseMistakeEntries(goal.mistakeEntriesJson)
+                                        if (entries.isNotEmpty()) {
+                                            val perGoalWrongs = entries.filter { it.kind == "wrong" }
+                                                .distinctBy { it.wordIndex }
+                                            val perGoalSkippeds = entries.filter { it.kind == "skipped" }
+                                                .distinctBy { it.wordIndex }
+                                            val perGoalTajweed = entries.filter { it.kind == "tajweed" }
+                                                .distinctBy { it.wordIndex to (it.rule ?: "") }
+                                            if (perGoalWrongs.isNotEmpty() || perGoalSkippeds.isNotEmpty() || perGoalTajweed.isNotEmpty()) {
+                                                Spacer(modifier = Modifier.height(10.dp))
+                                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                                                Spacer(modifier = Modifier.height(6.dp))
+                                                Text(
+                                                    text = getAppString(isArabic, "Words To Review"),
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = MaterialTheme.colorScheme.primary
+                                                )
+                                                Spacer(modifier = Modifier.height(4.dp))
+                                                if (perGoalWrongs.isNotEmpty()) {
+                                                    Text(
+                                                        text = if (isArabic)
+                                                            "الكلمات الخاطئة: ${perGoalWrongs.joinToString("، ") { it.word }}"
+                                                        else
+                                                            "Wrong words: ${perGoalWrongs.joinToString(", ") { it.word }}",
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                    )
+                                                }
+                                                if (perGoalSkippeds.isNotEmpty()) {
+                                                    Text(
+                                                        text = if (isArabic)
+                                                            "الكلمات المتخطاة: ${perGoalSkippeds.joinToString("، ") { it.word }}"
+                                                        else
+                                                            "Skipped words: ${perGoalSkippeds.joinToString(", ") { it.word }}",
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                    )
+                                                }
+                                                if (perGoalTajweed.isNotEmpty()) {
+                                                    // Group by rule so a multi-rule word is shown once per
+                                                    // (word, rule) pair, with the rule label localized.
+                                                    val tajweedLines = perGoalTajweed
+                                                        .groupBy { it.rule ?: "" }
+                                                        .map { (rule, items) ->
+                                                            val ruleLabel = getAppString(isArabic, rule)
+                                                            val words = items.joinToString(if (isArabic) "، " else ", ") { it.word }
+                                                            if (isArabic) "$ruleLabel: $words" else "$words [$ruleLabel]"
+                                                        }
+                                                    tajweedLines.forEach { line ->
+                                                        Text(
+                                                            text = line,
+                                                            style = MaterialTheme.typography.bodySmall,
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -7024,7 +7565,22 @@ spokenTimings.clear()
                                         }
                                     }
                                 }
-                            } else if (detailedAnalysis.any { it.status == RecitationStatus.CORRECT }) {
+                            } else if (
+                                // The "Excellent recitation" encouragement now only
+                                // appears AFTER the user (or the auto-stop silence
+                                // timer) has paused the mic, AND the selected range
+                                // is still incomplete (at least one PENDING target
+                                // word remains). Before this gate the card was
+                                // shown live during recitation, which is jarring —
+                                // a real-time "you've been perfect!" while the user
+                                // is still mid-ayah made the verdict look premature.
+                                // We also require the user is currently paused: an
+                                // active session shows the live word-tracking
+                                // feedback, not a summary card.
+                                !isListening &&
+                                detailedAnalysis.any { it.status == RecitationStatus.CORRECT } &&
+                                detailedAnalysis.any { it.status == RecitationStatus.PENDING }
+                            ) {
                                 Card(
                                     modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                                     colors = CardDefaults.cardColors(
@@ -7109,9 +7665,62 @@ spokenTimings.clear()
                             val tajweedViolated = detailedAnalysis.filter { (it.status == RecitationStatus.WRONG || it.status == RecitationStatus.SKIPPED || it.status == RecitationStatus.TAJWEED_ERROR) && it.tajweedRule != null }
                             val currentTajweed = tajweedViolated.size
                             val violatedRulesList = tajweedViolated.mapNotNull { it.tajweedRule }
-                            
+
                             val encounteredRulesList = detailedAnalysis.mapNotNull { it.tajweedRule }
-                            
+
+                            // Build per-word mistake entries for both the goal
+                            // persistence path and the session-summary dialog.
+                            // Dedup: tajweed rows are grouped by (wordIndex, rule)
+                            // so a multi-rule word doesn't double-count.
+                            val activeSurah = viewModel.selectedSurah?.number ?: 0
+                            val activeRangeStart = viewModel.rangeStart
+                            val activeRangeEnd = viewModel.rangeEnd
+
+                            val mistakeEntries = buildList {
+                                detailedAnalysis.forEach { wa ->
+                                    when (wa.status) {
+                                        RecitationStatus.WRONG -> {
+                                            val ayahNum = ayahIndexForWordIndex(wa.wordIndex, viewModel.ayahs)
+                                            add(MistakeEntry(
+                                                kind = "wrong",
+                                                word = wa.text,
+                                                rule = null,
+                                                score = null,
+                                                surah = activeSurah,
+                                                ayah = ayahNum,
+                                                wordIndex = wa.wordIndex,
+                                            ))
+                                        }
+                                        RecitationStatus.SKIPPED -> {
+                                            val ayahNum = ayahIndexForWordIndex(wa.wordIndex, viewModel.ayahs)
+                                            add(MistakeEntry(
+                                                kind = "skipped",
+                                                word = wa.text,
+                                                rule = null,
+                                                score = null,
+                                                surah = activeSurah,
+                                                ayah = ayahNum,
+                                                wordIndex = wa.wordIndex,
+                                            ))
+                                        }
+                                        RecitationStatus.TAJWEED_ERROR -> {
+                                            val rule = wa.tajweedRule ?: return@forEach
+                                            val ayahNum = ayahIndexForWordIndex(wa.wordIndex, viewModel.ayahs)
+                                            add(MistakeEntry(
+                                                kind = "tajweed",
+                                                word = wa.text,
+                                                rule = rule,
+                                                score = wa.tajweedScore?.toFloat(),
+                                                surah = activeSurah,
+                                                ayah = ayahNum,
+                                                wordIndex = wa.wordIndex,
+                                            ))
+                                        }
+                                        else -> { /* CORRECT / PENDING / HINTED: not a mistake */ }
+                                    }
+                                }
+                            }
+
                             if (newCompletedCount > 0 || currentWrong > 0 || currentSkipped > 0 || currentTajweed > 0 || encounteredRulesList.isNotEmpty()) {
                                 viewModel.incrementRecitedAyahs(newCompletedCount)
                                 prefs.edit().putInt("recited_ayahs", viewModel.recitedAyahs).apply()
@@ -7119,9 +7728,17 @@ spokenTimings.clear()
                                 // a goal scoped to "Surah 2, verses 1-5" only makes progress when
                                 // the user recites Surah 2 in the [1, 5] range. If the user is
                                 // on a different surah/range, scoped goals elsewhere stay idle.
-                                val activeSurah = viewModel.selectedSurah?.number ?: 0
-                                val activeRangeStart = viewModel.rangeStart
-                                val activeRangeEnd = viewModel.rangeEnd
+                                //
+                                // Use the [activeSessionScope] snapshot (captured at
+                                // session-start in [startTajweedSession]) instead of the
+                                // current view-model values. The user may have changed the
+                                // surah/range between the final decode and now, in which
+                                // case the live values would point at the NEW range and
+                                // silently mis-attribute this recitation to it.
+                                val chargeScope = activeSessionScope.value
+                                val chargeSurah = chargeScope?.surah ?: activeSurah
+                                val chargeRangeStart = chargeScope?.rangeStart ?: activeRangeStart
+                                val chargeRangeEnd = chargeScope?.rangeEnd ?: activeRangeEnd
                                 viewModel.triggerGoalRealProgress(
                                     recitedAyahsDelta = newCompletedCount,
                                     wrongDelta = currentWrong,
@@ -7129,10 +7746,36 @@ spokenTimings.clear()
                                     tajweedDelta = currentTajweed,
                                     violatedRules = violatedRulesList,
                                     encounteredRules = encounteredRulesList,
-                                    surahNumber = activeSurah,
-                                    rangeStart = activeRangeStart,
-                                    rangeEnd = activeRangeEnd
+                                    surahNumber = chargeSurah,
+                                    rangeStart = chargeRangeStart,
+                                    rangeEnd = chargeRangeEnd,
+                                    mistakeEntries = mistakeEntries,
                                 )
+
+                                // SESSION SUMMARY: shown when the user has finished
+                                // reciting the selected range AND the session has
+                                // finalized (final decode committed). The dialog
+                                // shows the same per-word breakdown the goal DB
+                                // just received, but to the user even when no
+                                // goal is configured.
+                                //
+                                // Use the [chargeScope] snapshot (same one we
+                                // passed to the goal call) so the dialog's
+                                // surah/range header reflects the recitation
+                                // the user actually did, not whatever they
+                                // happen to have selected by the time the
+                                // dialog opens.
+                                val pendingRemain = detailedAnalysis.any { it.status == RecitationStatus.PENDING }
+                                if (sessionFinalized && !pendingRemain && viewModel.sessionSummaryToShow == null) {
+                                    viewModel.sessionSummaryToShow = MainViewModel.SessionSummary(
+                                        surahNumber = chargeSurah,
+                                        rangeStart = chargeRangeStart,
+                                        rangeEnd = chargeRangeEnd,
+                                        entries = mistakeEntries,
+                                        recitedAyahCount = newCompletedCount,
+                                        totalAyahCount = (chargeRangeEnd - chargeRangeStart + 1).coerceAtLeast(1),
+                                    )
+                                }
                             }
                             
                             // Safe Pause/Mistake handling: Trims spoken text down to only matched words so they can continue seamlessly.
@@ -7956,4 +8599,88 @@ private fun trimSilence(x: FloatArray): FloatArray {
     // keep the full slice; do NOT collapse to a sub-quarter-second clip.
     if (end - start < 2048) return x
     return x.copyOfRange(start, end)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Session-summary dialog helpers
+//
+// Three small composables (Section, WordRow, TajweedRow) that render the
+// dialog body in [viewModel.sessionSummaryToShow]. They are factored out so
+// the dialog body stays readable; the per-word styling is identical to the
+// existing recitation-mistake card so the user sees the same look between
+// the live mistakes card and the post-session dialog.
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun SessionSummarySection(
+    title: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    iconTint: androidx.compose.ui.graphics.Color,
+    isArabic: Boolean,
+    content: @Composable () -> Unit
+) {
+    androidx.compose.material3.Text(
+        text = title,
+        style = MaterialTheme.typography.titleSmall,
+        fontWeight = FontWeight.SemiBold,
+        color = if (isArabic) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface,
+        modifier = Modifier.padding(top = 12.dp, bottom = 6.dp)
+    )
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 4.dp, end = 4.dp, bottom = 4.dp)
+    ) {
+        content()
+    }
+}
+
+@Composable
+private fun SessionSummaryRow(
+    word: String,
+    suffix: String,
+    textColor: androidx.compose.ui.graphics.Color,
+    isArabic: Boolean
+) {
+    Row(
+        modifier = Modifier.padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = word,
+            style = MaterialTheme.typography.bodyMedium,
+            color = textColor
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = suffix,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun SessionSummaryTajweedRow(
+    word: String,
+    rule: String,
+    isArabic: Boolean
+) {
+    Row(
+        modifier = Modifier.padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = word,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = getAppString(isArabic, rule),
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.SemiBold,
+            color = Color(0xFF7E57C2)
+        )
+    }
 }

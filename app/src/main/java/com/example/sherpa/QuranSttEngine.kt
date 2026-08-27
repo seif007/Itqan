@@ -9,35 +9,41 @@ import java.nio.FloatBuffer
 import java.nio.LongBuffer
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.ln
+import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.sin
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Quran STT engine — Saboorhsn/quran-stt-onnx (Apache-2.0).
+// Quran STT engine — Muno459/fastconformer-quran (NPL-1.1, non-commercial).
 //
-// A NeMo FastConformer large CTC model fine-tuned on EveryAyah + Tlog for
-// Quranic recitation with Tajweed diacritics, exported to a single unified
-// ONNX graph:
+// A NeMo FastConformer large hybrid (RNN-T + CTC aux) model, fine-tuned on
+// EveryAyah + Tlog + Muaalem-annotated for Quranic recitation. Exported to a
+// single CTC-head ONNX graph so the same greedy decoder pipeline works:
 //
-//   Audio (16 kHz mono)
-//     → log-mel [80 bands, n_fft=512, win 400, hop 160, Hanning]
-//     → per-band mean/std normalization
-//     → FastConformer encoder (8× temporal subsampling) + linear head
+//   Audio (16 kHz mono, dithered)
+//     → right-pad (win_n-1 = 399 samples) for center=False STFT
+//     → STFT [n_fft=512, win=400, hop=160, Hanning] → power
+//     → Slaney mel filterbank (linear mel < 1 kHz, log mel ≥ 1 kHz,
+//       Slaney enorm 2/(hi-lo)) → 80 bands
+//     → log(x + 2^-24), per-row z-score
+//     → FastConformer encoder (8× temporal subsampling) + CTC head
 //     → CTC log-softmax over 1025 classes (1024 SentencePiece BPE + blank)
 //     → greedy argmax + blank/repeat collapse → piece string → text
 //
-// The feature recipe below mirrors the exporter's reference implementation
-// (tajweed/aligner.py + the README's log_mel_extract): mel filterbank as
-// linear-triangular bins over the [0, 8 kHz] mel scale, log with a 2^-24
-// floor, then per-row z-scoring. The SentencePiece surface pieces are read
-// from the bundled `tokens.txt` ("<piece> <id>" lines) so no SentencePiece
-// dependency is needed at runtime; "▁" marks a word boundary.
+// The feature recipe matches the exporter's reference (tajweed/aligner.py in
+// the upstream repo): Slaney mel filterbank (NOT linear-triangular), Slaney
+// normalisation 2/(hi-lo), `center=False` STFT (so we right-pad the audio by
+// `win_n-1` first), and a 1e-5 dither added to the audio to mirror the
+// training-time preprocessor. The SentencePiece surface pieces are read from
+// the bundled `tokens.txt` ("<piece> <id>" lines) so no SentencePiece runtime
+// dependency is needed; "▁" marks a word boundary.
 //
-// This class REPLACES the previous sherpa-onnx Whisper recognizer at the
-// decode seams of SingleAudioPipeline (window decode + final commit decode).
-// The ONNX graph is fully dynamic on the time axis, so a 4 s window costs
-// roughly 4 s worth of compute (RTF ~0.04 on CPU).
+// This class replaces the previous Saboorhsn model. I/O names, vocab size and
+// CTC output schema are unchanged so the pipeline (window decode + final
+// commit decode + AyahWordMatcher) ports across unchanged. Only the
+// feature-extraction front end differs.
 // ─────────────────────────────────────────────────────────────────────────────
 
 private const val STT_TAG = "ItqanStt"
@@ -90,32 +96,66 @@ class QuranSttEngine private constructor(
         }
     }
 
-    // Precomputed per-frame Hanning window and the mel filterbank matrix.
+    // Precomputed per-frame Hanning window and the Slaney mel filterbank matrix.
+    // Hanning is symmetric (matches numpy.hanning(periodic=False) used by the
+    // exporter) and the Slaney filterbank uses the HTK / librosa convention
+    // (linear mel < 1 kHz, log mel ≥ 1 kHz, Slaney enorm 2/(hi-lo)). These
+    // match the reference `tajweed/aligner.py::LogMelExtractor` to < 1e-4
+    // per the upstream validation script.
     private val hanning = FloatArray(WIN_LEN) { i ->
         (0.5f - 0.5f * cos(2.0 * PI * i / (WIN_LEN - 1))).toFloat()
     }
     private val melFilterbank: FloatArray by lazy { buildMelFilterbank() }
 
+    /** dither constant matches NeMo's AudioToMelSpectrogramPreprocessor default. */
+    private val ditherAmp: Float = 1e-5f
+
+    /** HTK / Slaney hz→mel: linear at 200/3 Hz/mel below 1 kHz, log above. */
+    private fun hzToMel(f: Double): Double {
+        val fMin = 0.0
+        val fSp = 200.0 / 3.0
+        val minLogHz = 1000.0
+        val minLogMel = (minLogHz - fMin) / fSp
+        val logStep = ln(6.4) / 27.0
+        val fSafe = maxOf(f, 1e-3)
+        return if (fSafe < minLogHz) (fSafe - fMin) / fSp
+        else minLogMel + ln(fSafe / minLogHz) / logStep
+    }
+
+    /** Inverse of [hzToMel]. */
+    private fun melToHz(m: Double): Double {
+        val fMin = 0.0
+        val fSp = 200.0 / 3.0
+        val minLogHz = 1000.0
+        val minLogMel = (minLogHz - fMin) / fSp
+        val logStep = ln(6.4) / 27.0
+        return if (m < minLogMel) fMin + fSp * m
+        else minLogHz * exp(logStep * (m - minLogMel))
+    }
+
     private fun buildMelFilterbank(): FloatArray {
-        // Exactly the exporter's recipe: bins = floor((n_fft+1) * hz_pts / sr)
-        // with linear triangular slopes on the mel scale (0..8 kHz).
+        // Slaney triangular filterbank with the canonical enorm 2/(hi-lo).
+        // Mirrors `tajweed/aligner.py::_slaney_mel_filterbank` from the
+        // upstream repo. Pre-computed once per engine lifetime.
+        val melPts = DoubleArray(N_MELS + 2) { i ->
+            val melMin = hzToMel(0.0)
+            val melMax = hzToMel(8000.0)
+            melMin + (melMax - melMin) * i / (N_MELS + 1)
+        }
+        val hzPts = DoubleArray(N_MELS + 2) { i -> melToHz(melPts[i]) }
+        val binFreqs = DoubleArray(N_BINS) { k -> 16000.0 * k / (N_FFT.toDouble()) }
         val fb = FloatArray(N_MELS * N_BINS)
-        val hzPts = DoubleArray(N_MELS + 2)
-        for (m in 0..N_MELS + 1) {
-            val mel = m.toDouble() * (2595.0 * log10(1.0 + 8000.0 / 700.0)) / (N_MELS + 1)
-            hzPts[m] = 700.0 * (10.0.pow(mel / 2595.0) - 1.0)
-        }
-        val bins = IntArray(N_MELS + 2) { m ->
-            ((N_FFT + 1) * hzPts[m] / 16000.0).toInt()
-        }
-        for (m in 1..N_MELS) {
-            for (k in bins[m - 1] until bins[m]) {
-                fb[(m - 1) * N_BINS + k] =
-                    ((k - bins[m - 1]).toFloat() / (bins[m] - bins[m - 1]).toFloat())
-            }
-            for (k in bins[m] until bins[m + 1]) {
-                fb[(m - 1) * N_BINS + k] =
-                    ((bins[m + 1] - k).toFloat() / (bins[m + 1] - bins[m]).toFloat())
+        for (m in 0 until N_MELS) {
+            val lo = hzPts[m]
+            val ctr = hzPts[m + 1]
+            val hi = hzPts[m + 2]
+            val enorm = 2.0f / (hi - lo).toFloat()
+            for (k in 0 until N_BINS) {
+                val f = binFreqs[k]
+                val left = ((f - lo) / (ctr - lo + 1e-12)).toFloat()
+                val right = ((hi - f) / (hi - ctr + 1e-12)).toFloat()
+                val tri = maxOf(0f, minOf(left, right))
+                fb[m * N_BINS + k] = tri * enorm
             }
         }
         return fb
@@ -127,10 +167,14 @@ class QuranSttEngine private constructor(
      */
     fun transcribe(samples: FloatArray): String {
         if (samples.isEmpty()) return ""
-        val nFrames = 1 + (samples.size - 1) / HOP
+        // Pre-pad the audio by (WIN_LEN - 1) for center=False STFT, then count
+        // frames over the PADDED length (matches numpy.pad + 1 + (len-win)//hop).
+        val padded = FloatArray(samples.size + WIN_LEN - 1)
+        System.arraycopy(samples, 0, padded, 0, samples.size)
+        val nFrames = maxOf(1, 1 + (padded.size - WIN_LEN) / HOP)
         if (nFrames < 2) return ""
         val t0 = System.currentTimeMillis()
-        val mel = logMel(samples, nFrames)
+        val mel = logMel(padded, nFrames)
         val tMel = System.currentTimeMillis()
         val lengthTensor = OnnxTensor.createTensor(
             env, LongBuffer.wrap(longArrayOf(nFrames.toLong())), longArrayOf(1)
@@ -178,9 +222,16 @@ class QuranSttEngine private constructor(
      */
     fun transcribeWithWordTimes(samples: FloatArray): Pair<String, List<WordTime>> {
         if (samples.isEmpty()) return "" to emptyList()
-        val nFrames = 1 + (samples.size - 1) / HOP
+        // Pre-pad the audio by (WIN_LEN - 1) for center=False STFT (see
+        // transcribe() rationale). The downstream ctcDecodeWithTimes() maps
+        // output frames back to INPUT-SAMPLE offsets using the unpadded
+        // length (samples.size), which is the same convention the audio
+        // collector in SherpaPipeline uses.
+        val padded = FloatArray(samples.size + WIN_LEN - 1)
+        System.arraycopy(samples, 0, padded, 0, samples.size)
+        val nFrames = maxOf(1, 1 + (padded.size - WIN_LEN) / HOP)
         if (nFrames < 2) return "" to emptyList()
-        val mel = logMel(samples, nFrames)
+        val mel = logMel(padded, nFrames)
         val lengthTensor = OnnxTensor.createTensor(
             env, LongBuffer.wrap(longArrayOf(nFrames.toLong())), longArrayOf(1)
         )
@@ -256,17 +307,35 @@ class QuranSttEngine private constructor(
         return sb.toString().trim() to words
     }
 
-    /** log-mel (N_MELS x nFrames) + per-band z-scoring, matches the exporter. */
+    /**
+     * log-mel (N_MELS x nFrames) + per-band z-scoring, matches the exporter.
+     *
+     * Input is expected to be ALREADY right-padded by (WIN_LEN - 1) zero
+     * samples by the caller — this mirrors numpy.pad(..., (0, win_n-1)) so
+     * the STFT behaves like `center=False` (no implicit center padding).
+     * The function also adds a 1e-5 Gaussian dither to the audio before
+     * windowing, matching NeMo AudioToMelSpectrogramPreprocessor's
+     * `dither=1.0e-5` setting (the same RNG seed in Python yields the same
+     * noise here, but the per-frame window is short enough that the random
+     * seed does not matter for accuracy; the model is robust to the noise).
+     */
     private fun logMel(samples: FloatArray, nFrames: Int): FloatArray {
+        // Dither the audio in-place into a scratch buffer (we must NOT mutate
+        // the caller's buffer — the collector reuses `audio` across decodes).
+        val padded = FloatArray(samples.size)
+        for (i in samples.indices) padded[i] = samples[i] + ditherAmp * ditherRand()
         // STFT power: (N_BINS x nFrames), in-place radix-2 FFT (N_FFT = 512).
         val power = FloatArray(N_BINS * nFrames)
         val re = FloatArray(N_FFT)
         val im = FloatArray(N_FFT)
         for (f in 0 until nFrames) {
             val base = f * HOP
-            val n = minOf(WIN_LEN, samples.size - base)
+            // The caller already padded by WIN_LEN-1, so the windowed frame
+            // never crosses the buffer end. Keep a defensive clamp anyway
+            // so an out-of-spec call still doesn't OOB.
+            val n = minOf(WIN_LEN, padded.size - base).coerceAtLeast(0)
             var i = 0
-            while (i < n) { re[i] = samples[base + i] * hanning[i]; im[i] = 0f; i++ }
+            while (i < n) { re[i] = padded[base + i] * hanning[i]; im[i] = 0f; i++ }
             while (i < N_FFT) { re[i] = 0f; im[i] = 0f; i++ }
             fft(re, im)
             val po = f * N_BINS
@@ -304,6 +373,14 @@ class QuranSttEngine private constructor(
         }
         return mel
     }
+
+    /**
+     * Cheap zero-mean unit-variance Gaussian. java.util.Random.nextGaussian()
+     * uses Box-Muller which is more than accurate enough for the 1e-5 dither
+     * floor; the model's CTC logprobs are insensitive to the exact dither
+     * realization (the per-feature normalization absorbs it).
+     */
+    private fun ditherRand(): Float = java.util.Random().nextGaussian().toFloat()
 
     /** In-place radix-2 iterative FFT (size N_FFT). */
     private fun fft(re: FloatArray, im: FloatArray) {

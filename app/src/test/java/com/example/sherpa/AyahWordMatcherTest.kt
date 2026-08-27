@@ -204,4 +204,95 @@ class AyahWordMatcherTest {
         val cleaned = matcher.clean("لِلَّه رَ ٱلْعَٰلَمِين")
         assertEquals(listOf("لِلَّه", "ٱلْعَٰلَمِين"), cleaned)
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // CTC SANDWICH FRAGMENT — regression for the Baqarah 285-286 false
+    // WRONG/SKIPPED bug. The active vocabulary has no أَنْ standalone (it
+    // appears as the connector into أُنْزِلَ, but never alone in this
+    // range). The CTC decoder, when the window's right edge cut a word
+    // mid-span, sometimes hallucinated a tiny real Arabic word
+    // (أَنْ/إِنْ/مِنْ) that the user never said. The OLD matcher kept it
+    // as KEEP_RAW ("a real 1-3 letter Arabic word would be an exact vocab
+    // hit" — true for the GENERAL case, but not for these connector
+    // ghosts when the active range happens not to contain them). The merge
+    // then committed the phantom, ate a target slot, and the aligner
+    // charged a cascade of false SKIPPEDs down the rest of the ayah.
+    //
+    // The fix: when the token is short (≤3 codepoints), not in vocab, not
+    // a valid truncation-restoration, and the PREVIOUS cleaned tokens in
+    // the same window are all vocabulary words, drop it as a CTC sandwich
+    // fragment. Real 1-3 letter Arabic words (مِنْ, لَا) appear in the
+    // active vocab of every surah and stay as exact-vocab hits — the
+    // "prior all vocab" guard makes this safe.
+    // ───────────────────────────────────────────────────────────────────
+
+    // Subset of Baqarah 2:285 target vocabulary (no أَنْ alone).
+    // Using the EXACT same words the e2e test gets from the AlQuran API
+    // (verified via cached surah_2.json — first 5 words of ayah 285).
+    private val baqarah285Vocab = listOf(
+        "ءَامَنَ", "ٱلرَّسُولُ", "بِمَآ", "أُنزِلَ", "إِلَيْهِ", "مِن", "رَّبِّهِۦ",
+        "وَٱلْمُؤْمِنُونَ", "كُلٌّ", "ءَامَنَ", "بِٱللَّهِ", "وَمَلَٰٓئِكَتِهِۦ",
+        "وَكُتُبِهِۦ", "وَرُسُلِهِۦ", "لَا", "نُفَرِّقُ", "بَيْنَ", "أَحَدٍۢ",
+        "مِّن", "رُّسُلِهِۦ", "وَقَالُوا۟", "سَمِعْنَا"
+    )
+
+    @Test
+    fun `CTC sandwich fragment (phantom أَنْ) is dropped from a multi-token window`() {
+        val matcher = AyahWordMatcher(baqarah285Vocab)
+        // The exact t=4.3 device-log decode: window decoded
+        // "قمَمَ الرَّسُولُ بِمَا أَنْ" (قمَمَ is the head-wreck that
+        // restoreEdgeFragment drops because the target doesn't have it as
+        // a leading-prefix of anything — its prior is also a vocab hit, so
+        // it falls into the OOV-fragment branch). The 3-token "core" is
+        // [الرَّسُولُ, بِمَا, أَنْ] — two vocab hits and a phantom أَنْ.
+        // The phantom أَنْ is ≤3 codepoints, NOT in vocab, NOT a unique
+        // truncation, and its prior cleaned tokens are all vocab → drop.
+        val cleaned = matcher.clean("الرَّسُولُ بِمَا أَنْ")
+        assertEquals(listOf("الرَّسُولُ", "بِمَا"), cleaned)
+    }
+
+    @Test
+    fun `CTC sandwich fragment rule is a no-op when no prior vocab anchors it`() {
+        val matcher = AyahWordMatcher(baqarah285Vocab)
+        // Same phantom أَنْ, but as the FIRST token of a decode — there is
+        // no prior cleaned token to anchor the sandwich. Without that
+        // guard, the rule would eat the user-spoken أَنْ in any surah that
+        // legitimately has it (none in this range, but in general the
+        // first-token case is the "decoder warm-up wrecks" bucket, not a
+        // sandwich). A bare phantom أَنْ with nothing else in the window
+        // stays as KEEP_RAW (it's ≥1 char, <4 chars, prior empty → prior
+        // all-vocab = false → NOT dropped by the new rule, the previous
+        // KEEP_RAW behaviour for a standalone non-vocab short token
+        // remains).
+        val cleaned = matcher.clean("أَنْ")
+        // The new rule's priorAllVocab guard prevents dropping a
+        // free-standing short token, so the standalone behaviour is the
+        // pre-existing KEEP_RAW.
+        assertEquals(listOf("أَنْ"), cleaned)
+    }
+
+    @Test
+    fun `legitimate 1-3 letter Arabic word stays as exact vocab hit (sandwich guard)`() {
+        val matcher = AyahWordMatcher(baqarah285Vocab)
+        // لَا is in the active vocab. It is also 2 codepoints. The new
+        // sandwich rule MUST NOT eat it: the priorAllVocab check runs only
+        // when the token is NOT an exact vocab hit, and the first branch
+        // (exactSet.contains) returns long before the sandwich branch.
+        val cleaned = matcher.clean("بِٱللَّهِ لَا نُفَرِّقُ")
+        assertEquals(listOf("بِٱللَّهِ", "لَا", "نُفَرِّقُ"), cleaned)
+    }
+
+    @Test
+    fun `phantom أَنْ is dropped even when an OOV head wreck precedes it`() {
+        val matcher = AyahWordMatcher(baqarah285Vocab)
+        // The EXACT t=4.3 e2e scenario: raw = "قمَمَ الرَّسُولُ بِمَا
+        // أَنْ". قمَمَ is a 4-letter OOV head wreck (KEEP_RAW, too long
+        // for the sandwich branch). The 3rd token is a real vocab hit
+        // (بِمَا). The 4th token is the phantom أَنْ — even though the
+        // FIRST cleaned token (قمَمَ) is NOT a vocab hit, ANY prior
+        // cleaned token being a vocab hit is enough to mark this window
+        // as "has real speech" → drop the sandwich phantom.
+        val cleaned = matcher.clean("قمَمَ الرَّسُولُ بِمَا أَنْ")
+        assertEquals(listOf("قمَمَ", "الرَّسُولُ", "بِمَا"), cleaned)
+    }
 }

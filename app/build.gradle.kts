@@ -150,7 +150,9 @@ testImplementation("javazoom:jlayer:1.0.1")
   testImplementation("com.microsoft.onnxruntime:onnxruntime:1.17.1")
 
   // ONNX Runtime (Android) drives the FastConformer CTC model from
-  // Saboorhsn/quran-stt-onnx bundled in assets/quran_stt/. Runs on the CPU EP.
+  // Muno459/fastconformer-quran bundled in assets/quran_stt/. Runs on the
+  // CPU EP. The model is NPL-1.1 (non-commercial); the surrounding
+  // application stays Apache-2.0.
   implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.1")
 }
 

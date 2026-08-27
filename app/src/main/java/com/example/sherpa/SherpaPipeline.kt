@@ -27,14 +27,14 @@ import java.io.IOException
 // This file implements the **single-AudioRecord shared pipeline** for the
 // Memorize+Tajweed mode: exactly one `AudioRecord` instance feeds BOTH
 // (a) the ONNX Runtime engine in QuranSttEngine.kt, running the NeMo
-// **FastConformer large CTC** model from `Saboorhsn/quran-stt-onnx`
-// (fine-tuned on EveryAyah + Tlog Quran recitation with Tajweed diacritics,
-// int8-quantized, Apache-2.0) and (b) the existing TajweedNet acoustic scorer
-// (which receives the same PCM samples via a `FloatArray` sink). Using one
-// capture session — instead of the platform `SpeechRecognizer` in parallel
-// with our own `AudioRecord` — preserves the single-mic invariant that
-// previously broke recitation on the Samsung A05s (which starves partials as
-// soon as two HAL clients compete for the mic).
+// **FastConformer large CTC head** model from `Muno459/fastconformer-quran`
+// (fine-tuned on EveryAyah + Tlog + Muaalem-annotated Quran recitation,
+// int8-quantized, NPL-1.1 non-commercial) and (b) the existing TajweedNet
+// acoustic scorer (which receives the same PCM samples via a `FloatArray`
+// sink). Using one capture session — instead of the platform
+// `SpeechRecognizer` in parallel with our own `AudioRecord` — preserves the
+// single-mic invariant that previously broke recitation on the Samsung A05s
+// (which starves partials as soon as two HAL clients compete for the mic).
 //
 // This branch replaced the previous sherpa-onnx Tarteel-Whisper recognizer
 // (whisper-tiny-ar-quran) — a full-context attention decoder that won Arabic
@@ -62,10 +62,11 @@ import java.io.IOException
 //         already-seen window can never duplicate or retract words.
 //
 // Model weight layout: the two model files are bundled as APK assets
-// (`assets/quran_stt/`) — a ~167 MB int8 ONNX graph plus the SentencePiece
-// token map. On first launch `SherpaModelDownloader` copies them into
-// `filesDir/sherpa_model/` (it keeps its name/API so the Compose download
-// dialog flow works unchanged). The entire stack is Apache-2.0.
+// (`assets/quran_stt/`) — a ~125 MB int8 ONNX graph (CTC head export of
+// Muno459/fastconformer-quran) plus the SentencePiece token map. On first
+// launch `SherpaModelDownloader` copies them into `filesDir/sherpa_model/`
+// (it keeps its name/API so the Compose download dialog flow works
+// unchanged). The model is NPL-1.1 licensed (non-commercial).
 // ─────────────────────────────────────────────────────────────────────────────
 
 private const val TAG = "ItqanSherpa"
@@ -76,8 +77,8 @@ private const val ASSET_SUBDIR = "quran_stt"
 private data class ModelFile(val name: String, val size: Long)
 
 private val MODEL_FILES = listOf(
-    ModelFile("model_int8.onnx", 174_544_089L),
-    ModelFile("tokens.txt",           12_847L),
+    ModelFile("model.q8.onnx", 131_801_646L),
+    ModelFile("tokens.txt",       12_847L),
 )
 private val MODEL_TOTAL_BYTES = MODEL_FILES.sumOf { it.size }
 
@@ -531,11 +532,54 @@ class AyahWordMatcher(
                         val truncRestored = restoreTruncatedWord(norm)
                         if (truncRestored != null) {
                             cleaned.add(truncRestored)
-                        } else if (norm.codePointCount(0, norm.length) >= 4) {
-                            // Terminal mismatch in Arabic script: keep the RAW
-                            // token so the downstream aligner flags WRONG/SKIPPED
-                            // instead of the user hearing nothing happen.
-                            cleaned.add(tok)
+                        } else {
+                            val cp = norm.codePointCount(0, norm.length)
+                            // CTC SANDWICH FRAGMENT: a tiny Arabic word (1-3
+                            // letters) that the matcher could not resolve to
+                            // ANY vocabulary word, and arrives AFTER at
+                            // least one real vocabulary word has already been
+                            // matched in this same window, is a CTC
+                            // hallucination from a sub-word spike (Baqarah
+                            // 285's t=4.3 "قمَمَ الرَّسُولُ بِمَا أَنْ"
+                            // cleanly produced [قمَمَ, الرَّسُولُ, بِمَا,
+                            // أَنْ] — أَنْ is a real 1-3 letter Arabic word
+                            // but NOT in the active 285-286 vocabulary; the
+                            // merge then committed it as if it were speech,
+                            // the live log acquired a phantom 4th word, and
+                            // the aligner eventually charged WRONG/SKIPPED
+                            // against a perfect recitation for the next ~70
+                            // words). Drop here at the source: it's not in
+                            // the vocab and a real 1-3 letter Arabic word
+                            // in this position would be an exact vocab hit.
+                            // ≥4-letter KEEP_RAW remains — those signal a
+                            // genuine misreading and the aligner should
+                            // flag them. Bare non-vocab short tokens with
+                            // no prior vocab anchor (the very first token
+                            // of a window or the only token in a window)
+                            // keep the historic KEEP_RAW behaviour so the
+                            // aligner can still flag a genuinely-spoken
+                            // short word it doesn't recognize.
+                            //
+                            // Note the guard is "AT LEAST ONE PRIOR VOCAB
+                            // HIT", not "ALL prior cleaned are vocab" — the
+                            // first token of a decode may be a 4-letter OOV
+                            // head wreck (Baqarah's قمَمَ, restored by
+                            // KEEP_RAW because cp=4 is too long to call a
+                            // sandwich) and we must still drop the tiny
+                            // phantom that comes after the next vocab hit.
+                            val priorHasVocab = cleaned.any {
+                                normalizeArabicPub(it) in exactSet
+                            }
+                            if (cp <= 3 && priorHasVocab) {
+                                // drop
+                            } else {
+                                // Terminal mismatch in Arabic script: keep
+                                // the RAW token so the downstream aligner
+                                // flags WRONG/SKIPPED instead of the user
+                                // hearing nothing happen. Covers ≥4-letter
+                                // tokens AND standalone 1-3 letter tokens.
+                                cleaned.add(tok)
+                            }
                         }
                     }
                 }
@@ -770,8 +814,26 @@ class SingleAudioPipeline(
     private val decodeIntervalMs = 1500L             // min gap between starts
     private val speechFrameThr = 0.012f              // ≈ -38 dBFS per-frame speech gate
     private val audioFloorRms = 0.01f                // ≈ -40 dB RMS chunk gate (see runReadLoop)
-    private val noSpeechStopMs = 3000L               // stop decoding 3 s after last speech
+    private val noSpeechStopMs = 4000L               // stop decoding 4 s after last speech
+    // Auto-stop the mic after this much wall-clock silence. Distinct from
+    // [noSpeechStopMs] (which only halts the decode worker); the user contract
+    // is that a long pause hands the mic back without an explicit tap. Matches
+    // a normal breath between ayahs in casual recitation. The final-commit
+    // decode runs on auto-stop just like a manual pause()/stop().
+    private val autoStopSilenceMs = 4000L
     private val minDecodeFrames = sampleRate * 3 / 2 // never decode < 1.5 s (mid-word slices)
+
+    /** Wall-clock time of the most recent chunk that had ANY speech. -1 until
+     *  the first speech frame arrives. Used by both capture paths (mic + inject)
+     *  to drive the auto-stop mic timer. */
+    @Volatile private var lastSpeechWallMs: Long = -1L
+
+    /**
+     * True when the auto-stop silence timer has expired (no speech for at
+     * least [autoStopSilenceMs]). Cleared on every speech chunk; the mic loop
+     * uses this to call [stop] gracefully.
+     */
+    @Volatile private var autoStopFired: Boolean = false
 
     // NN engine lifecycle. There is NO persistent state: the FastConformer
     // decodes a whole window, so every decode builds a fresh feature matrix.
@@ -1004,6 +1066,11 @@ class SingleAudioPipeline(
                 Log.i(TAG, "start(): session speech reset id=$pipelineId")
                 sessionSpeechStart = -1
                 lastSpeechFrame = -1L
+                // Reset the auto-stop mic timer (lastSpeechWallMs is the wall
+                // clock of the most recent speech chunk; autoStopFired is the
+                // latch that prevents multiple fires during one silence gap).
+                lastSpeechWallMs = -1L
+                autoStopFired = false
                 startReadLoop()
                 notifyFreshSession()
             } catch (t: Throwable) {
@@ -1211,6 +1278,15 @@ class SingleAudioPipeline(
     }
 
     /**
+     * True while the debug injection file is present — the pipeline is being
+     * driven by the PC test harness rather than the real microphone. The UI
+     * uses this to relax tajweed-popup auto-stops during automated runs
+     * (wrong/skipped words still stop the session).
+     */
+    fun isInjecting(): Boolean =
+        java.io.File(context.filesDir, "inject.pcm").exists()
+
+    /**
      * Invalidates any IN-FLIGHT final commit decode launched by an earlier
      * [pause]/[stop]. Their async job captured the utterance generation at
      * call time; bumping it now makes [finalDecodeAndEmit]'s generation guard
@@ -1367,6 +1443,9 @@ class SingleAudioPipeline(
         // freshSession event below and resets its committed cursor in sync.
         resetEmitLogs()
         matcher?.reset()
+        // INJECTION MODE: resume continues from the CURRENT audio position —
+        // right after the word that triggered the pause (the user asked for
+        // "continue from the next ayah", not a re-read of the mistake word).
         notifyFreshSession()
         // Re-spawn BOTH workers on the IO scope: read (but FIRST join the old
         // read worker so the A05s mic HAL is free for the new AudioRecord) and
@@ -1560,6 +1639,18 @@ class SingleAudioPipeline(
         // reading from the OLD AudioRecord, holding the single-mic HAL and
         // starving the new session's AudioRecord (total deafness).
         val myEpoch = captureEpoch
+        // ── DEBUG AUDIO INJECTION BYPASS ── When a PCM file exists in the
+        // app's private storage, feed IT through the exact mic chunk path
+        // (same RMS gate, same sinks, same 250 ms cadence) instead of opening
+        // the microphone. Lets the PC drive a deterministic "recitation" into
+        // the app for reproducible on-device testing. Delete the file (or use
+        // the app normally without pushing it) for real-mic behaviour.
+        val inject = java.io.File(context.filesDir, "inject.pcm")
+            .takeIf { it.exists() && it.length() > 4096 }
+        if (inject != null) {
+            runInjectLoop(inject, myEpoch)
+            return
+        }
         val minBuf = android.media.AudioRecord.getMinBufferSize(
             sampleRate,
             android.media.AudioFormat.CHANNEL_IN_MONO,
@@ -1688,6 +1779,25 @@ class SingleAudioPipeline(
                             droppedChunks = 0L
                             droppedSum = 0L
                         }
+                        // Auto-stop: if the mic has been silent for
+                        // [autoStopSilenceMs] AFTER at least one speech frame,
+                        // hand control back to the user. We check inside the
+                        // silence branch so the timer only advances when the
+                        // app is actually quiet (not when the user is mid
+                        // recitation).
+                        if (lastSpeechWallMs > 0L &&
+                            !autoStopFired &&
+                            nowMs2 - lastSpeechWallMs >= autoStopSilenceMs) {
+                            autoStopFired = true
+                            Log.i(
+                                TAG,
+                                "runReadLoop(): auto-stop on ${nowMs2 - lastSpeechWallMs}ms silence"
+                            )
+                            // Hop to the IO scope to call stop() off the read
+                            // loop (stop is suspend; doing it from the audio
+                            // thread would deadlock with the decode worker).
+                            scope.launch { stop() }
+                        }
                         continue
                     }
                     var speechFrames = 0
@@ -1723,6 +1833,13 @@ class SingleAudioPipeline(
                     // 2) Speech tracker (after the sink so indices are stable).
                     if (speechFrames > 0) {
                         lastSpeechFrame = (audioSize - 1).toLong()
+                        // Wall-clock tracker for the auto-stop silence timer.
+                        // Reset [autoStopFired] the moment new speech arrives,
+                        // so a future second silence window can fire again
+                        // after a resume (the user can re-tap the mic to
+                        // start another session, which resets the field).
+                        lastSpeechWallMs = System.currentTimeMillis()
+                        autoStopFired = false
                     }
                 } else if (n == android.media.AudioRecord.ERROR ||
                     n == android.media.AudioRecord.ERROR_INVALID_OPERATION) {
@@ -1739,6 +1856,135 @@ class SingleAudioPipeline(
         }
     }
 
+
+    /**
+     * DEBUG: feed [f] (16 kHz mono 16-bit LE PCM) through the EXACT mic chunk
+     * path - same RMS floor gate, same un-gated TajweedNet sink, same gated
+     * STT sink, same speech tracking, same 250 ms real-time cadence - without
+     * opening the microphone. After EOF, silence is fed so the session stays
+     * live for a natural finalize-on-stop. [injectPos] survives pause/resume
+     * so a resumed session continues where it left off.
+     */
+    @Volatile private var injectPos: Long = 0L
+
+    private fun runInjectLoop(f: java.io.File, myEpoch: Int) {
+        Log.i(TAG, "runInjectLoop(): INJECT MODE file=${f.name} bytes=${f.length()} startPos=$injectPos")
+        val chunkSamples = sampleRate / 4
+        val buf = ByteArray(chunkSamples * 2)
+        var rmsSum = 0.0
+        var levelSum = 0.0
+        var levelCount = 0L
+        var lastLevelLogMs = System.currentTimeMillis()
+        var levelPeak = -180.0
+        var droppedChunks = 0L
+        var droppedSum = 0L
+        var stream: java.io.InputStream? = null
+        var nextChunkNs = System.nanoTime()
+        var eof = injectPos >= f.length()
+        try {
+            while (running && myEpoch == captureEpoch) {
+                if (!eof && stream == null) {
+                    stream = java.io.BufferedInputStream(f.inputStream(), 1 shl 16)
+                    var toSkip = injectPos
+                    while (toSkip > 0) {
+                        val s = stream!!.skip(toSkip)
+                        if (s <= 0) break
+                        toSkip -= s
+                    }
+                    if (toSkip > 0) { eof = true; injectPos = f.length() }
+                }
+                var off = 0
+                if (!eof) {
+                    while (off < buf.size) {
+                        val r = stream!!.read(buf, off, buf.size - off)
+                        if (r <= 0) { eof = true; break }
+                        off += r
+                    }
+                    if (eof) {
+                        try { stream!!.close() } catch (_: Throwable) {}
+                        stream = null
+                        injectPos = f.length()
+                        Log.i(TAG, "runInjectLoop(): file EOF - feeding silence from here")
+                    }
+                }
+                val samples = off / 2
+                val floats = FloatArray(chunkSamples)
+                var chunkEnergy = 0.0
+                for (i in 0 until samples) {
+                    val lo = buf[i * 2].toInt() and 0xFF
+                    val hi = buf[i * 2 + 1].toInt()
+                    val v = ((hi shl 8) or lo) / 32768f
+                    floats[i] = v
+                    chunkEnergy += v * v
+                }
+                for (i in samples until chunkSamples) floats[i] = 0f // silence pad at EOF
+                injectPos += off
+                // UN-GATED scorer sink: every chunk, real time (same as mic).
+                synchronized(audioSync) {
+                    ensureRawAudioCapacity(rawAudioSize + chunkSamples)
+                    System.arraycopy(floats, 0, rawAudio, rawAudioSize, chunkSamples)
+                    rawAudioSize += chunkSamples
+                }
+                val chunkRms = Math.sqrt(chunkEnergy / chunkSamples.coerceAtLeast(1))
+                if (chunkRms >= audioFloorRms) {
+                    var speechFrames = 0
+                    for (i in 0 until chunkSamples) {
+                        val v = floats[i]
+                        val abs = if (v < 0f) -v.toDouble() else v.toDouble()
+                        if (abs >= speechFrameThr) {
+                            speechFrames++
+                            if (sessionSpeechStart < 0) sessionSpeechStart = audioSize + i
+                        }
+                        levelSum += abs
+                        if (abs > levelPeak) levelPeak = abs
+                    }
+                    levelCount += chunkSamples
+                    synchronized(audioSync) {
+                        ensureAudioCapacity(audioSize + chunkSamples)
+                        for (i in 0 until chunkSamples) audio[audioSize + i] = floats[i]
+                        audioSize += chunkSamples
+                    }
+                    if (speechFrames > 0) {
+                        lastSpeechFrame = (audioSize - 1).toLong()
+                        // Wall-clock tracker for the auto-stop silence timer
+                        // (mirrors the mic loop). Reset [autoStopFired] so a
+                        // second silence window after a resume can refire.
+                        lastSpeechWallMs = System.currentTimeMillis()
+                        autoStopFired = false
+                    }
+                } else {
+                    droppedChunks++
+                    droppedSum += chunkSamples
+                    // Silence chunk: same auto-stop check as the mic path.
+                    if (lastSpeechWallMs > 0L &&
+                        !autoStopFired &&
+                        System.currentTimeMillis() - lastSpeechWallMs >= autoStopSilenceMs) {
+                        autoStopFired = true
+                        Log.i(
+                            TAG,
+                            "runInjectLoop(): auto-stop on ${System.currentTimeMillis() - lastSpeechWallMs}ms silence"
+                        )
+                        scope.launch { stop() }
+                    }
+                }
+                val nowMs = System.currentTimeMillis()
+                if (nowMs - lastLevelLogMs >= 1000L) {
+                    levelLog(levelSum, levelCount, levelPeak, nowMs, droppedChunks, droppedSum)
+                    levelSum = 0.0; levelCount = 0L; lastLevelLogMs = nowMs; levelPeak = -180.0
+                    droppedChunks = 0L; droppedSum = 0L
+                }
+                // Real-time cadence: one 250 ms chunk per 250 ms, like the mic.
+                nextChunkNs += 250_000_000L
+                val now = System.nanoTime()
+                if (nextChunkNs > now) Thread.sleep((nextChunkNs - now) / 1_000_000L)
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "runInjectLoop(): crashed", t)
+        } finally {
+            try { stream?.close() } catch (_: Throwable) {}
+            Log.i(TAG, "runInjectLoop(): exiting at running=$running epoch=$myEpoch/$captureEpoch pos=$injectPos")
+        }
+    }
     /** 1 s-interval mic level probe. Silent chunks (below the RMS floor) are counted separately so a quiet room is distinguishable from a dead mic. */
     private fun levelLog(
         levelSum: Double,
@@ -2182,6 +2428,26 @@ internal fun monotonicMergeWords(
         val sizeOk = if (coversSession) n.size * 2 >= L else n.size >= L - 2
         if (sizeOk && sameWordBagFuzzy(lastNorm, nNorm)) return n
     }
+    // HEAD-ANCHORED LOG POISON: the final decode anchored at the log's head
+    // (bestAnchor close to 0) — the live log's leading words are a clean
+    // re-render — yet the final decode DOES NOT INCLUDE one or two words
+    // the live log committed mid-log. Those words are window-edge phantoms
+    // the live windows admitted but the session-covering tail decode
+    // correctly refused to re-hear (Baqarah 285's t=4.3 phantom أَنْ: the
+    // live log committed it after بِمَا, the final decode correctly
+    // rendered بِمَا أُنزِلَ without it, but the merge's append-only
+    // anchor path kept the phantom — every subsequent word then shifted
+    // by one slot and the aligner charged 6 false SKIPPED + 1 false WRONG
+    // on a perfect recitation). When the decode is a session-covering
+    // full re-render, the bag of words is similar (the live log has the
+    // phantom, the decode doesn't — sameWordBagFuzzy allows ≤2 unpaired),
+    // and the decode size is within 2 of the log, trust the fresher
+    // decode's reading order and drop the live log's extra words.
+    if (fullReRender && vocab != null && coversSession && bestAnchor in 0..1 &&
+        !headAnchoredPoison && spansLogHead && spansToLogEnd &&
+        n.size <= L && n.size >= L - 2 && sameWordBagFuzzy(lastNorm, nNorm)) {
+        return n
+    }
     // FINAL-decode prefix trim: the decode explained ITSELF ENTIRELY as a
     // re-render of the log's tail (anchor mid-log, everything consumed) —
     // the log words BEFORE the anchor are not in the decode. When their
@@ -2199,12 +2465,17 @@ internal fun monotonicMergeWords(
         if (allInWindow) return n
     }
     var tail = n.subList(bestConsumed, n.size)
-    if (vocab != null && bestAnchor == -1) {
-        // Nothing of the decode re-renders the log: it is new audio — but
-        // OOV words among it (matcher KEEP_RAW fragments, fused garbage) have
-        // no target slot and would only poison future anchor chains; the
-        // collector drops them anyway (target-count cap 0), so never let them
-        // into the emission log.
+    if (vocab != null) {
+        // OOV tail-word filter (active whether or not an anchor was found —
+        // a window can re-render the log's tail AND still surface a fresh
+        // OOV phantom AFTER the re-render block: ma'un's t=22.3
+        // "تفسيرع الرحيم" had the OOV تف سيرع anchored on the log AND
+        // smuggled a real Arabic word (الرحيم) past the anchor into the new
+        // tail, where it had no target slot (surah 107:1-7's vocabulary
+        // never contains الرحيم) and the aligner later charged a SKIPPED
+        // mistake when it could not consume the real upcoming هُمْ). The
+        // collector drops OOV words anyway (target-count cap 0), so never
+        // let them into the emission log.
         tail = tail.filter { normalizeArabicPub(it).let { nn -> nn.isNotEmpty() && nn in vocab } }
     }
     if (vocab != null && vocabMultiset != null && tail.isNotEmpty()) {
