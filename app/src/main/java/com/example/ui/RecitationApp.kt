@@ -3259,6 +3259,14 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // target words must stay PENDING (no mistake card, no pause). Only the
     // final emission is complete enough for real SKIPPED/WRONG verdicts.
     var sessionFinalized by remember { mutableStateOf(false) }
+    // True when the session just ended because the user REACHED THE END of the
+    // selected range (as opposed to pausing mid-way). Used to detect that the
+    // NEXT mic tap should start a fresh recitation instead of resuming this one
+    // — otherwise a finished session's transcript bleeds into the next
+    // recitation (the "flashing popup then re-tap starts from the stale,
+    // fully-recited transcript" bug). Consumed in startTajweedSession() and
+    // reset on range/surah change and Restart.
+    var sessionRangeCompleted by remember { mutableStateOf(false) }
 
     // The shared SpeechRecognizer must exist BEFORE the target-change reset effect below (which
     // stops a running session). It is the single microphone client for Memorize/Tarteel/Tajweed
@@ -3392,6 +3400,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         mistakeCleanStreak = 0
         latestTajweedPopup = null
         sessionFinalized = false
+        // A new range/surah is a fresh target: the previous run's range-completed
+        // flag must not make the next mic tap wipe a brand-new recitation.
+        sessionRangeCompleted = false
         // New session: clear the just-completed summary so a fresh recitation
         // can build and pop its own dialog (the previous one stays dismissed
         // for the rest of the app's lifetime unless the user explicitly clears
@@ -4346,7 +4357,31 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         // AyahWordMatcher's monotonicity cursor is preserved so the highlight
         // picks up from where the user left off.
         val pipelineNow = tajweedPipelineHolder.pipeline
-        if (pipelineNow != null && pipelineNow.paused) {
+        // PREVIOUS RUN FINISHED THE RANGE: the last recitation completed its
+        // selected ayah range (the session was closed by stopAtEnd, leaving the
+        // pipeline paused but the range DONE). A plain resume() would replay the
+        // stale, fully-recited transcript as if the user were continuing — the
+        // "finished session bleeds into the next recitation" bug. Wipe the
+        // previous run's transcript + counters and start a genuinely fresh
+        // recitation instead of resuming.
+        if (pipelineNow != null && pipelineNow.paused && sessionRangeCompleted) {
+            android.util.Log.i("ItqanSherpa", "startTajweedSession(): previous run finished the range -> wiping transcript + counters, starting fresh recitation")
+            finalSpokenText = ""
+            partialSpokenText = ""
+            lastCommittedWords = emptyList()
+            committedWordCount = 0
+            spokenTimings.clear()
+            currentWordCount = 0
+            alignment = Pair(0, false)
+            detailedAnalysis = emptyList()
+            tajweedVerdictCache.clear()
+            verifiedSpokenIndices.clear()
+            hintedIndices.clear()
+            mistakeResumeIndex = -1
+            mistakeResumeLiveText = ""
+            sessionRangeCompleted = false
+            // fall through to the fresh-session path below (do NOT resume)
+        } else if (pipelineNow != null && pipelineNow.paused) {
             isListening = true
             // Restart the minimum-listen clock for the tajweed-popup auto-stop
             // guard (item 5c): the resume path must not inherit the ORIGINAL
@@ -7202,6 +7237,16 @@ spokenTimings.clear()
                                 partialSpokenText = ""
                                 committedWordCount = 0
                                 lastCommittedWords = emptyList()
+                                // An explicit Restart must also drop the SCORED state, not just the
+                                // transcript: alignment (stopAtEnd reads it) and detailedAnalysis
+                                // (the per-word verdict list) would otherwise freeze the next
+                                // recitation's scoring on the previous run's results, and a
+                                // range-completed flag left set would wipe the new run on the very
+                                // first mic tap.
+                                alignment = Pair(0, false)
+                                detailedAnalysis = emptyList()
+                                sessionFinalized = false
+                                sessionRangeCompleted = false
                                 mistakeResumeIndex = -1
                                 mistakeResumeLiveText = ""
                                 hintActive = false
@@ -7767,6 +7812,11 @@ spokenTimings.clear()
                                 // dialog opens.
                                 val pendingRemain = detailedAnalysis.any { it.status == RecitationStatus.PENDING }
                                 if (sessionFinalized && !pendingRemain && viewModel.sessionSummaryToShow == null) {
+                                    // The recitation reached the end of its selected range with no
+                                    // PENDING (un-scored) words left: mark the run as range-completed
+                                    // so the next mic tap starts fresh instead of resuming the stale,
+                                    // fully-recited transcript.
+                                    sessionRangeCompleted = true
                                     viewModel.sessionSummaryToShow = MainViewModel.SessionSummary(
                                         surahNumber = chargeSurah,
                                         rangeStart = chargeRangeStart,

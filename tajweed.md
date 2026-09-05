@@ -143,6 +143,18 @@ the bounded confirmation search, §1 step 5):
   as CORRECT; the fast analysis loop likewise keeps the confirmed verdict if a
   stale queued pass lands.
 
+**Session boundary (range completed).** When a recitation reaches the END of its
+selected range with no `PENDING` (un-scored) words left, `sessionRangeCompleted`
+is set. The NEXT mic tap must start a *fresh* recitation — so `startTajweedSession()`
+wipes the previous run's transcript + scored state (`alignment`, `detailedAnalysis`,
+verdict/mistake-resume caches) and falls through to the clean-session path instead of
+`resume()`-ing the paused pipeline (a plain resume would replay the stale,
+fully-recited transcript and bleed the finished session into the next recitation). The
+explicit **Restart** control does the same wipe (it drops scored state, not just the
+transcript) and clears `sessionRangeCompleted`, so a leftover range-completed flag can
+never wipe a brand-new run on its first mic tap. Both flags reset on every range/surah
+change.
+
 **WRONG / SKIPPED mistakes — confirmation + verification gate.** A text-level
 candidate only becomes a *punished* mistake after three gates:
 
