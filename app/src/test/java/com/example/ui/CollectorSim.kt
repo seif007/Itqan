@@ -145,7 +145,34 @@ class CollectorSim(
             // get rejected. On reject, commit the uncommitted live tail and
             // finalize — never shrink the transcript.
             if (repaired && partial.isNotEmpty()) {
-                fun targetPrefixLen(words: List<String>): Int {
+                // LONGEST COMMON SUBSEQUENCE with the target — how many target
+                // words the candidate holds IN READING ORDER. Mirrors
+                // RecitationApp: the old longest-leading-run metric punished a
+                // transcript missing one early word while holding the whole rest
+                // (fatihah_c34: live prefix 3 beat the repair's 0 even though the
+                // repair held 27 of the 29 target words in order against the
+                // log's 20).
+                fun targetCoverageLen(words: List<String>): Int {
+                    val a = words.map { normalize(it) }
+                    val b = targetNormSequence
+                    val dp = IntArray(b.size + 1)
+                    for (i in a.indices) {
+                        var prevDiag = 0
+                        for (j in 1..b.size) {
+                            val tmp = dp[j]
+                            dp[j] = if (a[i].isNotEmpty() && b[j - 1].isNotEmpty() && a[i] == b[j - 1]) {
+                                prevDiag + 1
+                            } else {
+                                maxOf(dp[j], dp[j - 1])
+                            }
+                            prevDiag = tmp
+                        }
+                    }
+                    return dp[b.size]
+                }
+                // Longest leading run: the ORDER tie-break when both candidates
+                // hold the same NUMBER of target words (see RecitationApp).
+                fun targetRunLen(words: List<String>): Int {
                     var i = 0
                     while (i < words.size && i < targetNormSequence.size &&
                         targetNormSequence[i].isNotEmpty() &&
@@ -154,10 +181,16 @@ class CollectorSim(
                     return i
                 }
                 val liveWords = spokenText
-                val livePrefix = targetPrefixLen(liveWords)
-                val repairPrefix = targetPrefixLen(partial)
-                if (repairPrefix > livePrefix ||
-                    (repairPrefix == livePrefix && partial.size >= liveWords.size)) {
+                val livePrefix = targetCoverageLen(liveWords)
+                val repairPrefix = targetCoverageLen(partial)
+                val liveRun = targetRunLen(liveWords)
+                val repairRun = targetRunLen(partial)
+                val takeRepair = when {
+                    repairPrefix != livePrefix -> repairPrefix > livePrefix
+                    repairRun != liveRun -> repairRun > liveRun
+                    else -> partial.size >= liveWords.size
+                }
+                if (takeRepair) {
                     finalSpokenText = partial.joinToString(" ").trim()
                     partialSpokenText = ""
                     committedWordCount = partial.size
@@ -172,6 +205,23 @@ class CollectorSim(
                         partialSpokenText = ""
                         committedWordCount = tailWords.size
                         lastCommittedWords = lastCommittedWords + tailWords
+                    }
+                    // A REJECTED REPAIR MAY STILL HOLD THE ONLY COPY OF A WORD
+                    // THE LIVE LOG NEVER HEARD (mirrors RecitationApp,
+                    // fatihah_c33). Rejecting the repair means "do not REPLACE
+                    // the live transcript with this worse ordering" — it does
+                    // NOT mean "discard everything this decode heard".
+                    // Recompute the delta against the now-committed log and
+                    // append whatever survives: those are words no sliding
+                    // window ever rendered, and dropping them lost real speech
+                    // silently (the walk ended 28/29 with no row for the last
+                    // word, no popup, and a "clean" summary while the word sat
+                    // greyed out on screen).
+                    val recovered = filterMemorizeWords(partial, endpoint = true)
+                    if (recovered.isNotEmpty()) {
+                        finalSpokenText = "$finalSpokenText ${recovered.joinToString(" ")}".trim()
+                        committedWordCount = recovered.size
+                        lastCommittedWords = lastCommittedWords + recovered
                     }
                     sessionFinalized = true
                     return

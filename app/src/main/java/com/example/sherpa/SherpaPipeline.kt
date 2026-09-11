@@ -62,7 +62,7 @@ import java.io.IOException
 //         already-seen window can never duplicate or retract words.
 //
 // Model weight layout: the two model files are bundled as APK assets
-// (`assets/quran_stt/`) — a ~125 MB int8 ONNX graph (CTC head export of
+// (`assets/quran_stt/`) — a ~174 MB (166 MiB) int8 ONNX graph (CTC head export of
 // Muno459/fastconformer-quran) plus the SentencePiece token map. On first
 // launch `SherpaModelDownloader` copies them into `filesDir/sherpa_model/`
 // (it keeps its name/API so the Compose download dialog flow works
@@ -77,7 +77,15 @@ private const val ASSET_SUBDIR = "quran_stt"
 private data class ModelFile(val name: String, val size: Long)
 
 private val MODEL_FILES = listOf(
-    ModelFile("model.q8.onnx", 131_801_646L),
+    // MUST name a file actually bundled in `app/src/main/assets/quran_stt/`.
+    // This used to say "model.q8.onnx" (131,801,646 B) — a graph that does NOT
+    // exist anywhere in the repo. Asset extraction threw FileNotFoundException,
+    // "Model download failed", the STT engine was never constructed
+    // (`prewarm(): QuranSttEngine created OK` never logged) and recognition
+    // silently died: the cursor never advanced and no popup ever fired, which
+    // reads to the user as "stuck on a word". The shipped graph is
+    // model_int8.onnx (174,544,089 B) — the one the working build used.
+    ModelFile("model_int8.onnx", 174_544_089L),
     ModelFile("tokens.txt",       12_847L),
 )
 private val MODEL_TOTAL_BYTES = MODEL_FILES.sumOf { it.size }
@@ -441,7 +449,15 @@ class AyahWordMatcher(
      */
     private fun restoreTruncatedWord(norm: String): String? {
         val cp = norm.codePointCount(0, norm.length)
-        if (cp < 2) return null
+        // 1-letter fragments ARE restorable. Measured on Al-Fatihah 1:2: every
+        // window rendered رَبِّ as just `رَ`, the old `cp < 2` guard dropped it,
+        // the word was permanently lost from the committed transcript and the
+        // aligner charged a false SKIPPED that cascaded into a WRONG and froze
+        // the whole surah. Safety is unchanged: [maxMissing] still caps a
+        // 1-letter stem at ONE missing letter (so `ر` can only ever become a
+        // 2-letter word such as رَبِّ) and the uniqueness scan below still
+        // vetoes any ambiguous fragment.
+        if (cp < 1) return null
         // A 2-letter fragment may only restore a 1-letter cut (لل → لِلَّه):
         // allowing 2 missing letters from a 2-letter stem (ال → ٱللَّه) would
         // re-create the phantom-first-word bug. Longer stems (≥3 letters)
@@ -896,6 +912,14 @@ class SingleAudioPipeline(
     private var lastEmitClean: List<String> = emptyList()
     private var lastEmitRaw: List<String> = emptyList()
 
+    // Set by [mergeClean]: true when the LAST merge took a repair branch and
+    // therefore handed back the decode's READING ORDER rather than an append of
+    // new words onto the tail. [finalDecodeAndEmit] must read it immediately
+    // after the mergeClean call (mergeRaw overwrites it). Inferring this from
+    // the result's shape is wrong for the superset repair with orphan
+    // re-injection, which returns neither `== cleaned` nor a pure append.
+    private var mergeWasRepair: Boolean = false
+
     // First-emission timestamp of each log word, parallel to the two logs
     // above. Lets [monotonicMergeWords] time-eligibility-check anchors: a word
     // first emitted before `nowMs - windowMs` had its audio LEFT of the
@@ -958,7 +982,20 @@ class SingleAudioPipeline(
      * have re-heard (the trailing window, or the final tail's length).
      */
     private fun mergeClean(cleaned: List<String>, windowMs: Long, nowMs: Long, fullReRender: Boolean = false, coversSession: Boolean = false): List<String> {
-        val merged = monotonicMergeWords(lastEmitClean, cleaned, lastEmitCleanMs, nowMs, windowMs, vocabNorm, vocabMultiset, fullReRender, coversSession)
+        // Record WHETHER the merge took a repair branch (adopted the decode's
+        // reading order) as opposed to appending new words to the tail. The
+        // caller in finalDecodeAndEmit() must not have to infer it from the
+        // result's shape: the superset repair with orphan re-injection returns
+        // decode-order words PLUS spliced log survivors, so it is neither
+        // `== cleaned` nor a pure append — inferring "not a repair" there made
+        // the collector append the delta on top of the (now reordered) log and
+        // produced a doubled, misordered transcript.
+        mergeWasRepair = false
+        val merged = monotonicMergeWords(
+            lastEmitClean, cleaned, lastEmitCleanMs, nowMs, windowMs,
+            vocabNorm, vocabMultiset, fullReRender, coversSession,
+            onRepair = { mergeWasRepair = true }
+        )
         lastEmitCleanMs = updatedEmitMs(lastEmitCleanMs, lastEmitClean.size, merged.size, nowMs)
         return merged
     }
@@ -1868,6 +1905,20 @@ class SingleAudioPipeline(
     @Volatile private var injectPos: Long = 0L
 
     private fun runInjectLoop(f: java.io.File, myEpoch: Int) {
+        // REPLAY ON A NEW SESSION. The pipeline — and therefore [injectPos] —
+        // survives pause/resume BY DESIGN (stopTajweedSession() only pauses; it
+        // never releases the 296 MB recognizer), so a SECOND injection run in
+        // the same process resumed at the previous run's offset and, being
+        // already past EOF, fed pure silence for the whole session: every
+        // window decoded nothing and the run looked like a dead app (measured
+        // fatihah_v2: bytes=1487928 but startPos=1495856 — matched stayed 0
+        // for 200 s). Rewinding once the file is exhausted keeps pause/resume
+        // continuity intact (a mid-file resume still continues where it left
+        // off) while letting consecutive runs replay from the top.
+        if (injectPos >= f.length() && f.length() > 0L) {
+            Log.i(TAG, "runInjectLoop(): rewinding $injectPos -> 0 (previous run exhausted the file)")
+            injectPos = 0L
+        }
         Log.i(TAG, "runInjectLoop(): INJECT MODE file=${f.name} bytes=${f.length()} startPos=$injectPos")
         val chunkSamples = sampleRate / 4
         val buf = ByteArray(chunkSamples * 2)
@@ -2179,7 +2230,21 @@ class SingleAudioPipeline(
         }
         val src = sessionAudio ?: return
         if (src.size <= 0) return
-        var fromIdx = maxOf(0, src.size - 10 * sampleRate)
+        // WHOLE-SESSION REPAIR. This used to decode only the last 10 s, which
+        // meant `coversSession` (fromIdx == 0) was false for every real
+        // recitation and the fullReRender repair-swap branch could never fire.
+        // Words the sliding windows dropped or reordered were therefore never
+        // recovered: the transcript stayed short, the walk ran out of spoken
+        // words and the tail of the range never lit up (fatihah_p3 ended with
+        // 10/29 matched on a 46 s recitation).
+        // Decode the whole session when it fits the cap so the repair can
+        // actually run; keep the short tail for anything longer, rather than
+        // spending 20+ s decoding audio at the end of a long session.
+        val FINAL_DECODE_MAX_SEC = 90
+        var fromIdx = maxOf(0, src.size - FINAL_DECODE_MAX_SEC * sampleRate)
+        if (fromIdx != 0) {
+            fromIdx = maxOf(0, src.size - 10 * sampleRate)
+        }
         if (src.size - fromIdx < sampleRate) {
             fromIdx = 0
         }
@@ -2205,6 +2270,14 @@ class SingleAudioPipeline(
             val windowMs = (win.size * 1000L) / sampleRate
             val prevCleanSize = lastEmitClean.size
             val mergedClean = mergeClean(cleaned, windowMs, t0, fullReRender = true, coversSession = fromIdx == 0)
+            // Capture the merge's own verdict on the branch it took, BEFORE
+            // mergeRaw overwrites the flag. Shape inference is not enough: the
+            // superset repair with orphan re-injection returns decode-order
+            // words PLUS spliced log survivors, so it is neither `== cleaned`
+            // nor a prefix-preserving append of the log — and mis-classifying
+            // it as "not a repair" made the collector append the delta on top
+            // of the reordered log (a doubled, misordered transcript).
+            val mergeWasRepair = this.mergeWasRepair
             val mergedRaw = mergeRaw(rawWords, windowMs, t0)
             if (mergedClean == lastEmitClean && mergedRaw == lastEmitRaw) {
                 Log.d(TAG, "finalDecodeAndEmit(): hold — no new words. lastClean=${lastEmitClean.size} clean=${cleaned.size} lastRaw=${lastEmitRaw.size} raw=${rawWords.size} rawText='${rawText.take(60)}'")
@@ -2212,7 +2285,24 @@ class SingleAudioPipeline(
             }
             // The append-only merge only GROWS the log — a same-size or
             // smaller result means the final decode REPLACED it (repair).
-            val repaired = mergedClean != lastEmitClean && mergedClean.size <= prevCleanSize
+            //
+            // A GROWN result can ALSO be a replacement: the superset repair
+            // (live log ⊂ session decode) swaps a log the streaming windows
+            // left SHORT and out of order for a longer, correctly ordered
+            // decode. Sizing it as "not a repair" doomed the fix — measured
+            // baqarah_c19: `superset repair — 36w is a superset of the 27w
+            // live log` fired, yet mergedClean.size(36) > prevCleanSize(27)
+            // so repaired=false, the collector's REPAIR SWAP was skipped, the
+            // 9 new words were appended to the scrambled 27 and the walk
+            // froze at 11/36. `merged == cleaned` means the merge handed back
+            // the decode itself, i.e. the log WAS replaced.
+            //
+            // `mergeWasRepair` (the merge's own branch report) is the primary
+            // signal now; the two shape tests stay as a belt-and-braces net for
+            // any repair path that does not report.
+            val replacedByDecode = mergedClean == cleaned
+            val repaired = mergedClean != lastEmitClean &&
+                (mergeWasRepair || mergedClean.size <= prevCleanSize || replacedByDecode)
             val newCleanCount = mergedClean.size - lastEmitClean.size
             lastEmitClean = mergedClean
             lastEmitRaw = mergedRaw
@@ -2322,7 +2412,17 @@ internal fun monotonicMergeWords(
     vocab: Set<String>? = null,
     vocabMultiset: List<String>? = null,
     fullReRender: Boolean = false,
-    coversSession: Boolean = false
+    coversSession: Boolean = false,
+    /**
+     * Invoked when the merge adopts the decode's READING ORDER instead of
+     * appending new words onto the log's tail. The caller needs to know this
+     * to decide whether the result is an authoritative transcript (replace the
+     * committed one) or just a longer log (append the delta). It cannot be
+     * inferred from the result's shape: the superset repair re-injects
+     * orphaned log words into the decode's order, so its result is neither
+     * `== decode` nor a prefix-preserving append.
+     */
+    onRepair: (() -> Unit)? = null
 ): List<String> {
     if (last.isEmpty()) return n
     if (n.isEmpty()) return last
@@ -2393,7 +2493,7 @@ internal fun monotonicMergeWords(
     }
     // Full re-render of the whole log (no skipped prefix) → the fresher
     // decode's spelling wins.
-    if (bestConsumed == n.size && bestAnchor == 0 && bestK == 0 && n.size == L) return n
+    if (bestConsumed == n.size && bestAnchor == 0 && bestK == 0 && n.size == L) { onRepair?.invoke(); return n }
     // FINAL-decode repair: the tail decode re-heard the whole recitation in
     // one pass and nothing of it could anchor on the log — the log was
     // poisoned by window-edge losses (words displaced or dropped and
@@ -2417,16 +2517,54 @@ internal fun monotonicMergeWords(
     val spansLogHead = lastNorm.isNotEmpty() && nNorm.any {
         it == lastNorm.first() || editDistanceLe(it, lastNorm.first(), ceiling = 1) <= 1
     }
+    // ONE OF THE FIRST THREE, not strictly `lastNorm.first()`. Measured
+    // fatihah_c29: the decode's opener was the fragment `م` (all that survived
+    // of `بِسْمِ ٱللَّهِ`) so the strict form was false and the repair was skipped
+    // on a run that needed it. Still rejects a genuinely head-truncated decode
+    // (humazah), because that shares none of the first three words either.
+    val headCovered = lastNorm.take(3).filter { it.isNotEmpty() }.let { heads ->
+        heads.isEmpty() || heads.any { hw ->
+            nNorm.any { it == hw || editDistanceLe(it, hw, ceiling = 1) <= 1 }
+        }
+    }
     val headAnchoredPoison = bestAnchor == 0 && bestK == 0 && bestConsumed == n.size &&
         n.size < L && spansToLogEnd
+    // A session-covering decode with NO anchor is the strongest signal we get
+    // that the live log is poisoned: it re-heard the whole range in one pass and
+    // shares no usable alignment with what the windows committed.
+    //
+    // FORWARD TOLERANCE. `sameWordBagFuzzy`'s allowance and this size guard have
+    // to loosen TOGETHER — a decode that merges a split token costs one extra
+    // unpaired decode word per extra word the log committed, so a branch guarded
+    // by size alone goes unreachable in exactly the case it was written for.
+    //
+    // Measured fatihah_c29 (45 s, 29 targets): `mergeDiag L=26 n=25 anchor=-1`
+    // with 4 unpaired decode words — الصرط+المستقيم (log) fused to
+    // الصرط_المستقيم (decode), الرحمن+الرح fused to الرَّح*, and بسم and الرحيم
+    // dropped by the windows entirely. At the old `L - 2` the gate missed by ONE
+    // word, the repair never ran, the walk stayed frozen at matched=15 and the
+    // run failed with the popup showing 15/29.
+    //
+    // `headAnchoredPoison` keeps the `n.size <= L + 2` ceiling (a GROWING decode
+    // that ate the log's head is a different failure and is not this branch).
+    // Truncation is excluded by the tail check below, not by size.
+    val forwardTolerant = (n.size + 4 >= L && n.size >= L - 2) || n.size <= L + 2
     if (fullReRender && vocab != null && (bestAnchor == -1 || headAnchoredPoison) &&
-        n.size <= L + 2 && spansLogHead) {
+        forwardTolerant && headCovered &&
+        // A correct repair must span to the log's LAST word. Without this a
+        // decode that simply stopped early looks like a smaller, tidier
+        // transcript and would REPLACE the log — losing every word the decode
+        // never reached. `logCoveredByDecode` bounds this too, but "a couple of
+        // unpaired log words" on a 26-word log is loose enough to let a short
+        // truncation through, and the whole point of this branch is to trust a
+        // decode that heard MORE than the log, not less.
+        spansToLogEnd
+    ) {
         // A session-covering decode may legitimately be much SHORTER than a
         // log bloated by duplicated window-edge re-appends (falaq's شَرِّ x10):
-        // there the bag check, not the size, is the validator. A partial
-        // decode must still stay within 2 words of the log.
-        val sizeOk = if (coversSession) n.size * 2 >= L else n.size >= L - 2
-        if (sizeOk && sameWordBagFuzzy(lastNorm, nNorm)) return n
+        // there the bag check, not the size, is the validator.
+        val sizeOk = if (coversSession) n.size + 4 >= L && n.size * 2 >= L else n.size >= L - 2
+        if (sizeOk && sameWordBagFuzzy(lastNorm, nNorm)) { onRepair?.invoke(); return n }
     }
     // HEAD-ANCHORED LOG POISON: the final decode anchored at the log's head
     // (bestAnchor close to 0) — the live log's leading words are a clean
@@ -2446,6 +2584,7 @@ internal fun monotonicMergeWords(
     if (fullReRender && vocab != null && coversSession && bestAnchor in 0..1 &&
         !headAnchoredPoison && spansLogHead && spansToLogEnd &&
         n.size <= L && n.size >= L - 2 && sameWordBagFuzzy(lastNorm, nNorm)) {
+        onRepair?.invoke()
         return n
     }
     // FINAL-decode prefix trim: the decode explained ITSELF ENTIRELY as a
@@ -2462,7 +2601,143 @@ internal fun monotonicMergeWords(
                 if (lastEmitMs[j] < eligibilityCut) { allInWindow = false; break }
             }
         }
-        if (allInWindow) return n
+        if (allInWindow) { onRepair?.invoke(); return n }
+    }
+    // ── SUPERSET REPAIR (log ⊂ decode) ──────────────────────────────────
+    // Every repair above assumes the session-covering decode is NOT LONGER
+    // than the live log — hence `n.size <= L` / `n.size <= L + 2` /
+    // `sameWordBagFuzzy` (which tolerates only 2 unpaired DECODE words). The
+    // opposite case had no branch at all, and it is the common one for
+    // long audio: the streaming windows silently DROP words, so the log ends
+    // up strictly SHORTER than the whole-session decode and, worse, the merge
+    // can only APPEND — the missing words are bolted onto the TAIL, out of
+    // order. That out-of-order tail is what freezes the aligner walk (its
+    // reorder buffer has a 3-target budget).
+    // Measured baqarah_c14 (Al-Baqarah 1-5, 36 targets, 54.5 s):
+    //   live log 30w — ذَٰلِكَ(2) الَّذِينَ(9) وَمِمَّا(14) رَزَقْنَاهُمْ(15)
+    //   يُنفِقُونَ(16) وَبِالْآخِرَةِ(26) were never emitted by any window;
+    //   54.5 s final decode 37w, correctly ordered
+    //     الم ذَلِكَ الْكِتَابُ لَا رَيْبَ فِيهِ هُدًى لِلْمُتَّقِينَ الَّذِينَ يُؤْمِنُون …
+    //   merge appended the 6 missing words (+1 echo) at the END:
+    //     … هُمُ الْمُفْلِحُونَ ذَلِكَ الَّذِينَ يُؤْمِنُونَ وَمِمَّا رَزَقْنَٰهُمْ
+    //       يُنفِقُونَ وَبِٱلْءَاخِرَةِ
+    //   -> walk froze at matched=10, autoFinalize finalized 10/36.
+    // When the decode covers the session, is LONGER than the log, and every
+    // log word is accounted for inside it (≤2 phantoms), the decode heard
+    // everything the log heard and more, in the right order. Adopting it can
+    // only add words and restore order — never drop one.
+    // Diagnostics: every input to the repair branches below is invisible in
+    // logcat, so a session that ends with the missing words bolted onto the
+    // tail is undiagnosable from the run. Dump them once per final decode.
+    // `headCovered` (declared above with the anchor branch) is the tolerant
+    // head test used by both repairs; `spansLogHead` is logged alongside it so
+    // the two can be told apart when a repair does NOT fire.
+    if (fullReRender && coversSession) {
+        Log.i(
+            TAG,
+            "monotonicMergeWords(): mergeDiag L=$L n=${n.size} vocab=${vocab?.size} " +
+                "head=$spansLogHead headCovered=$headCovered end=$spansToLogEnd " +
+                "anchor=$bestAnchor consumed=$bestConsumed " +
+                "covered=${logCoveredByDecode(lastNorm, nNorm)} bag=${sameWordBagFuzzy(lastNorm, nNorm)}\n" +
+                "    log='${lastNorm.joinToString(" ")}'\n" +
+                "    dec='${nNorm.joinToString(" ")}'"
+        )
+    }
+    // The tail is deliberately NOT required (no spansToLogEnd): the log's last
+    // word can equally be a phantom. logCoveredByDecode is the real guard —
+    // it allows only maxOf(2, L/6) unpaired log words, so a decode that
+    // truncates a chunk of the log cannot pass.
+    //
+    // `n.size` may be slightly BELOW `L` and the repair still applies. Requiring
+    // `n.size > L` assumed the decode can only ever be longer because the log is
+    // merely missing words; but the log can equally carry window-edge
+    // DUPLICATES the decode correctly refuses to re-hear, and those push L above
+    // n even when the decode restored real words. Measured fatihah_c32
+    // (L=25 n=24, anchor=-1):
+    //   log  … اهدنا الصرط المستقيم [عليهم] غير …   <- صرط الذين انعمت MISSING
+    //   dec  … اهدنا الصرط المستقيم صرط الذين انعمت عليهم غير … ولا الضالين
+    // The decode restores three words the windows dropped and reaches the range
+    // end; it is shorter only because it dropped بسم/الرحيم/الرحمن duplicated at
+    // the log's edges. The repair must take it.
+    //
+    // Truncation is still excluded: `logCoveredByDecode` alone would tolerate a
+    // 4-word shortfall, so require the decode to also span the log's tail AND
+    // stay within a proportional margin of its length.
+    //
+    // AND THE LOG-ONLY SURVIVORS ARE RE-INJECTED, NOT DROPPED. Adopting the
+    // decode wholesale is only safe when it contains every real word the log
+    // did; here it does not. Measured fatihah_c32:
+    //   log  … اهدنا الصرط المستقيم [عليهم] غير المغضوب عليهم ولا الضالين
+    //   dec  … اهدنا الصرط المستقيم صرط الذين انعمت عليهم المغضوب عليهم ولا الضالين
+    // The decode RESTORES صرط الذين انعمت (three words no window ever emitted)
+    // but LOSES غير. Replacing outright would trade three false skips for one —
+    // and the aligner would flag غير, which the user pronounced. So the repair
+    // takes the decode's reading order and splices each orphaned log word back
+    // in at its best position (immediately before the decode word that follows
+    // its log neighbour). Both sides keep everything they heard.
+    val decodeSpansTail = lastNorm.isNotEmpty() && nNorm.lastOrNull()?.let { last ->
+        last == lastNorm.last() || editDistanceLe(last, lastNorm.last(), ceiling = 1) <= 1
+    } == true
+    val shorterButComplete = n.size >= L - maxOf(2, L / 6) && decodeSpansTail
+    // A decode LONGER than the log cannot be a truncation, so its orphan budget
+    // is loosened (see logCoveredByDecode). The size/head guards are unchanged.
+    val decodeIsLonger = n.size > L
+    if (fullReRender && vocab != null && coversSession && L >= 2 &&
+        (decodeIsLonger && n.size <= L * 2 || shorterButComplete) && headCovered &&
+        logCoveredByDecode(lastNorm, nNorm, decodeIsLonger = decodeIsLonger)
+    ) {
+        // Pair every log word with its decode counterpart, then find the log
+        // words that had none. Those are the ones the decode dropped; each is
+        // re-inserted before the decode word that matched its SUCCESSOR in the
+        // log, which is where it belongs in the decode's order.
+        val decodeUsed = BooleanArray(n.size)
+        val logPartner = IntArray(L) { -1 }
+        for (j in 0 until L) {
+            val wl = lastNorm[j]
+            if (wl.isEmpty()) continue
+            for (d in n.indices) {
+                if (decodeUsed[d]) continue
+                val wd = nNorm[d]
+                if (wd.isEmpty()) continue
+                if (wl == wd || editDistanceLe(wl, wd, ceiling = 1) <= 1) {
+                    decodeUsed[d] = true
+                    logPartner[j] = d
+                    break
+                }
+            }
+        }
+        val orphans = (0 until L).filter { logPartner[it] < 0 && last[it].isNotBlank() }
+        if (orphans.isEmpty()) {
+            Log.i(
+                TAG,
+                "monotonicMergeWords(): superset repair — session decode ${n.size}w covers the " +
+                    "${L}w live log (${if (n.size > L) "superset" else "shorter-but-complete"}); " +
+                    "adopting the decode's order"
+            )
+            onRepair?.invoke()
+            return n
+        }
+        val out = ArrayList<String>(n.size + orphans.size)
+        for (d in n.indices) {
+            for (j in orphans) {
+                // Where should this orphan land? Before the decode word that
+                // matched the NEXT log word we did pair, so the log's own
+                // ordering decides. Orphans with no paired successor go last.
+                val successor = (j + 1 until L).firstOrNull { logPartner[it] >= 0 }
+                if (successor != null && logPartner[successor] == d) out.add(last[j])
+            }
+            out.add(n[d])
+        }
+        val missingTail = orphans.filter { j -> (j + 1 until L).none { logPartner[it] >= 0 } }
+        for (j in missingTail) out.add(last[j])
+        Log.i(
+            TAG,
+            "monotonicMergeWords(): superset repair — session decode ${n.size}w covers the " +
+                "${L}w live log; adopting its order and re-injecting ${orphans.size} " +
+                "log-only word(s): ${orphans.joinToString(" ") { last[it] }}"
+        )
+        onRepair?.invoke()
+        return out
     }
     var tail = n.subList(bestConsumed, n.size)
     if (vocab != null) {
@@ -2514,16 +2789,29 @@ internal fun monotonicMergeWords(
 }
 
 /**
- * True when all but ≤2 words of [decode] pair with a DISTINCT word of
+ * True when all but a few words of [decode] pair with a DISTINCT word of
  * [log] (exact normalized equality or ≤1 edit — a spelling variant like
- * اعوذ/أَعُوذ or غَاسق/غاسق). The 2 unpaired allowance covers words the
+ * اعوذ/أَعُوذ or غَاسق/غاسق). The unpaired allowance covers words the
  * live windows missed entirely and the final decode RESTORES (nasr's
  * النَّاسَ). Order-blind on purpose: the final decode's order is the
  * trustworthy one; this only checks it is the same recitation. Leftover
  * log words (phantom duplicates, garbage) are unconstrained — the caller's
  * size guard already ensures the decode spans the whole session.
+ *
+ * TOLERANCE IS PROPORTIONAL (`maxOf(2, log/6)`), not a flat 2, because one
+ * fusion costs exactly one unpaired decode word. Measured fatihah_c29:
+ *   log  … الصرط المستقيم … الرحمن … الرحيم …   (26w)
+ *   dec  … الصرط_المستقيم … الرَّح*      …       (25w)
+ * `الصرط` + `المستقيم` fused into one token, and `الرحمن` + `الرح`-fragment
+ * likewise: 2 fusions + the 2 words the windows genuinely dropped (بسم,
+ * الرحيم) = 4 unpaired, and a flat 2 rejected the very decode that heard the
+ * recitation correctly. log/6 gives 4 at 26 words and 5 at 30 — enough to
+ * absorb a couple of CTC fusions; a DIFFERENT recitation still fails by a
+ * wide margin (it shares almost no words at all). Short targets keep the floor
+ * of 2.
  */
 private fun sameWordBagFuzzy(log: List<String>, decode: List<String>): Boolean {
+    val tolerance = maxOf(2, log.size / 6)
     val used = BooleanArray(log.size)
     var unpaired = 0
     for (wd in decode) {
@@ -2536,7 +2824,80 @@ private fun sameWordBagFuzzy(log: List<String>, decode: List<String>): Boolean {
             if (wl == wd || editDistanceLe(wl, wd, ceiling = 1) <= 1) { matched = j; break }
         }
         if (matched == -1) {
-            if (++unpaired > 2) return false
+            if (++unpaired > tolerance) return false
+        } else {
+            used[matched] = true
+        }
+    }
+    return true
+}
+
+/**
+ * Mirror of [sameWordBagFuzzy] for the case where the session-covering decode
+ * is LONGER than the live log: every LOG word must be accounted for inside the
+ * decode (fuzzy ≤1 edit for spelling variants), with only a couple of leftover
+ * log words (window-edge phantoms the fresher decode correctly refused to
+ * re-hear). Decode words with no log counterpart are EXPECTED and unconstrained
+ * — they are exactly the words the streaming windows dropped and the repair
+ * exists to restore. Order-blind on purpose: the decode's order is the
+ * trustworthy one.
+ *
+ * TOLERANCE IS PROPORTIONAL AND MATCHES [sameWordBagFuzzy]'s spirit. The old
+ * `maxOf(2, log/10)` gave a 25-word log only 2 — but every CTC FUSION in the
+ * decode orphans one log word per extra token the log committed, so a decode
+ * that is *better* than the log can still trip a flat-2 budget. Measured
+ * fatihah_c32: the decode restored the interior words the windows had dropped
+ * (`صرط الذين انعمت` were entirely absent from the log) yet dropped three
+ * window-edge duplicates (`بسم`/`الرحيم`/`الرحمن`), orphaning 6 log words
+ * against a budget of 2. `covered=false` blocked the repair and the walk froze
+ * at 23/29.
+ *
+ * `log/4` is calibrated against real positives and negatives, not guessed:
+ *
+ * | case            | L  | n  | unpaired | verdict |
+ * |-----------------|----|----|----------|---------|
+ * | c29 real        | 26 | 25 |    5     | accept  |
+ * | c32 real        | 25 | 24 |    6     | accept  |
+ * | An-Nas (wrong)  | 26 | 20 |    7     | reject  |
+ * | Al-Ikhlas (wrong)|26 | 15 |    7     | reject  |
+ * | c32 truncated   | 25 | 12 |    7     | reject  |
+ *
+ * The margin is one word wide, which is uncomfortably thin — the strong guards
+ * are the caller's `headCovered`, the tail span and the size margin; this
+ * budget only catches grossly wrong decodes.
+ */
+private fun logCoveredByDecode(
+    log: List<String>,
+    decode: List<String>,
+    /**
+     * The decode is LONGER than the log. A longer decode cannot be a
+     * TRUNCATION, so the only failure mode this budget still has to catch is a
+     * decode of a DIFFERENT recitation — and the caller's `headCovered` (one of
+     * the log's first three words present in the decode) already rejects that.
+     * Every leftover log word is RE-INJECTED by the caller (§4.22), so a false
+     * accept cannot lose a word either. Measured fatihah_c34 (L=21 n=24,
+     * 7 log orphans against the flat L/4 = 5): the decode restored
+     * نعبد/اهدنا/الصرط/المستقيم and the range's last word but dropped seven
+     * window-edge duplicates; `covered=false` blocked the repair, the merge
+     * APPENDED its eight new words at the TAIL out of reading order, the walk
+     * froze at 10/29 and the user got neither a popup nor a summary.
+     */
+    decodeIsLonger: Boolean = false
+): Boolean {
+    val used = BooleanArray(decode.size)
+    val tolerance = if (decodeIsLonger) maxOf(3, log.size / 2) else maxOf(2, log.size / 4)
+    var unpaired = 0
+    for (wl in log) {
+        if (wl.isEmpty()) continue
+        var matched = -1
+        for (j in decode.indices) {
+            if (used[j]) continue
+            val wd = decode[j]
+            if (wd.isEmpty()) continue
+            if (wl == wd || editDistanceLe(wl, wd, ceiling = 1) <= 1) { matched = j; break }
+        }
+        if (matched == -1) {
+            if (++unpaired > tolerance) return false
         } else {
             used[matched] = true
         }

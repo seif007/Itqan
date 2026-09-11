@@ -294,4 +294,52 @@ class MemorizeTranscriptTrackerTest {
         assertEquals(expectedNorms.subList(0, prefixEnd), combined.subList(0, prefixEnd))
         assertEquals(expectedNorms, combined)
     }
+
+    // ── Test 9: a REJECTED repair still contributes the words the live log
+    // never heard. Measured fatihah_c33: the tail windows only produced
+    // fused/garbled renders, so the live log stopped one word short; the
+    // whole-session repair was correctly REJECTED on prefix quality, but its
+    // filtered delta held the one word the user had actually recited. That
+    // delta used to be thrown away with the repair, so the walk ended 28/29
+    // with NO row for the last word, no popup, and a "clean" summary while
+    // the word sat greyed out on screen.
+    @Test
+    fun rejectedRepair_stillContributesWordsTheLiveLogNeverHeard() {
+        val t = target
+        val sim = CollectorSim(riwayah, t)
+        // Live windows rendered words 0..6 only — the last word never made it
+        // into the merged log (its only renders were window-edge fragments).
+        val live = t.take(7)
+        sim.onEmission(live, endpoint = false, freshSession = true)
+        // stop()'s synthetic endpoint commits the live tail.
+        sim.onEmission(emptyList(), endpoint = true, freshSession = false)
+        assertEquals(live.map { norm(it) }, sim.spokenText.map { norm(it) })
+        // The whole-session repair is a WORSE ordering (prefix 0) AND shorter
+        // -> rejected. Its delta must still add the missing 8th word.
+        val repair = listOf(t[6], t[5], t[4], t[7])
+        sim.onEmission(repair, endpoint = true, freshSession = false, repaired = true)
+        assertTrue("session must still finalize", sim.sessionFinalized)
+        assertEquals(
+            "a rejected repair must not swallow the only copy of a word the live log never heard",
+            t.map { norm(it) }, sim.spokenText.map { norm(it) }
+        )
+    }
+
+    // ── Test 10: the recovered word is not double-counted when the live tail
+    // was NOT yet committed (no synthetic endpoint first) — the tail commit
+    // and the recovered delta must not both add it.
+    @Test
+    fun rejectedRepair_doesNotDoubleCountTheRecoveredWord() {
+        val t = target
+        val sim = CollectorSim(riwayah, t)
+        val live = t.take(7)
+        sim.onEmission(live, endpoint = false, freshSession = true)
+        // Straight to the repaired endpoint: the uncommitted live tail is
+        // committed first, then the delta is recomputed against it.
+        val repair = listOf(t[6], t[5], t[4], t[7])
+        sim.onEmission(repair, endpoint = true, freshSession = false, repaired = true)
+        assertTrue(sim.sessionFinalized)
+        assertEquals(t.map { norm(it) }, sim.spokenText.map { norm(it) })
+        assertWordsOnce(sim.spokenText)
+    }
 }

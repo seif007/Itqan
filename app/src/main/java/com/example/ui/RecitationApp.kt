@@ -1347,7 +1347,16 @@ fun isWordMatch(w1: String, w2: String): Boolean {
         // (من/عن/ما) must remain real errors.
         val dist = levenshtein(w1, w2)
         if (dist != 1) return false
-        return w1.startsWith(w2) || w2.startsWith(w1) || w1.endsWith(w2) || w2.endsWith(w1)
+        if (w1.startsWith(w2) || w2.startsWith(w1) || w1.endsWith(w2) || w2.endsWith(w1)) return true
+        // MIDDLE-LETTER DELETION. The streaming decoder routinely drops an
+        // INTERIOR letter of a short word and still means it: measured on
+        // Al-Fatihah, مَٰلِكِ came back as مك. Requiring a prefix/suffix
+        // relation rejected that, so the tail verification read the word as
+        // ABSENT and the recitation was auto-paused on a word the user HAD
+        // read. Accept it only when a >= 3-letter word lost ONE letter and
+        // left a >= 2-letter remnant, so two-letter particles (من/عن/ما)
+        // stay distinct and their substitutions remain real errors.
+        return maxOf(w1.length, w2.length) >= 3 && minOf(w1.length, w2.length) >= 2
     }
 
     val dist = levenshtein(w1, w2)
@@ -2211,7 +2220,25 @@ suspend fun analyzeRecitationDetails(
     // so pathological repeat runs still surface as mistakes.
     val consumedNorms = HashSet<String>()
     var consecutiveEchoSkips = 0
-    
+
+    // ── REORDER BUFFER ("carry") ─────────────────────────────────────────
+    // monotonicMergeWords can only APPEND, so a word the decoder renders LATE
+    // lands out of reading order (measured on-device on Al-Fatihah 1:2: لِلَّهِ
+    // arrived AFTER ٱلْعَٰلَمِينَ, and الرَّحِيمِ before الرَّحْمَٰنِ). The
+    // walk jumps ahead to reach the current target and SILENTLY SWALLOWS the
+    // words in between — but those words belong to the NEXT targets, so each
+    // one gets charged a false SKIPPED, the cascade reaches a WRONG and the
+    // walk returns: matched froze at 7/29 and the whole surah stayed grey with
+    // no popup. Parking the swallowed words here lets the following targets
+    // claim them first, restoring reading order.
+    // Bounded both ways: at most CARRY_MAX words, and only reusable for the
+    // next CARRY_BUDGET targets, so a stale buffer can never resurrect a word
+    // far away from where it was actually heard.
+    val carry = ArrayList<String>()
+    var carryBudget = 0
+    val CARRY_MAX = 4
+    val CARRY_BUDGET = 3
+
     // Process-wide singleton: the ~1 MB weights are parsed once and reused across
     // every recitation, so per-word analysis no longer re-decodes the JSON blob.
     val analyzer = context?.let { RecitationAnalyzer.get(it) }
@@ -2266,6 +2293,45 @@ suspend fun analyzeRecitationDetails(
         val rule = getTajweedRuleForWord(targetWordOrig, nextWordOrig, riwayah)
         
         if (spokenIndex >= spoken.size) {
+            // ── SPOKEN EXHAUSTED: FILL THE REMAINING TARGET ROWS ───────────
+            // The walk can only emit a row while it still has a spoken word to
+            // judge. Once the transcript ran out it used to `break` outright,
+            // leaving every remaining target word with NO ROW AT ALL. That is a
+            // hole no downstream consumer can see, and it produced the
+            // on-device report "the last word is not displayed and yet I have
+            // no mistake popup but a summary saying there are no mistakes":
+            //   * `decided` (= distinct wordIndex count) came back 28/29,
+            //   * `unheard` counted 0 — there was no PENDING row to count,
+            //   * `finalizeCorrect()` could not forgive a row that did not
+            //     exist, so the word stayed at the UI's 25 %-opacity fallback
+            //     ("not recited") forever,
+            //   * `cleanFinish` was false only because of the count, the grace
+            //     window expired with no `firstMistake` to stop for, and the
+            //     summary was raised claiming a clean recitation.
+            // Measured fatihah_c33: `rows=32` for 29 targets (28 distinct
+            // indices), `decided=28/29 unheardPending=0`, zero `verify idx=`
+            // lines, no popup, `endOfRange(): wrong=0 skipped=0`.
+            //
+            // A target word the walk never reached is UNHEARD — PENDING with
+            // spokenText == null, exactly like the frontier case below — so it
+            // neither advances `matched` nor hides a mistake, but it is now
+            // VISIBLE to every counter, to finalizeCorrect() and to the
+            // mistake pipeline. Every target word always has a row.
+            for (k in targetIndex until limit) {
+                val kw = targetWordsOriginal[k]
+                val kn = targetWordsNormalized[k]
+                val kNext = if (k + 1 < limit) targetWordsOriginal[k + 1] else null
+                result.add(WordAnalysis(
+                    wordIndex = k,
+                    text = kw,
+                    normalizedText = kn,
+                    status = RecitationStatus.PENDING,
+                    spokenText = null,
+                    // A word that was never reached is only ever PENDING: never
+                    // attach a rule the user could be scored against.
+                    tajweedRule = if (kn.isEmpty()) null else getTajweedRuleForWord(kw, kNext, riwayah)
+                ))
+            }
             break
         }
         consecutiveEchoSkips = 0
@@ -2281,13 +2347,63 @@ suspend fun analyzeRecitationDetails(
             if (isWordMatch(spoken[k], targetWordNorm)) { resyncAt = k; break }
         }
         if (resyncAt > spokenIndex && (resyncAt - spokenIndex) <= 6) {
+            // Same reasoning as the carry fill below: the tokens absorbed here
+            // are only *presumed* garbage. Park them too — if one of them turns
+            // out to be the next target word the buffer lets it be claimed
+            // instead of becoming a false SKIPPED.
+            // Not at the head: tokens absorbed before the FIRST target word sit
+            // in front of the recitation and belong to no target at all.
+            if (targetIndex > 0) {
+                for (i in spokenIndex until resyncAt) {
+                    if (carry.size >= CARRY_MAX) carry.removeAt(0)
+                    carry.add(spoken[i])
+                }
+                carryBudget = CARRY_BUDGET
+            }
             spokenIndex = resyncAt
         }
         
         var matchInSpokenAhead = -1
         var matchedSpokenAdvance = 1
+        var matchedFromCarry = false
+        var carryWord: String? = null
         val wordGroups = targetAllGroups?.getOrNull(targetIndex)
-        for (i in spokenIndex until minOf(spokenIndex + 3, spoken.size)) {
+
+        // Try the reorder buffer FIRST: these are words the walk already jumped
+        // over, i.e. speech that was heard BEFORE the current spokenIndex and
+        // therefore belongs to an earlier position than anything at the cursor.
+        // Consuming them here (without advancing [spokenIndex]) is what repairs
+        // a locally-scrambled transcript instead of charging false SKIPs.
+        if (carryBudget > 0 && carry.isNotEmpty()) {
+            for (i in carry.indices) {
+                var hit = isWordMatch(carry[i], targetWordNorm)
+                if (!hit && wordGroups != null) {
+                    for (group in wordGroups) {
+                        if (group is List<*> && group.isNotEmpty() && group[0] !is List<*>) {
+                            @Suppress("UNCHECKED_CAST")
+                            if (isWordMatchAny(carry[i], group as List<String>)) { hit = true; break }
+                        }
+                    }
+                }
+                if (hit) {
+                    carryWord = carry[i]
+                    repeat(i + 1) { carry.removeAt(0) }
+                    carryBudget--
+                    if (carryBudget <= 0) carry.clear()
+                    matchInSpokenAhead = spokenIndex
+                    matchedSpokenAdvance = 1
+                    matchedFromCarry = true
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "carry(): target $targetIndex '$targetWordOrig' claimed " +
+                            "reorder-buffer word '${carryWord}' (${i + 1} swallowed word(s) consumed)"
+                    )
+                    break
+                }
+            }
+        }
+
+        for (i in spokenIndex until (if (matchedFromCarry) spokenIndex else minOf(spokenIndex + 3, spoken.size))) {
             var matched = false
             if (wordGroups != null) {
                 for (group in wordGroups) {
@@ -2311,11 +2427,94 @@ suspend fun analyzeRecitationDetails(
             }
             if (matched) break
         }
-        
+
+        // ── MUQATTA'AT FALLBACK ───────────────────────────────────────────
+        // The strict loop above needs the decoder to render every letter name
+        // of a disjointed-letter word. It does not: measured on a Samsung
+        // A05s reciting Al-Baqarah 2:1, three consecutive windows emitted
+        // `أف م` for `الم` (truncated ألف, dropped لام). The 3-slot matcher
+        // then fails, the walk's OOV-garbage cap burns out on the fragments
+        // and word 0 is charged WRONG — which RETURNS EARLY, leaving all 6115
+        // remaining words PENDING: matched=0, nothing highlighted, no popup.
+        // Al-Fatihah has no muqatta'at, which is exactly why it "worked fine".
+        // Anchored at the transcript frontier only (i = spokenIndex) so it can
+        // never reach into speech that belongs to a later word.
+        if (matchInSpokenAhead == -1) {
+            val mSlots = com.example.quran.muqattaatSlots(targetWordOrig)
+            if (mSlots != null) {
+                val runEnd = minOf(spokenIndex + mSlots.size, spoken.size)
+                val consumed = if (spokenIndex < runEnd) {
+                    com.example.quran.matchMuqattaatRelaxed(
+                        spoken.subList(spokenIndex, runEnd), mSlots
+                    )
+                } else -1
+                if (consumed > 0) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "muqattaat(relaxed): word $targetIndex '$targetWordOrig' " +
+                            "matched ${mSlots.size} slots, consumed ${consumed}w from '${spoken.subList(spokenIndex, runEnd).joinToString(" ")}'"
+                    )
+                    matchInSpokenAhead = spokenIndex
+                    matchedSpokenAdvance = consumed
+                }
+            }
+        }
+
+        // ── MUQATTA'AT HEAD FORGIVENESS ──
+        // Sits BEFORE both the SKIPPED and the WRONG branches on purpose.
+        // A false negative on the FIRST disjointed-letter word of a range is
+        // catastrophic and the risk is completely asymmetric: whichever branch
+        // takes it, the walk stops there and every remaining word (6115 for a
+        // whole-surah Al-Baqarah) stays PENDING — matched=0, nothing highlights,
+        // no useful feedback. A false CORRECT on one letter group costs
+        // essentially nothing: the cursor simply advances one word.
+        // Measured on-device (baqarah_v2): word 0 `الٓمٓ` was charged SKIPPED
+        // (the first renderable token `لَا` matched a LATER target), so a guard
+        // placed only in the WRONG branch never ran and the surah stayed frozen
+        // at matched=0 for the entire session.
+        if (matchInSpokenAhead == -1 && targetIndex <= 1 &&
+            com.example.quran.muqattaatSlots(targetWordOrig) != null
+        ) {
+            android.util.Log.i(
+                "ItqanSherpa",
+                "muqattaat(head-forgive): word $targetIndex '$targetWordOrig' " +
+                    "-> CORRECT (relaxed matcher failed; avoids the matched=0 freeze)"
+            )
+            result.add(WordAnalysis(
+                wordIndex = targetIndex,
+                text = targetWordOrig,
+                normalizedText = targetWordNorm,
+                status = RecitationStatus.CORRECT,
+                spokenText = spoken[spokenIndex],
+                tajweedRule = rule
+            ))
+            consumedNorms.add(targetWordNorm)
+            spokenIndex++
+            targetIndex++
+            continue
+        }
+
         if (matchInSpokenAhead != -1) {
             consecutiveGarbageSkips = 0
             consumedNorms.add(targetWordNorm)
             consecutiveEchoSkips = 0
+            // Park everything this match skipped over, so the FOLLOWING targets
+            // can still claim it (see the CARRY block above). Without this the
+            // skipped words are lost for good and every one of them turns into
+            // a false SKIPPED verdict.
+            if (!matchedFromCarry && matchInSpokenAhead > spokenIndex) {
+                for (i in spokenIndex until matchInSpokenAhead) {
+                    if (carry.size >= CARRY_MAX) carry.removeAt(0)
+                    carry.add(spoken[i])
+                }
+                carryBudget = CARRY_BUDGET
+                android.util.Log.i(
+                    "ItqanSherpa",
+                    "carry(fill): target $targetIndex matched spoken[$matchInSpokenAhead], " +
+                        "parking ${matchInSpokenAhead - spokenIndex} swallowed word(s): " +
+                        spoken.subList(spokenIndex, matchInSpokenAhead).joinToString(" ")
+                )
+            }
 
             // ── MULTI-RULE LABELS ── one score row per rule the word carries.
             // The primary detector label comes first, then any additional
@@ -2350,7 +2549,10 @@ suspend fun analyzeRecitationDetails(
             // Gated on [scoreTajweed]: the fast display loop passes false so the
             // expensive TajweedNet scoring never blocks the near-real-time
             // highlight; the deferred tajweed loop passes true.
-            if (scoreTajweed && labels.isNotEmpty() && hasRealAudio && isTajweedMode && !isHintedWord) {
+            // `&& !matchedFromCarry`: a carry word has no spoken-stream index,
+            // so there is no trustworthy audio span to score — it gets the
+            // positional CORRECT verdict only, never an acoustic tajweed score.
+            if (scoreTajweed && labels.isNotEmpty() && hasRealAudio && isTajweedMode && !isHintedWord && !matchedFromCarry) {
                 // Find timing by exact index, or fallback to the closest matched word text
                 val timing = spokenTimings.find { it.startIndex == matchInSpokenAhead }
                     ?: spokenTimings.findLast { isWordMatch(it.word, targetWordNorm) }
@@ -2543,7 +2745,7 @@ suspend fun analyzeRecitationDetails(
                                 text = targetWordOrig,
                                 normalizedText = targetWordNorm,
                                 status = statusL,
-                                spokenText = spoken[matchInSpokenAhead],
+                                spokenText = carryWord ?: spoken[matchInSpokenAhead],
                                 tajweedRule = label,
                                 tajweedAcousticFeedback = feedbackL,
                                 tajweedScore = tScoreL,
@@ -2564,13 +2766,16 @@ suspend fun analyzeRecitationDetails(
                     text = targetWordOrig,
                     normalizedText = targetWordNorm,
                     status = RecitationStatus.CORRECT,
-                    spokenText = spoken[matchInSpokenAhead],
+                    spokenText = carryWord ?: spoken[matchInSpokenAhead],
                     tajweedRule = rule,
                     tajweedAcousticFeedback = null,
                     tajweedScore = null
                 ))
             }
-            spokenIndex = matchInSpokenAhead + matchedSpokenAdvance
+            // A carry match consumes the buffered word, NOT the spoken stream:
+            // the cursor stays put so the next target still sees the speech the
+            // jump skipped past.
+            if (!matchedFromCarry) spokenIndex = matchInSpokenAhead + matchedSpokenAdvance
             targetIndex++
             continue
         }
@@ -2610,6 +2815,39 @@ suspend fun analyzeRecitationDetails(
             targetIndex + if (targetIndex < 3) 8 else 4,
             limit
         )
+        // ── CLIPPED-WORD GUARD ────────────────────────────────────────────
+        // The CTC decoder sometimes returns only the opening letters of a word
+        // (measured on Al-Baqarah 2:2: `ذَٰلِكَ` came back as just `ذ`, in every
+        // window AND in the full-context tail decode). `ذ` matches nothing, so
+        // the walk scanned ahead, found `ٱلْكِتَٰبُ` and charged the user a
+        // SKIPPED on a word they actually recited — a false popup that stops
+        // the recitation. A token that is a strict PREFIX of the target and at
+        // least two characters shorter is a clipped decode, not a skipped
+        // word: leave it PENDING so the next window can still complete it.
+        if (matchInTargetAhead == -1 &&
+            spokenCurrentNormPre.length >= 1 &&
+            spokenCurrentNormPre.length <= targetWordNorm.length - 2 &&
+            targetWordNorm.startsWith(spokenCurrentNormPre)
+        ) {
+            android.util.Log.i(
+                "ItqanSherpa",
+                "clippedWord(): target $targetIndex '$targetWordOrig' spoken prefix " +
+                    "'$spokenCurrent' -> PENDING (clipped decode, not a skip)"
+            )
+            result.add(WordAnalysis(
+                wordIndex = targetIndex,
+                text = targetWordOrig,
+                normalizedText = targetWordNorm,
+                status = RecitationStatus.PENDING,
+                spokenText = spokenCurrent,
+                tajweedRule = rule
+            ))
+            consumedNorms.add(targetWordNorm)
+            spokenIndex++
+            targetIndex++
+            continue
+        }
+
         for (j in targetIndex + 1 until aheadLimit) {
             if (isWordMatch(spokenCurrent, targetWordsNormalized[j])) {
                 matchInTargetAhead = j
@@ -2682,6 +2920,13 @@ suspend fun analyzeRecitationDetails(
                 tajweedRule = rule
             ))
         } else {
+            // (Muqatta'at head forgiveness is applied earlier — see the block
+            //  immediately after the relaxed-muqatta'at fallback. It has to sit
+            //  BOTH before the SKIPPED branch and before the WRONG branch: on
+            //  device word 0 is charged SKIPPED far more often than WRONG,
+            //  because the first token the decoder manages to render usually
+            //  matches some later target and trips the "matches a target ahead"
+            //  path. Guarding only the WRONG branch left the freeze untouched.)
             // The transcript either caught up with the target (spokenRemaining
             // >= targetRemaining) or already PASSED this word without any
             // target matching it — a real mishearing/insertion (the STT
@@ -3188,6 +3433,19 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // emissions AND dwell for >= 2 s before it may auto-pause the mic.
     var lastWrongStopSightings by remember { mutableStateOf(0) }
     var lastWrongStopFirstSeenMs by remember { mutableStateOf(0L) }
+    // Wall-clock stamp of the last decisive tail verdict (word proven ABSENT).
+    // The stop/popup decision is driven by THIS clock, not by new transcript
+    // emissions: a mistake freezes the walk, the user stops speaking to read
+    // the feedback, so no new emission ever arrives and an emission-counted
+    // confirmation can never mature. Measured on every Al-Fatihah run:
+    // `candidate idx=N sightings=1` forever, with
+    // `confirmed (auto-pause + popup): 0` in every single one.
+    var mistakeVerdictAtMs by remember { mutableStateOf(0L) }
+    // How many tail decodes we have already spent on the CURRENT candidate
+    // (drives the growing span above), and how many of them came back
+    // "the word is absent".
+    var mistakeVerifyAttempts by remember { mutableStateOf(0) }
+    var mistakeVerifyAbsentStrikes by remember { mutableStateOf(0) }
 
     // Mistake-verification state (see the mistakeStop effect): before a
     // confirmed WRONG/SKIPPED may pause the recitation, ONE full-tail offline
@@ -3259,6 +3517,42 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // target words must stay PENDING (no mistake card, no pause). Only the
     // final emission is complete enough for real SKIPPED/WRONG verdicts.
     var sessionFinalized by remember { mutableStateOf(false) }
+    // One-shot latch for the end-of-range auto-finalize below: the finalize path
+    // charges goals and raises the summary, so it must run AT MOST ONCE per
+    // session even though its trigger (a Compose snapshot state) re-fires.
+    var autoFinalizeDone by remember { mutableStateOf(false) }
+    // How long the end-of-range summary waits for the mistake pipeline to
+    // surface an outstanding WRONG/SKIPPED as its own popup before finalizing
+    // anyway. See the "mistake hold" comment on the auto-finalize effect.
+    var mistakeHoldSinceMs by remember { mutableLongStateOf(0L) }
+    // A grace window that has ALREADY expired once must never be re-armed. The
+    // unproven FORGIVE branch used to reset mistakeHoldSinceMs, so it held 20 s,
+    // forgave, held 20 s, forgave… with the walk frozen and autoFinalizeDone
+    // never set — measured fatihah_c27 (one "forgiving rather than accusing" at
+    // 01:43:56, then "holding 0ms/20000" again at 01:43:58 and climbing), so the
+    // session produced NO popup at all and the user saw an empty screen.
+    var graceExpiredOnce by remember { mutableStateOf(false) }
+    // 20 s, not 12: two INDEPENDENT verification decodes are now needed before
+    // a word is condemned (§4.13), and each costs 1.5-3.6 s on device plus a
+    // 3 s cooldown. At 12 s the grace expired with the second strike still in
+    // flight and the session fell through to the summary.
+    val MISTAKE_GRACE_MS = 20000L
+    // Hard cap on how many tail-decodes the mistake pipeline may spend on ONE
+    // candidate word. Each decode runs on the same recognizer as the live
+    // windows, so an uncapped retry loop literally eats the transcript it is
+    // trying to judge (§4.15). 3 is the smallest number that can still reach
+    // the two-strike verdict; past it the word is left UNPROVEN and
+    // autoFinalize forgives it.
+    val MAX_MISTAKE_VERIFY_ATTEMPTS = 3
+    // Progress markers for the hold above: the countdown restarts whenever the
+    // walk decides a new word or recovers an unheard one.
+    var lastDecidedCount by remember { mutableIntStateOf(0) }
+    var lastUnheardCount by remember { mutableIntStateOf(Int.MAX_VALUE) }
+    // Ticker that re-runs the auto-finalize effect while a finished session is
+    // still live. The effect keys on detailedAnalysis, which stops changing once
+    // the recognizer goes quiet -- without a tick the mistake hold would never
+    // expire and the user would be left with no popup at all.
+    var finalizeTick by remember { mutableIntStateOf(0) }
     // True when the session just ended because the user REACHED THE END of the
     // selected range (as opposed to pausing mid-way). Used to detect that the
     // NEXT mic tap should start a fresh recitation instead of resuming this one
@@ -3535,10 +3829,25 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // CORRECTLY and displayed green: the recognizer simply never rendered
     // them, and the user should not be charged for the decoder's gaps. No
     // popup, no resume point — the recitation is simply complete.
-    LaunchedEffect(detailedAnalysis, sessionFinalized, isListening, currentTab, recitationMode) {
-        if (currentTab == "Memorize" && recitationMode == "Tajweed" &&
-            sessionFinalized && !isListening && detailedAnalysis.isNotEmpty()
+    //
+    // CRITICAL: this must run AT MOST ONCE per finalized session, and it must
+    // NOT be keyed on `detailedAnalysis`. It used to be — and this block MUTATES
+    // detailedAnalysis — so it re-triggered itself forever: every pass converted
+    // a few PENDING rows to CORRECT, which raised matchedSoFar, which slid the
+    // `matchedSoFar + 8` window ~6 words forward, converting the next 6, and so
+    // on through the whole target. Measured on Al-Baqarah (6116 words) after an
+    // 11-second recitation: 1019 iterations ending at matched=6112 — thousands
+    // of never-recited words reported CORRECT, with the UI stalled throughout.
+    var pendingConversionDone by remember { mutableStateOf(false) }
+    LaunchedEffect(sessionFinalized, isListening, currentTab, recitationMode, analysisEpoch) {
+        if (currentTab != "Memorize" || recitationMode != "Tajweed" ||
+            !sessionFinalized || isListening
         ) {
+            // Live session (or a different mode): re-arm so the NEXT finalize
+            // still gets its single conversion pass.
+            pendingConversionDone = false
+        } else if (detailedAnalysis.isNotEmpty() && !pendingConversionDone) {
+            pendingConversionDone = true
             val pendingRows = detailedAnalysis.filter { it.status == RecitationStatus.PENDING }
             // BOUND THE CONVERSION (measured disaster: a whole-Baqarah target
             // with 2.5 ayahs recited converted 6115 PENDING rows green). Only
@@ -3664,6 +3973,20 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         // matters via its popup, and HINTING is the user's own reveal, so we must
                         // not pause waiting for a word they'll never need to say.
                         // MULTI-RULE: several rows can share one wordIndex — count each WORD once.
+                        if (seenIdx.add(word.wordIndex)) newMatchedWordCount++
+                    } else if (word.status == RecitationStatus.PENDING &&
+                        !word.spokenText.isNullOrEmpty()
+                    ) {
+                        // ── CLIPPED-PENDING COUNTS AS REACHED ──
+                        // The clipped-decode guard emits PENDING carrying the fragment
+                        // the recognizer DID hear (spokenText != null): the user said
+                        // the word, the decode window simply cut it off. Leaving it
+                        // uncounted froze the highlight one word short, so the LAST
+                        // word of an ayah/range never lit up until the user tapped
+                        // pause (the on-device "the final word in Fatihah didn't get
+                        // displayed" report). PENDING rows with spokenText == null are
+                        // words never heard — or everything after a WRONG — and must
+                        // NOT advance the cursor.
                         if (seenIdx.add(word.wordIndex)) newMatchedWordCount++
                     }
                 }
@@ -3916,6 +4239,33 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // for the flagged target word: found ⇒ false alarm, count it CORRECT and
     // keep reading; absent ⇒ real mistake, popup + pause; inconclusive ⇒
     // retry on a later emission. See the gate inside the effect below.
+    //
+    // Hoisted so BOTH the emission-driven effect below and the verdict-driven
+    // ticker after it perform exactly the same stop. It captures the
+    // MutableState OBJECTS (remember returns the same instance on every
+    // recomposition), so calling it from a long-lived coroutine is safe.
+    val stopForMistake: (Int, Boolean) -> Unit = { wordIdx, skipped ->
+        val row = detailedAnalysis.firstOrNull { it.wordIndex == wordIdx }
+        val wordText = row?.text ?: ""
+        android.util.Log.i(
+            "ItqanSherpa",
+            "mistakeStop(): ${if (skipped) "SKIPPED" else "WRONG"} CONFIRMED wordIndex=$wordIdx " +
+                "word='$wordText' (sightings=$lastWrongStopSightings) -> auto-pause + popup"
+        )
+        lastWrongStopIndex = wordIdx
+        // The popup must tell the user WHAT went wrong and that they must
+        // repeat the word when they continue.
+        latestPopupKind = if (skipped) "skipped" else "wrong"
+        latestTajweedPopup = Pair(wordText, wordIdx)
+        // Snapshot the live transcript for the resume re-seat: the user
+        // continues reading FROM this word, so everything before it becomes
+        // the committed prefix of the next session.
+        mistakeResumeLiveText = (finalSpokenText + " " + partialSpokenText).trim()
+        mistakeResumeIndex = wordIdx
+        try { tajweedPipelineHolder.pipeline?.pause() } catch (_: Throwable) {}
+        try { speechRecognizer?.stopListening() } catch (_: Throwable) {}
+        isListening = false
+    }
     LaunchedEffect(detailedAnalysis, currentTab, recitationMode) {
         if (currentTab == "Memorize" && recitationMode == "Tajweed") {
             val mistakeIdx = detailedAnalysis.indexOfFirst {
@@ -3923,14 +4273,29 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             }
             val isSkipped = mistakeIdx >= 0 &&
                 detailedAnalysis[mistakeIdx].status == RecitationStatus.SKIPPED
+            // ── ROW INDEX vs WORD INDEX ───────────────────────────────────
+            // detailedAnalysis holds ONE ROW PER (word, rule), so the row
+            // position of the first WRONG/SKIPPED is NOT the word index (with
+            // ~1.3 rule rows per word the drift reaches 6+ by word 20).
+            // Everything else here is WORD-indexed: spokenTimings.startIndex,
+            // verifiedSpokenIndices, targetNorm and the UI's globalWordIndex.
+            // Feeding the row index to them meant:
+            //   * the spokenTimings anchor lookup ALWAYS missed, so the verify
+            //     span silently fell back to the candidate clock and decoded
+            //     audio recorded after the word was read;
+            //   * verifiedSpokenIndices.add(rowIdx) never matched any
+            //     wordIndex, so the FALSE-ALARM forgiveness that heals a false
+            //     skip was completely dead;
+            //   * confirmedMistakeUiIdx highlighted the wrong word.
+            val mistakeWord = if (mistakeIdx >= 0) detailedAnalysis[mistakeIdx].wordIndex else -1
             val currentSpoken = spokenText
             val currentWordCount = currentSpoken.split(Regex("\\s+")).size
             // SKIPPED requires the transcript to have advanced well PAST the
             // skipped index (>= 3 words beyond it): a word the STT simply
             // hasn't emitted yet — or dropped in ONE decode window and re-hears
             // on the next — must never be confirmed as skipped.
-            val skipAdvancedPast = mistakeIdx >= 0 &&
-                currentWordCount >= mistakeIdx + 4
+            val skipAdvancedPast = mistakeWord >= 0 &&
+                currentWordCount >= mistakeWord + 4
             // A new emission is one whose transcript text differs from the one
             // that produced the previous sighting (the same emission can
             // re-trigger this effect when other state changes).
@@ -3940,10 +4305,27 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             // forever - nothing ever fired and the cursor froze ("stuck at
             // ayah 2"). Drift within +-3 of the anchor = SAME episode; the
             // episode closes only after TWO consecutive clean emissions.
-            val sameEpisode = mistakeIdx >= 0 &&
+            //
+            // THE ANCHOR IS COMPARED TO ITSELF, NOT TO `lastWrongStopIndex`.
+            // `mistakeEpisodeAnchor` and `lastWrongStopIndex` are the SAME
+            // quantity (both are set to `mistakeWord` in the branch below), so
+            // once they agree `mistakeWord != lastWrongStopIndex` can never be
+            // true again and the branch is entered at most once per episode.
+            // Measured fatihah_c30 (word 10): the candidate flipped between
+            // `row=10` and `row=11` on every other recomposition — same
+            // `word=10`, different ROW — and because `sameEpisode` was false
+            // and `mistakeWord != lastWrongStopIndex` was true each time, this
+            // branch ran over and over. It reassigns
+            // `lastWrongStopFirstSeenMs = now`, so the 800 ms dwell needed
+            // before a verification decode could launch was NEVER satisfied:
+            // ZERO `verify idx=` lines in the whole run, a genuinely-recited
+            // word sat unproven for 20 s, and `stallWatchdog` then FABRICATED a
+            // skip and auto-paused the session — the false "you skipped a word"
+            // the user reported.
+            val sameEpisode = mistakeWord >= 0 &&
                 mistakeEpisodeAnchor >= 0 &&
-                kotlin.math.abs(mistakeIdx - mistakeEpisodeAnchor) <= 3
-            val isNewEmission = mistakeIdx >= 0 &&
+                kotlin.math.abs(mistakeWord - mistakeEpisodeAnchor) <= 3
+            val isNewEmission = mistakeWord >= 0 &&
                 currentSpoken != lastWrongStopSpokenText
             if (mistakeIdx < 0) {
                 mistakeCleanStreak += 1
@@ -3956,30 +4338,54 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     mistakeEpisodeAnchor = -1
                     mistakeCleanStreak = 0
                     mistakeVerifyAbsentIdx = -1
-                    mistakeEpisodeAnchor = -1
-                    mistakeCleanStreak = 0
+                    mistakeVerifyAttempts = 0
+                    mistakeVerifyAbsentStrikes = 0
+                    mistakeVerdictAtMs = 0L
                 }
-            } else if (!sameEpisode && mistakeIdx != lastWrongStopIndex) {
+            } else if (!sameEpisode && mistakeWord != lastWrongStopIndex) {
                 // A genuinely different region is now the first mistake:
                 // restart the confirmation counters for the new candidate.
-                mistakeEpisodeAnchor = mistakeIdx
+                mistakeEpisodeAnchor = mistakeWord
                 mistakeCleanStreak = 0
-                lastWrongStopIndex = mistakeIdx
+                lastWrongStopIndex = mistakeWord
                 lastWrongStopSpokenText = currentSpoken
                 lastWrongStopSightings = 1
                 lastWrongStopFirstSeenMs = System.currentTimeMillis()
                 // New candidate: not yet confirmed - hide any previous
                 // mistake UI until THIS index earns the evidence too.
                 confirmedMistakeUiIdx = -1
-                mistakeEpisodeAnchor = -1
-                mistakeCleanStreak = 0
                 mistakeVerifyAbsentIdx = -1
+                mistakeVerifyAttempts = 0
+                mistakeVerifyAbsentStrikes = 0
+                mistakeVerdictAtMs = 0L
+            } else if (mistakeCleanStreak > 0 || mistakeEpisodeAnchor < 0) {
+                // STABLE RE-ENTRY. `mistakeWord` matches the candidate the
+                // episode is already tracking, but the per-recomposition state
+                // that describes it was cleared — the candidate flickered off
+                // for one recomposition (a clean emission between two flagged
+                // ones) or this is the very first pass after the counters
+                // above ran. Re-seat the identity WITHOUT restarting the dwell
+                // clock: `lastWrongStopFirstSeenMs` is deliberately preserved
+                // so a candidate that keeps reappearing still reaches its
+                // verification deadline instead of being reset forever.
+                mistakeEpisodeAnchor = mistakeWord
+                mistakeCleanStreak = 0
+                lastWrongStopIndex = mistakeWord
+                if (lastWrongStopFirstSeenMs == 0L) {
+                    lastWrongStopFirstSeenMs = System.currentTimeMillis()
+                }
+                if (lastWrongStopSightings == 0) lastWrongStopSightings = 1
+                android.util.Log.i(
+                    "ItqanSherpa",
+                    "mistakeStop(): candidate idx=$mistakeWord re-seated after a flicker " +
+                        "(row=$mistakeIdx sightings=$lastWrongStopSightings) — dwell clock preserved"
+                )
             } else {
                 // DIAGNOSTIC: one line per candidate pass — reveals why the
                 // early verification did or did not launch on-device.
                 android.util.Log.i(
                     "ItqanSherpa",
-                    "mistakeStop(): candidate idx=$mistakeIdx sightings=$lastWrongStopSightings absentIdx=$mistakeVerifyAbsentIdx verified=${mistakeIdx in verifiedSpokenIndices} listening=$isListening running=${tajweedPipelineHolder.running} sinceVerify=${System.currentTimeMillis() - lastMistakeVerifyMs}ms jobActive=${verifyJobRef.get()?.isActive == true}"
+                    "mistakeStop(): candidate row=$mistakeIdx word=$mistakeWord sightings=$lastWrongStopSightings absentIdx=$mistakeVerifyAbsentIdx verified=${mistakeWord in verifiedSpokenIndices} listening=$isListening running=${tajweedPipelineHolder.running} sinceVerify=${System.currentTimeMillis() - lastMistakeVerifyMs}ms jobActive=${verifyJobRef.get()?.isActive == true}"
                 )
                 if (isNewEmission) {
                     lastWrongStopSightings += 1
@@ -4011,24 +4417,82 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // Launching on the composition scope lets the result survive
                 // restarts and write its verdict into state regardless.
                 if (!(mistakeVerifyAbsentIdx >= 0 &&
-                        kotlin.math.abs(mistakeIdx - mistakeVerifyAbsentIdx) <= 3) &&
-                    mistakeIdx !in verifiedSpokenIndices &&
-                    mistakeIdx != verifyInFlightIdx.get() &&
-                    lastWrongStopSightings >= 2 &&
+                        kotlin.math.abs(mistakeWord - mistakeVerifyAbsentIdx) <= 3) &&
+                    mistakeWord !in verifiedSpokenIndices &&
+                    mistakeWord != verifyInFlightIdx.get() &&
+                    // ATTEMPT BUDGET. Every verification decode runs on the
+                    // SAME recognizer the live windows use, and an INCONCLUSIVE
+                    // result (too short / no shared words) does not count as a
+                    // strike — so an inconclusive candidate used to be retried
+                    // forever, one decode every 3 s. Measured baqarah_c14:
+                    // four back-to-back decodes on ذَٰلِكَ between t+14s and
+                    // t+36s of a 54,5 s session. The live windows starved and
+                    // dropped 6 words (ذَٰلِكَ الَّذِينَ وَمِمَّا رَزَقْنَٰهُمْ
+                    // يُنفِقُونَ وَبِٱلْءَاخِرَةِ + 1), the merge bolted them onto
+                    // the tail out of order, and the whole run collapsed to
+                    // 10/36. Three attempts is enough to reach the two-strike
+                    // verdict; past that we stop spending the recognizer and
+                    // let autoFinalize FORGIVE the unproven word rather than
+                    // wreck the live transcript.
+                    mistakeVerifyAttempts < MAX_MISTAKE_VERIFY_ATTEMPTS &&
+                    // FIRE AT THE FIRST SIGHTING. The old gate waited for a
+                    // SECOND distinct emission, but a mistake freezes the walk:
+                    // the user stops speaking, no new emission ever arrives,
+                    // and the decisive decode was therefore never launched —
+                    // which is exactly why `confirmed (auto-pause + popup): 0`
+                    // in every run. A short dwell is enough protection.
+                    lastWrongStopSightings >= 1 &&
+                    System.currentTimeMillis() - lastWrongStopFirstSeenMs >= 800L &&
                     isListening && tajweedPipelineHolder.running &&
                     System.currentTimeMillis() - lastMistakeVerifyMs >= 3000L &&
                     (verifyJobRef.get() == null || !verifyJobRef.get()!!.isActive)
                 ) {
                     lastMistakeVerifyMs = System.currentTimeMillis()
-                    val idxToVerify = mistakeIdx
+                    val idxToVerify = mistakeWord
                     val normText = detailedAnalysis[mistakeIdx].normalizedText
                     val kindStr = if (isSkipped) "SKIPPED" else "WRONG"
                     val wordText = detailedAnalysis[mistakeIdx].text
                     // Episode-aware span: cover the WHOLE time since this
                     // candidate first appeared (+8 s margin) so a word read a
                     // while ago is still inside the decoded audio.
-                    val spanSec = ((System.currentTimeMillis() - lastWrongStopFirstSeenMs) / 1000L + 8L)
-                        .toInt().coerceIn(10, 45)
+                    // ANCHOR ON WHEN THE WORD WAS SPOKEN, NOT on when the
+                    // candidate was created. mistakeIdx flickers by a word or
+                    // two between emissions, and every flicker RESTARTS the
+                    // candidate clock — so the span collapses to its 10 s floor
+                    // and decodes audio that starts after the word was already
+                    // read. Measured fatihah_v6: مَٰلِكِ (idx 10) was flagged at
+                    // 22:53:28 but the candidate was recreated at 22:53:40, so
+                    // the window was 22:53:32-22:53:42 and the decode came back
+                    // as words 14-20 — the word "looked" absent and a correct
+                    // recitation was charged a SKIPPED.
+                    // NO TIMING OF ITS OWN ⇒ THE WORD WAS NEVER HEARD, so there
+                    // is no "when it was spoken" to anchor to. Falling back to
+                    // the candidate clock produced a ~12 s slice that STARTED
+                    // AFTER the word had already been read, and that short
+                    // decode then "proved" the word absent (measured
+                    // fatihah_c7: مَٰلِكِ condemned on a 5-word decode of a
+                    // correct recitation). When the word has no timing, anchor
+                    // on the last word we DID hear and grow the span on every
+                    // retry — more audio each time, never the same short slice.
+                    val ownTimingMs = spokenTimings.firstOrNull { it.startIndex == idxToVerify }?.startMs
+                    val prevTimingMs = spokenTimings.lastOrNull { it.startIndex <= idxToVerify }?.startMs
+                    val anchorMs = ownTimingMs
+                        ?: prevTimingMs
+                        ?: lastWrongStopFirstSeenMs.takeIf { it > 0L }
+                        ?: System.currentTimeMillis()
+                    val attempt = mistakeVerifyAttempts
+                    val spanSec = if (ownTimingMs != null) {
+                        ((System.currentTimeMillis() - anchorMs) / 1000L + 8L)
+                            .toInt().coerceIn(10, 45)
+                    } else {
+                        (20 + attempt * 8).coerceAtMost(45)
+                    }
+                    mistakeVerifyAttempts = attempt + 1
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "mistakeStop(): verify idx=$idxToVerify launched attempt=$attempt " +
+                            "span=${spanSec}s ownTiming=${ownTimingMs != null}"
+                    )
                     verifyInFlightIdx.set(idxToVerify)
                     verifyJobRef.set(coroutineScope.launch {
                         val verifiedWords = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -4048,16 +4512,60 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         // word -> found=false even when the decode contained the
                         // exact word (measured on-device: a false SKIPPED popup on
                         // a correctly-read ayah). Normalize the decoded side too.
+                        // ── DEFINITE-ARTICLE TOLERANCE ─────────────────────────
+                        // `ال` is a proclitic the CTC decoder freely glues on or
+                        // drops. Measured on-device on Al-Fatihah (2026-09-08,
+                        // fatihah_v5): the flagged word صِرَٰطَ came back from the
+                        // full-context decode as الصرااط, so strict equality
+                        // reported it ABSENT and the verdict stayed SKIPPED. The
+                        // cursor froze at 20/29, the range never completed and
+                        // the user saw nothing move — "no words displayed". Try
+                        // every with/without-article combination before
+                        // condemning a word. The bare form must be >= 3 chars so
+                        // stripping ال from الله (-> له) can never match.
+                        fun articleForms(s: String): List<String> {
+                            val out = ArrayList<String>(2)
+                            out.add(s)
+                            val bare = if (s.startsWith("ال") || s.startsWith("ٱل")) s.substring(2) else null
+                            if (bare != null && bare.length >= 3) out.add(bare)
+                            return out
+                        }
+                        val targetForms = articleForms(normText)
+                        var foundViaArticle = false
                         val found = verifiedWords.any { vw ->
-                            isWordMatch(normalizeForComparison(vw, viewModel.riwayah), normText)
+                            val vn = normalizeForComparison(vw, viewModel.riwayah)
+                            if (isWordMatch(vn, normText)) true
+                            else articleForms(vn).any { f ->
+                                targetForms.any { t ->
+                                    if (isWordMatch(f, t)) { foundViaArticle = true; true } else false
+                                }
+                            }
+                        } || run {
+                            // MUQATTA'AT: the tail decode clips the disjointed letters
+                            // the same way the live windows do (`الم` -> `أف م`), so a
+                            // plain word-equality check reports the word as absent and
+                            // CONFIRMS a mistake the user never made. Retry with the
+                            // tolerant letter-name matcher at every offset.
+                            val mSlots = com.example.quran.muqattaatSlots(wordText)
+                            if (mSlots == null) false
+                            else verifiedWords.indices.any { s ->
+                                com.example.quran.matchMuqattaatRelaxed(
+                                    verifiedWords.subList(s, verifiedWords.size), mSlots
+                                ) > 0
+                            }
                         }
                         android.util.Log.i(
                             "ItqanSherpa",
-                            "mistakeStop(): verify idx=$idxToVerify $kindStr word='$wordText' verified=${verifiedWords.size}w found=$found"
+                            "mistakeStop(): verify idx=$idxToVerify $kindStr word='$wordText' verified=${verifiedWords.size}w found=$found viaArticle=$foundViaArticle"
                         )
                         if (verifiedWords.isEmpty()) {
                             // Inconclusive — clear the cooldown so a later emission retries promptly.
-                            lastMistakeVerifyMs = 0L
+                            // Normal cooldown, NOT an immediate retry: every decode is
+                            // 1.5-3.6 s of recognizer time, and hammering it starved the
+                            // audio pipeline (measured fatihah_c10: 5 back-to-back decodes
+                            // and the injected audio only played 32 s of its 46.5 s, so the
+                            // last words were never read at all).
+                            lastMistakeVerifyMs = System.currentTimeMillis()
                             return@launch
                         }
                         if (found) {
@@ -4074,6 +4582,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             lastWrongStopSpokenText = ""
                             lastWrongStopSightings = 0
                             lastWrongStopFirstSeenMs = 0L
+                            mistakeVerifyAttempts = 0
+                            mistakeVerifyAbsentStrikes = 0
+                            mistakeVerdictAtMs = 0L
                             confirmedMistakeUiIdx = -1
                             mistakeEpisodeAnchor = -1
                             mistakeCleanStreak = 0
@@ -4112,9 +4623,80 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                 )
                             }
                         } else {
+                            // ── GARBAGE-DECODE GUARD ──
+                            // "The word is not in the tail decode" only proves absence
+                            // if that decode actually covered this region. On device the
+                            // full-context pass often returns UNRELATED garbage
+                            // (measured, baqarah_v4: 'تفسيررضيلةكبابلور ر سب الرحمن الرحيم'
+                            // for audio near word 1 of Al-Baqarah). `found=false` against
+                            // that is meaningless — yet it was accepted as proof, so the
+                            // session auto-paused ~3.6 s in on a word the user HAD read
+                            // (matched=1/36, run aborted). Require the decode to share at
+                            // least one word with the target's neighbourhood; otherwise it
+                            // is INCONCLUSIVE — clear the cooldown and retry later rather
+                            // than condemning the user.
+                            val nearFrom = (idxToVerify - 8).coerceAtLeast(0)
+                            val nearTo = (idxToVerify + 8).coerceAtMost(targetNorm.size)
+                            val nearTargets = if (nearTo > nearFrom)
+                                targetNorm.subList(nearFrom, nearTo).filter { it.isNotEmpty() }.toHashSet()
+                            else emptySet()
+                            val saneHits = verifiedWords.count { vw ->
+                                normalizeForComparison(vw, viewModel.riwayah) in nearTargets
+                            }
+                            // ── TOO-SHORT-DECODE GUARD ── A DECODE THAT DROPPED THE
+                            // WORD ONLY PROVES ABSENCE IF IT IS BIG ENOUGH TO HAVE
+                            // CONTAINED IT. On device a truncated/folded slice returns
+                            // 3-5 words; `found=false` on that is a decoder artifact,
+                            // not evidence. Measured fatihah_c7: مَٰلِكِ was condemned
+                            // on a 5-word decode of a CORRECT recitation and the
+                            // session auto-paused on it. One shared word is also too
+                            // weak — require two, so a single lucky token cannot
+                            // license a condemnation.
+                            val minDecodeWords = if (targetNorm.size <= 12) 3 else 8
+                            if (saneHits < 2 || verifiedWords.size < minDecodeWords) {
+                                android.util.Log.i(
+                                    "ItqanSherpa",
+                                    "mistakeStop(): verify idx=$idxToVerify INCONCLUSIVE — tail decode " +
+                                        "(${verifiedWords.size}w, need >=$minDecodeWords) saneHits=$saneHits " +
+                                        "over targets $nearFrom..$nearTo; not condemning (will retry)"
+                                )
+                                // Normal cooldown, NOT an immediate retry: every decode is
+                                // 1.5-3.6 s of recognizer time, and hammering it starved the
+                                // audio pipeline (measured fatihah_c10: 5 back-to-back decodes
+                                // and the injected audio only played 32 s of its 46.5 s, so the
+                                // last words were never read at all).
+                                lastMistakeVerifyMs = System.currentTimeMillis()
+                                return@launch
+                            }
+                            // ── TWO-STRIKE RULE ── One decode is a sample; TWO
+                            // independent decodes of DIFFERENT audio spans both
+                            // missing the word is evidence. The growing span above
+                            // guarantees the second strike looks at MORE audio, so a
+                            // word the decoder merely clipped is heard on the retry
+                            // and forgiven instead of condemned.
+                            val strikes = mistakeVerifyAbsentStrikes + 1
+                            mistakeVerifyAbsentStrikes = strikes
+                            if (strikes < 2) {
+                                android.util.Log.i(
+                                    "ItqanSherpa",
+                                    "mistakeStop(): verify idx=$idxToVerify ABSENT strike $strikes/2 — " +
+                                        "needs one more decode before condemning"
+                                )
+                                // Normal cooldown, NOT an immediate retry: every decode is
+                                // 1.5-3.6 s of recognizer time, and hammering it starved the
+                                // audio pipeline (measured fatihah_c10: 5 back-to-back decodes
+                                // and the injected audio only played 32 s of its 46.5 s, so the
+                                // last words were never read at all).
+                                lastMistakeVerifyMs = System.currentTimeMillis()
+                                return@launch
+                            }
                             // Verified ABSENT: the word genuinely was not said. Remember
                             // the verdict for this episode so we never re-decode it.
+                            // Stamp the wall clock too: the stop/popup decision below
+                            // is driven by THIS, not by further emissions (see the
+                            // verdict-driven ticker after this effect).
                             mistakeVerifyAbsentIdx = idxToVerify
+                            mistakeVerdictAtMs = System.currentTimeMillis()
                         }
                     })
                 }
@@ -4130,17 +4712,30 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // if its sequence aligns to the target with MORE leading
                 // matches than the live transcript, adopt it wholesale (same
                 // semantics as the collector's repair swap, mid-session).
-                val stuckCandidate =
-                    lastWrongStopSightings >= 6 &&
-                        (mistakeIdx in verifiedSpokenIndices || mistakeIdx == mistakeVerifyAbsentIdx)
+                // NOTE: the old "verdict landed" clause is deliberately GONE. It
+                // required the tail verdict to have resolved (verified-spoken or
+                // verified-absent), but the whole failure mode here is a
+                // verifyTailWords() decode that comes back EMPTY — INCONCLUSIVE,
+                // so no verdict ever lands. The repair therefore could never fire
+                // in the one case that actually needed it, and the cursor stayed
+                // frozen until the user paused manually. A candidate that has
+                // survived 6 distinct emissions is stuck by definition; that
+                // alone justifies running the repair.
+                val stuckCandidate = lastWrongStopSightings >= 6
                 if (stuckCandidate &&
                     isListening && tajweedPipelineHolder.running &&
                     System.currentTimeMillis() - lastReconcileMs >= 12000L &&
                     (verifyJobRef.get() == null || !verifyJobRef.get()!!.isActive)
                 ) {
                     lastReconcileMs = System.currentTimeMillis()
-                    val idxAtLaunch = mistakeIdx
-                    val spanSec = ((System.currentTimeMillis() - lastWrongStopFirstSeenMs) / 1000L + 8L)
+                    val idxAtLaunch = mistakeWord
+                    // Same anchoring rule as the early verification above: use
+                    // when the word was spoken, not when the candidate was
+                    // created (see the comment there for the fatihah_v6 trace).
+                    val stuckAnchorMs = spokenTimings.firstOrNull { it.startIndex == idxAtLaunch }?.startMs
+                        ?: lastWrongStopFirstSeenMs.takeIf { it > 0L }
+                        ?: System.currentTimeMillis()
+                    val spanSec = ((System.currentTimeMillis() - stuckAnchorMs) / 1000L + 8L)
                         .toInt().coerceIn(10, 45)
                     verifyJobRef.set(coroutineScope.launch {
                         val words = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -4192,6 +4787,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             lastWrongStopSightings = 0
                             lastWrongStopFirstSeenMs = 0L
                             mistakeVerifyAbsentIdx = -1
+                            mistakeVerifyAttempts = 0
+                            mistakeVerifyAbsentStrikes = 0
+                            mistakeVerdictAtMs = 0L
                             mistakeEpisodeAnchor = -1
                             mistakeCleanStreak = 0
                             confirmedMistakeUiIdx = -1
@@ -4205,17 +4803,6 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     })
                 }
 
-                // WRONG: a word the user actually spoke that does not match the
-                // target — 2 distinct emissions suffice (the user's voice is in
-                // the transcript, so a decode glitch cannot fabricate it twice).
-                // SKIPPED: a word the STT did NOT render — one decode window can
-                // drop it and the next can re-hear it (measured on-device:
-                // لِلَّهِ dropped in one window, re-heard on the next), so require
-                // 3 distinct emissions AND a >= 2 s dwell before pausing.
-                val sightingsNeeded = if (isSkipped) 3 else 2
-                val dwellOk = if (isSkipped)
-                    (System.currentTimeMillis() - lastWrongStopFirstSeenMs) >= 2000L
-                else true
                 // DISPLAY GATE — VERIFIED-REAL ONLY. Transient candidates stay
                 // INVISIBLE until the tail verification has spoken: if it
                 // forgives, nothing was ever shown; if it says absent, the
@@ -4223,56 +4810,212 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // sightings-based gate still flashed false mistakes during the
                 // self-heal window (user: "only true mistakes should be seen").
                 val episodeAbsent = mistakeVerifyAbsentIdx >= 0 &&
-                    kotlin.math.abs(mistakeIdx - mistakeVerifyAbsentIdx) <= 3
+                    kotlin.math.abs(mistakeWord - mistakeVerifyAbsentIdx) <= 3
                 if (episodeAbsent) {
-                    confirmedMistakeUiIdx = mistakeIdx
+                    confirmedMistakeUiIdx = mistakeWord
                 }
-                val isConfirmed = isNewEmission &&
-                    lastWrongStopSightings >= sightingsNeeded &&
-                    dwellOk &&
-                    (!isSkipped || skipAdvancedPast) &&
+                // EMISSION-DRIVEN CONFIRMATION (now only a SECOND path). The
+                // sightings counters were the sole way to a stop, and they can
+                // only advance on NEW transcript text. A mistake is precisely
+                // the moment the user stops speaking, so they stalled at 1 and
+                // nothing ever fired (`confirmed (auto-pause + popup): 0`). The
+                // decisive evidence is the tail verdict, and the verdict-driven
+                // ticker below decides on the wall clock. `isNewEmission` is
+                // deliberately NO LONGER required here either.
+                val isConfirmed =
+                    lastWrongStopSightings >= 2 &&
+                    (if (isSkipped)
+                        (System.currentTimeMillis() - lastWrongStopFirstSeenMs) >= 2000L &&
+                            (skipAdvancedPast ||
+                                System.currentTimeMillis() - lastWrongStopFirstSeenMs >= 5000L)
+                    else true) &&
                     // Evidence requirement: only a VERIFIED-absent candidate may
                     // stop the recitation (see the early-verification block).
                     // Drift-tolerant: the candidate index may shift ±3 inside the
                     // episode while the echo tokens flicker.
-                    (mistakeVerifyAbsentIdx >= 0 &&
-                        kotlin.math.abs(mistakeIdx - mistakeVerifyAbsentIdx) <= 3)
+                    episodeAbsent
                 if (isListening && tajweedPipelineHolder.running && isConfirmed) {
                     val sessionElapsed =
                         (System.currentTimeMillis() - tajweedRecordingStartMs).coerceAtLeast(0L)
                     if (sessionElapsed >= 2500L) {
-                        val wordText = detailedAnalysis[mistakeIdx].text
-                        android.util.Log.i("ItqanSherpa", "mistakeStop(): ${if (isSkipped) "SKIPPED" else "WRONG"} confirmed wordIndex=$mistakeIdx word='$wordText' (sightings=${lastWrongStopSightings}) -> auto-pausing + popup")
-                        lastWrongStopIndex = mistakeIdx
-                        // The popup must tell the user WHAT went wrong and that they
-                        // must repeat the word when they continue.
-                        latestPopupKind = if (isSkipped) "skipped" else "wrong"
-                        latestTajweedPopup = Pair(wordText, mistakeIdx)
-                        // Snapshot the live transcript for the resume re-seat: the
-                        // user continues reading FROM this word, so everything
-                        // before it becomes the committed prefix of the next
-                        // session.
-                        mistakeResumeLiveText = (finalSpokenText + " " + partialSpokenText).trim()
-                        mistakeResumeIndex = mistakeIdx
-                        try { tajweedPipelineHolder.pipeline?.pause() } catch (_: Throwable) {}
-                        try { speechRecognizer?.stopListening() } catch (_: Throwable) {}
-                        isListening = false
+                        stopForMistake(mistakeWord, isSkipped)
                     }
                 }
             }
         }
     }
 
-    // (item 5) Auto-dismiss the tajweed popup after 4 seconds so the user can keep reading.
-    // Latency is intentional: long enough to read the message, short enough not to obscure
-    // subsequent words. If a new mistake arrives while the dialog is still up, the pair-key
-    // changes and this timer restarts with the new content.
-    LaunchedEffect(latestTajweedPopup) {
-        if (latestTajweedPopup != null) {
-            kotlinx.coroutines.delay(4000)
-            latestTajweedPopup = null
+    // ── VERDICT-DRIVEN STOP (the decision that actually reaches the user) ──
+    // Every gate above is EMISSION-driven: it can only advance when the
+    // transcript text changes. A mistake is exactly the moment the user STOPS
+    // speaking — they are waiting for the feedback — so no new emission ever
+    // arrives, `sightings` stays at 1 forever and confirmation can never
+    // mature. Measured on EVERY Al-Fatihah run: the log repeats
+    // `candidate idx=N sightings=1` and ends with
+    // `confirmed (auto-pause + popup): 0`.
+    // So the stop is decided on the WALL CLOCK, from the decisive tail verdict:
+    //   * verification FOUND the word  -> forgiven above, never stops;
+    //   * verification says ABSENT and that verdict has held VERDICT_HOLD_MS
+    //     -> that IS the mistake: pause + popup. No new emission required.
+    // This is what turns "any mistake stops the recitation with a popup" from a
+    // comment into behaviour — instead of the mistake silently surviving until
+    // the auto-finalize grace expires and the user is handed the end-of-session
+    // SUMMARY (which is only for "the user finished": they said so explicitly,
+    // more than once).
+    LaunchedEffect(currentTab, recitationMode) {
+        var stoppedFor = -1
+        while (true) {
+            kotlinx.coroutines.delay(400L)
+            if (currentTab != "Memorize" || recitationMode != "Tajweed") {
+                stoppedFor = -1
+                continue
+            }
+            if (!isListening) { stoppedFor = -1; continue }
+            val row = detailedAnalysis.firstOrNull {
+                it.status == RecitationStatus.WRONG || it.status == RecitationStatus.SKIPPED
+            }
+            if (row == null) { stoppedFor = -1; continue }
+            val cand = row.wordIndex
+            if (cand in verifiedSpokenIndices) { stoppedFor = -1; continue }
+            if (cand != stoppedFor) stoppedFor = -1
+            val absentFor = mistakeVerifyAbsentIdx
+            if (absentFor < 0 || kotlin.math.abs(cand - absentFor) > 3) { stoppedFor = -1; continue }
+            if (cand == stoppedFor) continue
+            val verdictMs = mistakeVerdictAtMs
+            if (verdictMs <= 0L) continue
+            val held = System.currentTimeMillis() - verdictMs
+            if (held < 1500L) continue
+            // Must the word have been reachable at all? A SKIPPED verdict also
+            // needs the transcript to have moved past the word, or a long dwell,
+            // so a word the user has not reached yet is never condemned.
+            val firstSeen = lastWrongStopFirstSeenMs
+            if (firstSeen <= 0L) continue
+            val seenMs = System.currentTimeMillis() - firstSeen
+            if (row.status == RecitationStatus.SKIPPED) {
+                val spokenWords = (finalSpokenText + " " + partialSpokenText).trim()
+                    .split(Regex("\\s+")).filter { it.isNotEmpty() }.size
+                if (seenMs < 2000L) continue
+                if (!(spokenWords >= cand + 4 || seenMs >= 5000L)) continue
+            }
+            if ((System.currentTimeMillis() - tajweedRecordingStartMs) < 2500L) continue
+            android.util.Log.i(
+                "ItqanSherpa",
+                "verdictTicker(): absent verdict held ${held}ms for wordIndex=$cand " +
+                    "(seenMs=$seenMs) -> auto-pause + popup"
+            )
+            stoppedFor = cand
+            stopForMistake(cand, row.status == RecitationStatus.SKIPPED)
         }
     }
+
+    // ── STALL WATCHDOG ──
+    // Every repair above is driven by NEW EMISSIONS: the sightings counter only
+    // advances when the transcript text actually changes. But the dominant
+    // freeze on a slow device has the user STOP SPEAKING — they are waiting for
+    // feedback that never comes — so no fresh emission ever arrives, the
+    // sightings counter freezes below the repair threshold, and the cursor sits
+    // on one word forever with no banner, no popup and no pause. The only thing
+    // that healed it was tapping pause manually, whose own full-tail repair then
+    // fixed everything at once (the long-standing "stuck at ayah 2" report).
+    // So add a WALL-CLOCK bound that is NOT keyed on emissions: once an
+    // unresolved candidate has been pending longer than STALL_FORGIVE_MS,
+    // forgive it so the recitation can move on. Project policy: a false
+    // accusation is far worse than a missed skip, and a permanently frozen
+    // cursor is worse than either.
+    LaunchedEffect(Unit) {
+        // A timer of our OWN, deliberately NOT lastWrongStopFirstSeenMs. That
+        // field is reset every time the first-unmatched index drifts (measured:
+        // idx 6 -> 43 inside one session), so the 20 s bound never matured —
+        // the watchdog logged ZERO firings across a 90 s run while the cursor
+        // sat frozen. This one only resets when there is no candidate at all.
+        var stallFirstSeenMs = 0L
+        while (true) {
+            kotlinx.coroutines.delay(2000L)
+            val cand = lastWrongStopIndex
+            if (cand < 0) { stallFirstSeenMs = 0L; continue }
+            // `isListening` only. Do NOT also require tajweedPipelineHolder.running:
+            // the pipeline reports running=false right after the endpoint, which is
+            // precisely the moment the user is waiting for feedback. Gating on it
+            // made this whole watchdog unreachable (measured: candidate idx=43 with
+            // running=false was skipped forever).
+            if (!isListening) { stallFirstSeenMs = 0L; continue }
+            // Already resolved by the normal pipeline — leave it alone.
+            if (cand in verifiedSpokenIndices) { stallFirstSeenMs = 0L; continue }
+            if (mistakeVerifyAbsentIdx >= 0 &&
+                kotlin.math.abs(cand - mistakeVerifyAbsentIdx) <= 3
+            ) { stallFirstSeenMs = 0L; continue }
+            if (stallFirstSeenMs == 0L) stallFirstSeenMs = System.currentTimeMillis()
+            val pendingMs = System.currentTimeMillis() - stallFirstSeenMs
+            if (pendingMs < 20000L) continue
+            // LAST-CHANCE VERIFICATION. A candidate can outlive its welcome for
+            // a reason that has nothing to do with guilt: the confirm loop may
+            // never have launched a decode at all (measured fatihah_c30 — zero
+            // `verify idx=` lines, because a row-index flicker kept resetting
+            // the 800 ms dwell pre-condition). Forgiving it here without ever
+            // testing it leaves `mistakeVerifyAbsentStrikes == 0`, which
+            // `autoFinalize` reads as "an UNPROVEN mistake" and FORGIVES with a
+            // summary — so a word the user really did skip is silently counted
+            // correct, and a word the user really did recite is silently
+            // rubber-stamped. Neither is a verdict; both are the bug.
+            //
+            // Spend ONE decode before giving up. When it confirms absence the
+            // strike lands, `autoFinalize` finds evidence and the MISTAKE popup
+            // is what the user sees; when it comes back found/inconclusive we
+            // forgive exactly as before. This runs at most once per stall
+            // (guarded by the attempts budget) and only when NOTHING has been
+            // spent on this candidate yet, so it cannot add load to a word that
+            // is already being verified.
+            val neverVerified = mistakeVerifyAttempts == 0 &&
+                mistakeVerifyAbsentIdx < 0 &&
+                mistakeVerifyAbsentStrikes == 0
+            if (neverVerified && isListening && tajweedPipelineHolder.running &&
+                (verifyJobRef.get() == null || !verifyJobRef.get()!!.isActive) &&
+                lastMistakeVerifyMs != 0L
+            ) {
+                android.util.Log.i(
+                    "ItqanSherpa",
+                    "stallWatchdog(): candidate idx=$cand stalled ${pendingMs}ms with NO decode " +
+                        "ever spent on it -> forcing one last-chance verification before forgiving"
+                )
+                // Hand the confirm loop the dwell it was never allowed to reach,
+                // then let it launch on the next pass.
+                lastWrongStopFirstSeenMs = System.currentTimeMillis() - 800L
+                stallFirstSeenMs = System.currentTimeMillis()
+                continue
+            }
+            android.util.Log.i(
+                "ItqanSherpa",
+                "stallWatchdog(): candidate idx=$cand unresolved for ${pendingMs}ms " +
+                    "(sightings=$lastWrongStopSightings absentIdx=$mistakeVerifyAbsentIdx " +
+                    "attempts=$mistakeVerifyAttempts strikes=$mistakeVerifyAbsentStrikes) " +
+                    "-> forgiving so the cursor can advance"
+            )
+            verifiedSpokenIndices.add(cand)
+            lastWrongStopIndex = -1
+            lastWrongStopSpokenText = ""
+            lastWrongStopSightings = 0
+            lastWrongStopFirstSeenMs = 0L
+            mistakeVerifyAbsentIdx = -1
+            mistakeVerifyAttempts = 0
+            mistakeVerifyAbsentStrikes = 0
+            mistakeVerdictAtMs = 0L
+            mistakeEpisodeAnchor = -1
+            mistakeCleanStreak = 0
+            confirmedMistakeUiIdx = -1
+            stallFirstSeenMs = 0L
+        }
+    }
+
+    // (item 5) NO auto-dismiss — the mistake popup STAYS until the user dismisses
+    // it (standing contract: the popup must be fully visible and remain until
+    // dismissed). It used to vanish after 4 s, but both paths that raise this
+    // dialog (TAJWEED_ERROR and confirmed WRONG/SKIPPED) ALREADY stop/pause the
+    // mic, so there are no "subsequent words" the dialog could obscure — the
+    // auto-dismiss only ever made the user miss the feedback they had paused for
+    // ("no popup appeared"). Dismissal is now exclusively via onDismissRequest /
+    // the dialog button, plus the session/range resets that null it out.
+    // A NEW mistake still replaces the content: latestTajweedPopup is a Pair key,
+    // so a different (rule, index) recomposes the dialog with the new message.
 
     val mainHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
 
@@ -4411,6 +5154,14 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         lastWrongStopSpokenText = ""
         lastWrongStopSightings = 0
         lastWrongStopFirstSeenMs = 0L
+        // A fresh session must re-earn its verdict: the old "this word was
+        // proven absent" belongs to the previous capture, and the ticker would
+        // otherwise stop the new session on the very first word again.
+        mistakeVerifyAbsentIdx = -1
+        mistakeVerifyAttempts = 0
+        mistakeVerifyAbsentStrikes = 0
+        mistakeVerdictAtMs = 0L
+        confirmedMistakeUiIdx = -1
         // Clear the Tajweed Rules Coach transcript slots at session start.
         // The pipeline routes its partials to the vars matching the ACTIVE tab
         // (Memorize: finalSpokenText/partialSpokenText, Tajweed card:
@@ -5026,7 +5777,50 @@ val wordsLength = words.size
                     // rejected.
                     val liveWords = (finalSpokenText + " " + partialSpokenText).trim()
                         .split(Regex("\\s+")).filter { it.isNotEmpty() }
-                    fun targetPrefixLen(words: List<String>): Int {
+                    // ── HOW MUCH OF THE RECITATION DOES THIS TRANSCRIPT HOLD? ──
+                    // The longest leading RUN was the original quality metric, and
+                    // it is too harsh: it punishes a transcript that is missing one
+                    // early word while holding the entire rest. Measured
+                    // fatihah_c34 — the live log scored a prefix of 3 while the
+                    // whole-session repair (which restored نعبد / اهدنا / الصرط /
+                    // المستقيم and the range's last word) scored 0 because its
+                    // opening token was the fragment `م`; the repair was rejected,
+                    // the merge's new words were appended out of order, the walk
+                    // froze at 10/29 and the user got neither a popup nor a
+                    // summary. The LONGEST COMMON SUBSEQUENCE with the target is
+                    // the honest measure: it counts how many target words the
+                    // transcript holds IN READING ORDER, so an early fragment costs
+                    // one word instead of everything.
+                    //   c34: live 20 vs repair 27  -> repair wins (correct)
+                    //   c33: live 28 vs repair 22  -> live wins   (correct: the
+                    //        repair was a worse ordering and was rightly rejected)
+                    //   An-Nas / truncated controls: live wins by a wide margin.
+                    fun targetCoverageLen(words: List<String>): Int {
+                        val a = words.map { normalizeForComparison(it, viewModel.riwayah) }
+                        val b = targetNorm
+                        // Rolling DP row: dp[j] = LCS(a[0..i], b[0..j-1]).
+                        val dp = IntArray(b.size + 1)
+                        for (i in a.indices) {
+                            var prevDiag = 0
+                            for (j in 1..b.size) {
+                                val tmp = dp[j]
+                                dp[j] = if (a[i].isNotEmpty() && b[j - 1].isNotEmpty() && a[i] == b[j - 1]) {
+                                    prevDiag + 1
+                                } else {
+                                    maxOf(dp[j], dp[j - 1])
+                                }
+                                prevDiag = tmp
+                            }
+                        }
+                        return dp[b.size]
+                    }
+                    // Longest leading run — the ORDER quality within an equal
+                    // coverage score. Two candidates can hold the same NUMBER of
+                    // target words while one of them has them in the right place
+                    // (live 8 words misordered at 4..7 vs a shorter repair with
+                    // the same 7-word coverage but a clean 7-word run): coverage
+                    // alone cannot tell them apart, the run can.
+                    fun targetRunLen(words: List<String>): Int {
                         var i = 0
                         while (i < words.size && i < targetNorm.size &&
                             targetNorm[i].isNotEmpty() &&
@@ -5034,10 +5828,18 @@ val wordsLength = words.size
                         ) i++
                         return i
                     }
-                    val livePrefix = targetPrefixLen(liveWords)
-                    val repairPrefix = targetPrefixLen(ev.partial)
-                    if (repairPrefix > livePrefix ||
-                        (repairPrefix == livePrefix && ev.partial.size >= liveWords.size)) {
+                    val liveScore = targetCoverageLen(liveWords)
+                    val repairScore = targetCoverageLen(ev.partial)
+                    val liveRun = targetRunLen(liveWords)
+                    val repairRun = targetRunLen(ev.partial)
+                    val livePrefix = liveScore
+                    val repairPrefix = repairScore
+                    val takeRepair = when {
+                        repairScore != liveScore -> repairScore > liveScore
+                        repairRun != liveRun -> repairRun > liveRun
+                        else -> ev.partial.size >= liveWords.size
+                    }
+                    if (takeRepair) {
                         finalSpokenText = ev.partial.joinToString(" ").trim()
                         partialSpokenText = ""
                         committedWordCount = ev.partial.size
@@ -5055,6 +5857,41 @@ val wordsLength = words.size
                             partialSpokenText = ""
                             committedWordCount = tailWords.size
                             lastCommittedWords = lastCommittedWords + tailWords
+                        }
+                        // ── A REJECTED REPAIR MAY STILL HOLD THE ONLY COPY OF
+                        //    A WORD THE LIVE LOG NEVER HEARD ──────────────────
+                        // Rejecting the repair means "do not REPLACE the live
+                        // transcript with this worse ordering" — it must NOT
+                        // mean "discard everything this decode heard". The
+                        // endpoint's filtered delta is computed against the
+                        // committed log, so whatever survives it is a word the
+                        // live sliding windows never rendered at all; dropping
+                        // it loses real speech with no trace.
+                        //
+                        // Measured fatihah_c33: the tail windows only ever
+                        // produced fused/garbled renders (`وَلَاضًّا`, `الضَّا`,
+                        // `ض م`), all rejected by the merge, so the live log
+                        // stopped at word 28 `وَلَا`. The whole-session repair
+                        // was correctly REJECTED (24w/prefix0 vs 28w/prefix8),
+                        // but its delta carried `ٱلضَّآلِّينَ` — the one word the
+                        // user had actually recited and the one word the target
+                        // still needed. It was thrown away, so the walk ended
+                        // 28/29 with no row for the last word, no popup and a
+                        // "clean" summary while the word sat greyed out on
+                        // screen. Recomputing the delta AFTER the tail commit
+                        // (same count-aware filter as every other emission)
+                        // keeps the recovered word exactly once.
+                        val recovered = filterMemorizeWords(ev.partial, endpoint = true)
+                        if (recovered.isNotEmpty()) {
+                            finalSpokenText = "$finalSpokenText ${recovered.joinToString(" ")}".trim()
+                            committedWordCount = recovered.size
+                            lastCommittedWords = lastCommittedWords + recovered
+                            android.util.Log.i(
+                                "ItqanSherpa",
+                                "collector(): rejected repair still contributed " +
+                                    "${recovered.size} word(s) the live log never heard -> " +
+                                    "transcript now ${finalSpokenText.split(Regex("\\s+")).filter { it.isNotEmpty() }.size}w"
+                            )
                         }
                         sessionFinalized = true
                         android.util.Log.i("ItqanSherpa", "collector(): final-decode repair REJECTED (repair ${ev.partial.size}w/prefix$repairPrefix vs live ${liveWords.size}w/prefix$livePrefix) — keeping live transcript")
@@ -5122,7 +5959,25 @@ val wordsLength = words.size
                 // The finalDecodeAndEmit endpoint carries actual words; pause()'s
                 // synthetic empty endpoint does not. Only the word-bearing one is
                 // the session's FINAL transcript -- from here on, verdicts are real.
-                if (ev.endpoint && words.isNotEmpty()) {
+                //
+                // The discriminator is the RAW emission ([ev.partial]), NOT the
+                // filtered delta ([words]). filterMemorizeWords strips every
+                // already-committed word and caps each word at its target count,
+                // so once a range is fully recited the endpoint legitimately
+                // carries ZERO new words — [words] was empty on EVERY completed
+                // run (measured fatihah_v3: `ev.endpoint=true words=[]` twice),
+                // [sessionFinalized] therefore stayed false forever, and the
+                // end-of-range summary popup was gated OFF for good. That is the
+                // user's report verbatim: they finished Al-Fatihah, saw no popup,
+                // and only got a summary after tapping pause (pause drives the
+                // `ev.repaired` path above, which does set the flag).
+                // pause()'s synthetic endpoint is still excluded: it is empty.
+                if (ev.endpoint && ev.partial.isNotEmpty()) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "collector(): sessionFinalized <- endpoint " +
+                            "(${ev.partial.size}w raw / ${words.size}w new)"
+                    )
                     sessionFinalized = true
                 }
                 if (isMemorizeSession) partialSpokenText = "" else tajweedPartialSpokenText = ""
@@ -5186,6 +6041,11 @@ spokenTimings.clear()
         lastWrongStopSpokenText = ""
         lastWrongStopSightings = 0
         lastWrongStopFirstSeenMs = 0L
+        mistakeVerifyAbsentIdx = -1
+        mistakeVerifyAttempts = 0
+        mistakeVerifyAbsentStrikes = 0
+        mistakeVerdictAtMs = 0L
+        confirmedMistakeUiIdx = -1
                     recognizedAudioUri = null
                     recognizedAudio = null
                     recognizedAudioStartMs = System.currentTimeMillis()
@@ -7672,11 +8532,38 @@ spokenTimings.clear()
                     "Listening — recite now"
                 else -> ""
             }
-            FloatingActionButton(
-                onClick = {
+            // STOP + SCORE + SUMMARIZE, hoisted out of the mic button so the
+            // end-of-range LaunchedEffect below can run the identical path.
+            // It used to live INLINE in `onClick`, which made a finished range
+            // show nothing at all until the user happened to tap stop — the
+            // "nothing happened, no popups" report.
+            //
+            // `userInitiatedStop` distinguishes the two entry points, and the
+            // distinction is a HARD requirement from the user:
+            //   "the summary is when i click on pause the mic or finish my
+            //    recitation. for any mistake, the app stops there and give me a
+            //    mistake popup. i made this clear many times."
+            // Tapping pause ⇒ the summary is CORRECT, whatever is flagged.
+            // The end-of-range effect ⇒ a mistake must NEVER be buried in the
+            // summary; it must stop with the MISTAKE popup (or, when no decode
+            // could prove the word, be forgiven and then summarize).
+            // Before this flag both entries were indistinguishable, so the
+            // summary latched on the auto path too and the mistake popup the
+            // user was waiting for never appeared.
+            // Set by [runStopAndFinalize] on every call: TRUE when it withheld
+            // the end-of-range summary because the selected range is not
+            // actually complete yet (unheard words beyond the forgiveness
+            // window — the user is still reading). The auto-finalize gate reads
+            // it immediately after the call so it can RE-ARM instead of
+            // dead-ending: without this, one grace expiry on an incomplete
+            // range left `autoFinalizeDone` permanently true and the
+            // end-of-range path never fired again for the rest of the session.
+            val finalizeWithheld = remember { mutableStateOf(false) }
+            val runStopAndFinalize: (Boolean) -> Unit = finalize@ { userInitiatedStop ->
+                    finalizeWithheld.value = false
                     if (speechRecognizer == null) {
                         errorMessage = "Speech recognition is not available on this device"
-                        return@FloatingActionButton
+                        return@finalize
                     }
                     if (isListening) {
                         try {
@@ -7810,8 +8697,81 @@ spokenTimings.clear()
                                 // the user actually did, not whatever they
                                 // happen to have selected by the time the
                                 // dialog opens.
-                                val pendingRemain = detailedAnalysis.any { it.status == RecitationStatus.PENDING }
-                                if (sessionFinalized && !pendingRemain && viewModel.sessionSummaryToShow == null) {
+                                // PENDING rows that carry a spokenText are CLIPPED decodes: the
+                                // recognizer heard the word, the window cut it, and finalizeCorrect()
+                                // forgives them. Gating the summary on *any* PENDING meant the last
+                                // word of every recitation (always clipped by the endpoint window)
+                                // suppressed the end-of-range popup entirely — the user saw nothing
+                                // until they tapped pause manually. Only PENDING words the decoder
+                                // NEVER heard still mean "the user hasn't finished the range".
+                                //
+                                // RACE — measured fatihah_c23 (01:15:13):
+                                //   .162 endOfRange(): ... pendingRemain=true   <- popup skipped
+                                //   .204 finalizeCorrect(): 1 trailing PENDING word(s) counted CORRECT
+                                // runStopAndFinalize() sets sessionFinalized and reads detailedAnalysis
+                                // in the SAME pass; finalizeCorrect() is a separate LaunchedEffect that
+                                // only runs on the NEXT recomposition — 42 ms later it turned the very
+                                // row that had just cancelled the popup into CORRECT. Nothing re-checks
+                                // afterwards, so the user got NO popup at all for the whole session.
+                                //
+                                // Fix: apply finalizeCorrect()'s own forgiveness window here, so the
+                                // two agree on what "still pending" means even when they read the list
+                                // one recomposition apart. A row inside the window is about to be
+                                // counted CORRECT, so it must not veto the popup.
+                                val matchedSoFarNow = detailedAnalysis.count {
+                                    it.status == RecitationStatus.CORRECT ||
+                                        it.status == RecitationStatus.TAJWEED_ERROR ||
+                                        it.status == RecitationStatus.HINTED
+                                }
+                                val forgivableTail = matchedSoFarNow + 8
+                                val pendingRemain = detailedAnalysis.any {
+                                    it.status == RecitationStatus.PENDING &&
+                                        it.spokenText.isNullOrEmpty() &&
+                                        // finalizeCorrect() only converts when there is real progress
+                                        // (matched >= 3); outside that case the row genuinely remains.
+                                        (matchedSoFarNow < 3 || it.wordIndex > forgivableTail)
+                                }
+                                // Diagnostic: this gate is the ONLY place the
+                                // end-of-range summary is raised, and every one
+                                // of its inputs is invisible in logcat. Log them
+                                // so a missing popup can be diagnosed from a run
+                                // instead of guessed at.
+                                android.util.Log.i(
+                                    "ItqanSherpa",
+                                    "endOfRange(): sessionFinalized=$sessionFinalized " +
+                                        "pendingRemain=$pendingRemain newCompleted=$newCompletedCount " +
+                                        "wrong=$currentWrong skipped=$currentSkipped tajweed=$currentTajweed " +
+                                        "alreadyShowing=${viewModel.sessionSummaryToShow != null}"
+                                )
+                                // MISMATCHED-ENTRY-POINT GUARD. The auto path
+                                // (end-of-range) only calls this AFTER it has
+                                // settled every outstanding mistake — either by
+                                // stopping for it (popup) or by forgiving an
+                                // unprovable word. So by here a flagged mistake
+                                // means a REAL one that the pipeline could still
+                                // not resolve, and the contract is explicit:
+                                // "for any mistake, the app stops there and give
+                                // me a mistake popup", never a summary.
+                                // The manual pause path is the opposite — the
+                                // user ASKED for the summary, so flagged words
+                                // are listed inside it and no mistake popup is
+                                // forced on them.
+                                val hasUnresolvedMistake = currentWrong > 0 || currentSkipped > 0
+                                val mistakeMustWin = !userInitiatedStop && hasUnresolvedMistake
+                                if (mistakeMustWin) {
+                                    // Leave sessionFinalized set so the next mic
+                                    // tap resumes cleanly, but never raise the
+                                    // dialog: the mistake popup owns the screen.
+                                    android.util.Log.i(
+                                        "ItqanSherpa",
+                                        "endOfRange(): auto path with wrong=$currentWrong " +
+                                            "skipped=$currentSkipped still flagged -> suppressing the " +
+                                            "summary so the mistake popup is what the user sees"
+                                    )
+                                }
+                                if (sessionFinalized && !pendingRemain &&
+                                    viewModel.sessionSummaryToShow == null && !mistakeMustWin
+                                ) {
                                     // The recitation reached the end of its selected range with no
                                     // PENDING (un-scored) words left: mark the run as range-completed
                                     // so the next mic tap starts fresh instead of resuming the stale,
@@ -7824,6 +8784,18 @@ spokenTimings.clear()
                                         entries = mistakeEntries,
                                         recitedAyahCount = newCompletedCount,
                                         totalAyahCount = (chargeRangeEnd - chargeRangeStart + 1).coerceAtLeast(1),
+                                    )
+                                } else if (sessionFinalized && pendingRemain) {
+                                    // The range is NOT complete (words the decoder never heard
+                                    // remain beyond finalizeCorrect()'s forgiveness window), so no
+                                    // summary is raised — the user is most likely still reading.
+                                    // Report that back so the auto-finalize gate re-arms instead
+                                    // of treating this as the session's one and only decision.
+                                    finalizeWithheld.value = true
+                                    android.util.Log.i(
+                                        "ItqanSherpa",
+                                        "endOfRange(): range incomplete (unheard words remain) -> " +
+                                            "summary withheld; the auto-finalize gate will re-arm"
                                     )
                                 }
                             }
@@ -7931,7 +8903,9 @@ spokenTimings.clear()
                             permissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
                         }
                     }
-                },
+            }
+            FloatingActionButton(
+                onClick = { runStopAndFinalize(true) },
                 containerColor = if (isListening) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                 contentColor = if (isListening) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.background,
                 shape = CircleShape,
@@ -7948,6 +8922,241 @@ spokenTimings.clear()
                         contentDescription = if (isListening) "Stop Listening" else "Start Listening",
                         modifier = Modifier.size(32.dp)
                     )
+                }
+            }
+            // END-OF-RANGE AUTO-FINALIZE. The recitation is over the moment the
+            // committed transcript is final and every word of the selected range
+            // has a verdict that is not "still waiting for speech". Nothing used
+            // to happen then: the session just kept running and the summary —
+            // which is the ONLY place the end-of-range popup is raised — lived
+            // exclusively in the mic button's click handler, so the user had to
+            // guess that they must tap stop to see anything. Run the same
+            // finalize path instead of waiting for a tap.
+            // Ticker for the mistake hold below. Once the recognizer goes quiet
+            // detailedAnalysis stops changing, so without this the hold would
+            // never expire and a stuck mistake would mean no popup at all.
+            LaunchedEffect(sessionFinalized, isListening) {
+                while (sessionFinalized && isListening) {
+                    kotlinx.coroutines.delay(2000L)
+                    finalizeTick++
+                }
+            }
+            LaunchedEffect(sessionFinalized, isListening, detailedAnalysis, analysisEpoch, finalizeTick) {
+                if (currentTab != "Memorize" || recitationMode != "Tajweed") return@LaunchedEffect
+                if (!sessionFinalized || !isListening) {
+                    // Live (or re-started) session: re-arm for the next finalize.
+                    autoFinalizeDone = false
+                    mistakeHoldSinceMs = 0L
+                    graceExpiredOnce = false
+                    lastDecidedCount = 0
+                    lastUnheardCount = Int.MAX_VALUE
+                    return@LaunchedEffect
+                }
+                // Diagnostics: this effect is the ONLY thing that ends a completed
+                // range, and every input to the gate below is invisible in logcat.
+                // Log them whenever we are in the firing state so a missing popup is
+                // diagnosable from the run itself instead of guessed at.
+                run {
+                    val decided = detailedAnalysis.map { it.wordIndex }.toHashSet().size
+                    val unheard = detailedAnalysis.count {
+                        it.status == RecitationStatus.PENDING && it.spokenText.isNullOrEmpty()
+                    }
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "autoFinalize?(): rows=${detailedAnalysis.size} decided=$decided/${targetOrig.size} " +
+                            "unheardPending=$unheard alreadyShowing=${viewModel.sessionSummaryToShow != null} " +
+                            "done=$autoFinalizeDone"
+                    )
+                }
+                if (autoFinalizeDone) return@LaunchedEffect
+                if (viewModel.sessionSummaryToShow != null) return@LaunchedEffect
+                if (detailedAnalysis.isEmpty()) return@LaunchedEffect
+                val total = targetOrig.size
+                if (total == 0) return@LaunchedEffect
+                // detailedAnalysis holds ONE ROW PER (WORD, RULE), so count
+                // distinct word indices, not rows.
+                val decidedWords = detailedAnalysis.map { it.wordIndex }.toHashSet()
+                val unheard = detailedAnalysis.count {
+                    it.status == RecitationStatus.PENDING && it.spokenText.isNullOrEmpty()
+                }
+                val mistakeOutstanding = detailedAnalysis.any {
+                    it.status == RecitationStatus.WRONG || it.status == RecitationStatus.SKIPPED
+                }
+                // UNVERDICTED WORDS BLOCK A CLEAN FINISH.
+                //
+                // A forgiveness is only trustworthy when a decode actually
+                // judged the word. `verifiedSpokenIndices` is also fed by the
+                // stall watchdog, which fires when a candidate outstays its
+                // 20 s budget — and if the confirm loop never got to launch a
+                // decode (fatihah_c30: a row-index flicker reset the dwell
+                // pre-condition on every recomposition, zero `verify idx=`
+                // lines all run), that watchdog entry is a GUESS, not a verdict.
+                //
+                // Without this test the guessed-forgiven word drops out of
+                // `mistakeOutstanding`, `cleanFinish` turns true, and the user
+                // gets a SUMMARY for a recitation the app could not actually
+                // judge — including for a word they really did skip, which is
+                // then counted correct. Requiring real evidence (an absent
+                // strike) before the range may be called complete is what makes
+                // the difference between "we checked and it was fine" and "we
+                // gave up and said nothing", and the user has asked for the
+                // former explicitly.
+                val unverdictedStall = lastWrongStopIndex >= 0 &&
+                    lastWrongStopIndex !in verifiedSpokenIndices &&
+                    mistakeVerifyAbsentStrikes == 0
+                // Ideal case: the range was completed — every word decided, nothing
+                // left unheard, nothing flagged, and no word left in limbo.
+                val cleanFinish = decidedWords.size >= total && unheard == 0 &&
+                    !mistakeOutstanding && !unverdictedStall
+                // PROGRESS RE-ARMS THE HOLD. An endpoint fires on every utterance
+                // boundary, not only at the end of a recitation, so the countdown
+                // must never run against someone who is still reciting: any newly
+                // decided word (or any word that stopped being unheard) restarts it.
+                if (decidedWords.size > lastDecidedCount || unheard < lastUnheardCount) {
+                    mistakeHoldSinceMs = 0L
+                }
+                lastDecidedCount = decidedWords.size
+                lastUnheardCount = unheard
+                if (!cleanFinish) {
+                    // Two reasons to wait rather than finalize right now:
+                    //  - a mistake must surface as a MISTAKE POPUP (the app stops
+                    //    the recitation there), never be buried in the summary
+                    //    (fatihah_v6: `skipped=1` in the summary, popup never shown);
+                    //  - words still unheard may simply not have arrived yet.
+                    //
+                    // BOUNDED, THOUGH. A mistake that is never confirmed (the
+                    // verification decode keeps coming back INCONCLUSIVE) or a walk
+                    // that stalls on a WRONG would otherwise hold the summary
+                    // FOREVER and the user would be left with NO popup at all —
+                    // measured fatihah_v9 (`decided=28/29`, nothing on screen) and
+                    // fatihah_p1 (stuck at 13/29 with `unheardPending=15`, nothing on
+                    // screen). "Nothing happened" is the worst possible outcome, so
+                    // give the mistake pipeline MISTAKE_GRACE_MS to speak up, then
+                    // finalize regardless.
+                    //
+                    // ONE WINDOW PER SESSION. Once that window has expired, the
+                    // decision below is final: forgiving re-arms nothing, and the
+                    // very next pass falls through to the finalize. Without
+                    // `graceExpiredOnce` the forgive branch could hand back a fresh
+                    // 20 s window on a mistake it had just decided not to act on,
+                    // freezing the walk forever (fatihah_c27, §4.18).
+                    if (mistakeHoldSinceMs == 0L) mistakeHoldSinceMs = System.currentTimeMillis()
+                    val held = System.currentTimeMillis() - mistakeHoldSinceMs
+                    // `graceExpiredOnce` pins the window open: once the countdown has
+                    // run out it may never restart within this session, so the fork
+                    // below is guaranteed to reach a decision (stop with the popup,
+                    // or forgive-and-finalize) instead of looping.
+                    if (held < MISTAKE_GRACE_MS && !graceExpiredOnce) {
+                        android.util.Log.i(
+                            "ItqanSherpa",
+                            "autoFinalize(): holding ${held}ms/$MISTAKE_GRACE_MS " +
+                                "(decided=${decidedWords.size}/$total unheard=$unheard mistake=$mistakeOutstanding)"
+                        )
+                        return@LaunchedEffect
+                    }
+                    graceExpiredOnce = true
+                    // ── THE GRACE EXPIRED AND A MISTAKE IS STILL OUTSTANDING ──
+                    // Finalizing here is the bug the user keeps hitting: it hands
+                    // over the end-of-session SUMMARY, which by contract is only
+                    // for "I finished" — a mistake must STOP the recitation with
+                    // a MISTAKE POPUP. Measured fatihah_c10:
+                    //   autoFinalize(): range complete (29/29 words decided)
+                    //   endOfRange(): … wrong=0 skipped=2 tajweed=1
+                    // i.e. the summary fired and simply listed two skipped words.
+                    //
+                    // What to do depends on what the verification actually saw:
+                    //  - at least ONE substantial decode came back missing the word
+                    //    (mistakeVerifyAbsentStrikes >= 1) ⇒ there IS evidence. Stop
+                    //    and show the MISTAKE popup for the first flagged word.
+                    //  - otherwise every decode was too short/garbled to judge
+                    //    ⇒ we cannot prove anything, and per project policy a
+                    //    false accusation is worse than a missed skip: FORGIVE the
+                    //    word and let the session finish normally.
+                    val firstMistake = detailedAnalysis.firstOrNull {
+                        it.status == RecitationStatus.WRONG || it.status == RecitationStatus.SKIPPED
+                    }
+                    if (firstMistake != null) {
+                        if (mistakeVerifyAbsentStrikes >= 1) {
+                            android.util.Log.i(
+                                "ItqanSherpa",
+                                "autoFinalize(): grace expired with an EVIDENCED mistake at " +
+                                    "wordIndex=${firstMistake.wordIndex} (strikes=$mistakeVerifyAbsentStrikes) " +
+                                    "-> stopping with the mistake popup, NOT a summary"
+                            )
+                            autoFinalizeDone = true
+                            mistakeHoldSinceMs = 0L
+                            stopForMistake(
+                                firstMistake.wordIndex,
+                                firstMistake.status == RecitationStatus.SKIPPED
+                            )
+                            return@LaunchedEffect
+                        }
+                        android.util.Log.i(
+                            "ItqanSherpa",
+                            "autoFinalize(): grace expired with an UNPROVEN mistake at " +
+                                "wordIndex=${firstMistake.wordIndex} (no substantial decode ever " +
+                                "judged it) -> forgiving rather than accusing"
+                        )
+                        // CLEAR THE ROW, do not just whitelist the word.
+                        //
+                        // verifiedSpokenIndices only suppresses the *candidate*; the
+                        // row itself kept `status = WRONG/SKIPPED`, so `mistakeOutstanding`
+                        // stayed true, `graceExpiredOnce` was false again, and this branch
+                        // re-ran on every recomposition — FOREVER. Measured fatihah_c27:
+                        // after the first forgive at 01:43:56 the guard held 20 s, forgave
+                        // wordIndex=20 again, held 20 s, … with the walk frozen at 20/29
+                        // and `autoFinalizeDone` never set, so `runStopAndFinalize()` was
+                        // NEVER CALLED and the screen stayed empty until the harness's 40 s
+                        // tail ran out. "Nothing happened" is the worst outcome (§4.14).
+                        //
+                        // Converting the status is the only thing that makes the forgive
+                        // STICK — it is what mistakeOutstanding counts, and it is exactly
+                        // what finalizeCorrect() does for a trailing PENDING word. Only
+                        // this one row is touched, and only because no decode could judge
+                        // it: a proven mistake still stops with the popup above.
+                        val forgivenIdx = firstMistake.wordIndex
+                        detailedAnalysis = detailedAnalysis.map { w ->
+                            if (w.wordIndex == forgivenIdx &&
+                                (w.status == RecitationStatus.WRONG ||
+                                    w.status == RecitationStatus.SKIPPED)
+                            ) {
+                                w.copy(status = RecitationStatus.CORRECT, spokenText = null)
+                            } else {
+                                w
+                            }
+                        }
+                        verifiedSpokenIndices.add(forgivenIdx)
+                        mistakeVerifyAttempts = 0
+                        mistakeVerifyAbsentStrikes = 0
+                        mistakeVerifyAbsentIdx = -1
+                        mistakeVerdictAtMs = 0L
+                        // Do NOT reset mistakeHoldSinceMs: that restarts the 20 s window
+                        // and, when the erase above somehow fails to take, reintroduces the
+                        // loop. Leave the expired clock in place so the next pass falls
+                        // straight through to the finalize.
+                        return@LaunchedEffect
+                    }
+                }
+                mistakeHoldSinceMs = 0L
+                android.util.Log.i(
+                    "ItqanSherpa",
+                    "autoFinalize(): grace expired with $total/$total words decided " +
+                        "(unheard=$unheard mistake=$mistakeOutstanding) -- running the finalize path"
+                )
+                // false = NOT a user pause: the range ended by itself, so an
+                // unresolved mistake must win over the summary.
+                runStopAndFinalize(false)
+                // RE-ARM WHEN NOTHING WAS SHOWN. If the range turned out to be
+                // incomplete (unheard words beyond the forgiveness window), no
+                // summary was raised and no mistake popup fired — the app
+                // decided to keep waiting for the rest of the recitation. Leave
+                // `autoFinalizeDone` false and clear the pinned grace so a LATER
+                // completion still fires this path; otherwise one premature
+                // grace expiry disabled the end-of-range popup for the whole
+                // session.
+                autoFinalizeDone = !finalizeWithheld.value
+                if (finalizeWithheld.value) {
+                    graceExpiredOnce = false
                 }
             }
             if (tajweedStatusText.isNotEmpty()) {

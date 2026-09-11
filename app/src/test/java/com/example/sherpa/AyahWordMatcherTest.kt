@@ -196,14 +196,27 @@ class AyahWordMatcherTest {
     }
 
     @Test
-    fun `single-letter fragment is still dropped`() {
+    fun `unambiguous single-letter fragment IS restored (one missing letter only)`() {
         val matcher = AyahWordMatcher(fatihah12)
-        // The device log also showed a lone "رَ" (a cut رَبِّ) — 1 letter is
-        // too short to restore unambiguously; it stays dropped and the next
-        // window re-decodes the whole word.
+        // Measured on Al-Fatihah 1:2: EVERY streaming window rendered رَبِّ as
+        // the lone `رَ`. The old "1 letter is too short" rule dropped it; the
+        // word was then permanently lost from the committed transcript (every
+        // re-decode truncates it identically), and the aligner charged a false
+        // SKIPPED that cascaded into a WRONG and froze the whole surah.
+        // Restoring is safe here because `ر` is a strict prefix of exactly ONE
+        // word of the active range (ٱلرَّحْمَٰن / ٱلرَّحِيم start with alef, so
+        // they are not candidates) and a 1-letter stem may gain only ONE
+        // missing letter — `ر` can become رَبِّ ("رب") and nothing longer.
         val cleaned = matcher.clean("لِلَّه رَ ٱلْعَٰلَمِين")
-        assertEquals(listOf("لِلَّه", "ٱلْعَٰلَمِين"), cleaned)
+        assertEquals(listOf("لِلَّه", "رَبِّ", "ٱلْعَٰلَمِين"), cleaned)
     }
+
+    // NOTE — a 1-letter token is ALSO within 1 edit of any 2-letter vocabulary
+    // word, so it can additionally be KEPT RAW by the neighbour rule (measured:
+    // `بِ` survives as رَبِّ against this vocab). The relaxation above only
+    // governs the stricter prefix-restore path; it does not make every stray
+    // letter a vocabulary word — the `ال` phantom guard below is what stops a
+    // generic fragment from being restored.
 
     // ───────────────────────────────────────────────────────────────────
     // CTC SANDWICH FRAGMENT — regression for the Baqarah 285-286 false

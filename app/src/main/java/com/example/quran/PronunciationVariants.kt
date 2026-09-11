@@ -222,3 +222,137 @@ fun formGroupsFor(displayWord: String): List<Any> {
 fun spokenVariants(spoken: String): List<String> {
     return listOf(normalizeForSpokenForms(spoken))
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tolerant muqatta'at matching
+//
+// The strict ordered-slot matcher above assumes the decoder renders EVERY letter
+// name of a disjointed-letter word correctly. On device it does not.
+//
+// Measured on a Samsung A05s (SM-A057F) reciting Al-Baqarah 2:1 with the shipped
+// `model_int8.onnx` CTC graph, three consecutive decode windows emitted:
+//
+//     window 1:  م
+//     window 2:  سف م ذ الكتاب
+//     window 3:  أف م ذ الكتاب وَلَا ريب فِيهِ
+//
+// i.e. `الم` (ألف لام ميم) came back as a truncated `أف` and a bare `م` — the
+// `لام` was dropped outright. The 3-slot matcher needs three tokens and gets
+// garbage; [isWordMatchPlural] returns false; the alignment walk falls through to
+// the OOV-garbage skip, blows its cap of 2 on the fragments, and charges a WRONG
+// at word 0 — which returns early and leaves all 6115 remaining words of the
+// surah PENDING. Result: `matched=0`, nothing highlighted, no popup, and the
+// cursor frozen until the user taps pause.
+//
+// Al-Fatihah has no muqatta'at, which is precisely why the user saw it
+// "work fine" while Al-Baqarah never displayed a single word.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Small local edit distance (the app's matcher lives in the UI module). */
+private fun editDistance(a: String, b: String): Int {
+    if (a == b) return 0
+    if (a.isEmpty()) return b.length
+    if (b.isEmpty()) return a.length
+    var v0 = IntArray(b.length + 1) { it }
+    var v1 = IntArray(b.length + 1)
+    for (i in a.indices) {
+        v1[0] = i + 1
+        for (j in b.indices) {
+            val cost = if (a[i] == b[j]) 0 else 1
+            v1[j + 1] = minOf(v1[j] + 1, v0[j + 1] + 1, v0[j] + cost)
+        }
+        val tmp = v0; v0 = v1; v1 = tmp
+    }
+    return v0[b.length]
+}
+
+/**
+ * Ordered letter-name slots for a muqatta'at display word, or null for an
+ * ordinary word. Only the canonical (first) segmentation is returned — the
+ * relaxed matcher below tolerates the decoder's deviations from it.
+ */
+fun muqattaatSlots(displayWord: String): List<List<String>>? {
+    val base = normalizeForSpokenForms(displayWord)
+    return muqattaatNormalized[base]?.firstOrNull()
+}
+
+/** True when [token] plausibly renders the letter name spoken for [slot]. */
+private fun relaxedSlotMatch(token: String, slot: List<String>): Boolean {
+    val t = normalizeForSpokenForms(token)
+    if (t.isEmpty()) return false
+    for (alt in slot) {
+        if (t == alt) return true
+        // The CTC decoder clips letter names to their first letter or two
+        // (ميم -> م, الف -> اف) far more often than it invents letters, so a
+        // shared prefix is strong evidence — provided the token is at least
+        // one letter and the alternation is at least two.
+        if (alt.length >= 2 && (alt.startsWith(t) || t.startsWith(alt))) return true
+        if (alt.length >= 2 && editDistance(t, alt) <= 1) return true
+        // Three-letter names (الف, لام, ميم, كاف, عين, قاف, نون, صاد) come back
+        // two edits away surprisingly often: one recitation of `ألف` decoded as
+        // `أف` in one window and `سف` in the next — the decoder reliably keeps
+        // the FINAL consonant and mangles everything before it. Accept a 2-char
+        // token that ends in the same letter as a 3-char alternation.
+        //
+        // Gated on the last character deliberately. A plain "edit distance <= 2"
+        // rule was tried first and is far too loose: it let `صدر` claim `صاد`
+        // and `ولا` claim `الف`. Matching the final consonant rejects both.
+        if (alt.length == 3 && t.length == 2 && t.last() == alt.last()) return true
+    }
+    return false
+}
+
+/**
+ * Tolerant match of a short spoken run against a muqatta'at's letter-name slots.
+ *
+ * [spokenTokens] must start at the transcript frontier. Returns the number of
+ * tokens consumed by the match (so the caller can advance the cursor past
+ * exactly what was used), or -1 when the run does not match.
+ *
+ * Tolerates two decoder failures, both observed on device:
+ *  - a letter name rendered short or slightly wrong (prefix / edit distance 1);
+ *  - a letter name dropped entirely.
+ *
+ * Bounded so it cannot fire on unrelated speech: the run is at most
+ * `slots.size` tokens, at least `slots.size - 1` of the slots must match, and
+ * order is preserved.
+ */
+fun matchMuqattaatRelaxed(spokenTokens: List<String>, slots: List<List<String>>): Int {
+    val n = slots.size
+    if (n == 0 || spokenTokens.isEmpty()) return -1
+    val run = spokenTokens.take(n)
+    // Two-letter muqatta'at (حم, طه, يس, ق, ص, ن) are short enough that
+    // accepting `n - 1` would let a single stray letter (م, ح, ي) claim the
+    // word; require every slot there. Three-plus-letter tokens may lose ONE
+    // letter name to the decoder (measured: `الم` -> `أف م`, `لام` dropped).
+    val need = if (n <= 2) n else n - 1
+
+    // best[i][j] = most slots matched by slots[i..] against run[j..]; tie-break
+    // on the fewest tokens consumed so the cursor advances as little as possible.
+    data class Hit(val matched: Int, val end: Int)
+    fun better(a: Hit, b: Hit): Hit =
+        if (b.matched > a.matched || (b.matched == a.matched && b.end < a.end)) b else a
+
+    val memo = Array(n + 1) { arrayOfNulls<Hit>(run.size + 1) }
+    fun solve(i: Int, j: Int): Hit {
+        if (i == n) return Hit(0, j)
+        memo[i][j]?.let { return it }
+        var best = Hit(0, j)
+        if (j < run.size) {
+            best = better(best, solve(i, j + 1))          // stray token: skip it
+        }
+        best = better(best, solve(i + 1, j))              // letter dropped by the decoder
+        if (j < run.size && relaxedSlotMatch(run[j], slots[i])) {
+            val rest = solve(i + 1, j + 1)
+            best = better(best, Hit(rest.matched + 1, rest.end))
+        }
+        memo[i][j] = best
+        return best
+    }
+
+    val hit = solve(0, 0)
+    if (hit.matched < need) return -1
+    // `end` is an index into the run; tokens beyond it were strays the decoder
+    // inserted and must stay available for the NEXT target word.
+    return hit.end.coerceAtLeast(1)
+}
