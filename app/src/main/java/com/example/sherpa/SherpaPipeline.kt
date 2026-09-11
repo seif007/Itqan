@@ -115,6 +115,96 @@ fun isSherpaModelReady(context: Context): Boolean {
 private fun normalizeArabicPub(text: String): String = normalizeArabicUi(text)
 
 /**
+ * Plans the frame ranges of the verification decode used by
+ * [SherpaPipeline.verifyTailWords], which stitches a span out of short slices
+ * because this model decodes a ~4 s slice cleanly but hallucinates on long
+ * buffers.
+ *
+ * Returns `[start, endExclusive]` pairs over the half-open span
+ * `[fromIdx, toIdx)`, each at most [sliceLen] frames long, advancing backwards
+ * from `toIdx` by at most [hop] frames per step, at most [maxSlices] of them.
+ *
+ * GUARANTEES (pinned by unit test):
+ *  - never empty when `toIdx > fromIdx`;
+ *  - every slice lies inside `[fromIdx, toIdx)` and is at least 1 frame long;
+ *  - the LAST slice ends exactly at `toIdx`, so the most recent speech — the
+ *    region a frozen candidate is actually in — is always decoded;
+ *  - coverage is CONTIGUOUS: consecutive slices abut or overlap, never leaving
+ *    an undecoded gap whose words would look absent;
+ *  - the slice count never exceeds [maxSlices], which bounds the wall-clock
+ *    cost of one verification on-device.
+ *
+ * When the span is too wide to cover within [maxSlices], the OLDEST audio is
+ * dropped and coverage starts at the first returned slice — the caller must
+ * therefore never treat "absent from the pool" as proof for a candidate that
+ * lies outside `[first().first(), toIdx)`.
+ */
+internal fun planVerifySlices(
+    fromIdx: Int,
+    toIdx: Int,
+    sliceLen: Int,
+    hop: Int,
+    maxSlices: Int
+): List<IntArray> {
+    val span = toIdx - fromIdx
+    if (span <= 0 || sliceLen <= 0) return emptyList()
+    val cap = maxOf(1, maxSlices)
+    // A stride longer than the slice would leave undecoded GAPS between
+    // slices, and a word falling in a gap would look absent — precisely the
+    // false evidence this verifier must never manufacture. Clamp it.
+    val stride = maxOf(1, minOf(hop, sliceLen))
+    // Walk BACKWARDS from the newest audio. The frozen candidate always sits in
+    // the most recent speech, so when the cap binds it must be the OLDEST audio
+    // that is dropped, never the newest. The walk also guarantees the last
+    // slice ends exactly at toIdx — integer division on a forward stride lands
+    // a few frames short and would leave the newest audio undecoded.
+    val out = ArrayList<IntArray>(cap)
+    var end = toIdx
+    while (out.size < cap && end > fromIdx) {
+        val start = maxOf(fromIdx, end - sliceLen)
+        out.add(intArrayOf(start, end))
+        if (start <= fromIdx) break
+        end -= stride
+    }
+    out.reverse()
+    return out
+}
+
+/**
+ * Appends [words] to [pool], dropping the leading words that already form the
+ * tail of [pool]. Consecutive verification slices overlap by
+ * `sliceLen - hop` frames, so at most a word or two can repeat at a seam.
+ *
+ * Compared on NORMALIZED forms (see [normalizeArabicPub]) because two decodes
+ * of the same word routinely disagree on diacritics and on whether the
+ * definite article was glued on — an exact string compare would leave the
+ * duplicate in and inflate the word count the caller's sanity guard reads.
+ *
+ * Matching is capped at 2 words so a genuinely repeated word inside the
+ * recitation (e.g. `الرحمن الرحيم` twice) is never eaten.
+ */
+internal fun appendWithoutOverlap(pool: MutableList<String>, words: List<String>) {
+    if (words.isEmpty()) return
+    if (pool.isEmpty()) {
+        pool.addAll(words)
+        return
+    }
+    var k = minOf(2, pool.size, words.size)
+    while (k > 0) {
+        var same = true
+        for (j in 0 until k) {
+            if (normalizeArabicPub(pool[pool.size - k + j]) != normalizeArabicPub(words[j])) {
+                same = false
+                break
+            }
+        }
+        if (same) break
+        k--
+    }
+    pool.addAll(words.drop(k))
+}
+
+/**
  * Copies the bundled Quran-STT model assets into `filesDir/sherpa_model/` if
  * not already present. Reports per-file and overall progress via [progress].
  *
@@ -839,6 +929,15 @@ class SingleAudioPipeline(
     private val autoStopSilenceMs = 4000L
     private val minDecodeFrames = sampleRate * 3 / 2 // never decode < 1.5 s (mid-word slices)
 
+    // Verification-decode geometry (see verifyTailWords). This model decodes a
+    // ~4 s slice cleanly but hallucinates on 10-27 s buffers, so the verifier
+    // stitches its span out of [verifySliceSec]-second slices (1 s overlap)
+    // instead of one long buffer. [verifyMaxSlices] bounds the wall-clock cost:
+    // each slice is ~0.6 s of recognizer time on-device, so 6 slices ≈ 3.6 s,
+    // comparable to the single long decode this replaced.
+    private val verifySliceSec = 4
+    private val verifyMaxSlices = 6
+
     /** Wall-clock time of the most recent chunk that had ANY speech. -1 until
      *  the first speech frame arrives. Used by both capture paths (mic + inject)
      *  to drive the auto-stop mic timer. */
@@ -1370,12 +1469,18 @@ class SingleAudioPipeline(
     fun snapshotRawAudio(): FloatArray = synchronized(audioSync) { rawAudio.copyOf(rawAudioSize) }
 
     /**
-     * One-off high-quality re-decode of the session tail, for MISTAKE
-     * VERIFICATION / TRANSCRIPT RECONCILIATION. Runs the recognizer over up to
+     * One-off re-decode of the session tail, for MISTAKE VERIFICATION /
+     * TRANSCRIPT RECONCILIATION. Runs the recognizer over up to
      * [trailingSeconds] of the SAME gated speech-only buffer the live sliding
-     * windows consume — but as a single full-context offline pass (exactly what
-     * [finalDecodeAndEmit] does on pause), which recovers words a 4 s window
-     * cut at its edge or folded mid-span.
+     * windows consume, and returns the pooled word list in reading order.
+     *
+     * NOT a single full-context offline pass. That was the original design —
+     * "the live decode, looking harder" — and it was wrong: this model decodes
+     * a ~4 s slice cleanly but hallucinates on long buffers, so the verifier
+     * returned thin, hallucinated word lists that never satisfied the caller's
+     * sanity/count guards, starving verification. It now stitches the span out
+     * of [verifySliceSec]-second slices (1 s overlap, capped at
+     * [verifyMaxSlices]) and pools the words. See the rationale in the body.
      *
      * Read-only by design: unlike every other decode path it does NOT touch
      * the monotonic emit logs ([lastEmitClean]/[lastEmitRaw]) and does NOT
@@ -1387,9 +1492,10 @@ class SingleAudioPipeline(
      * (measured: two consecutive verifications returned EMPTY while the user
      * waited stuck at one word). We now wait up to ~2.5 s for a free slot.
      * Returns an EMPTY list when still inconclusive (not running, no
-     * recognizer, slot never freed, too little audio, blank result).
+     * recognizer, slot never freed, too little audio, no speech-bearing slice).
      *
-     * Blocking (~0.5-3 s per call on-device); invoke from Dispatchers.IO.
+     * Blocking (~0.6 s per slice, ≈2-4 s per call on-device); invoke from
+     * Dispatchers.IO.
      */
     fun verifyTailWords(trailingSeconds: Int = 10): List<String> {
         val rec = recognizer ?: return emptyList()
@@ -1407,30 +1513,126 @@ class SingleAudioPipeline(
         val t0 = System.currentTimeMillis()
         try {
             val spanSec = trailingSeconds.coerceIn(4, 45)
-            val src = synchronized(audioSync) {
+            // ── DECODE THE SPAN AS SEVERAL LIVE-WINDOW-SIZED SLICES ──────────
+            // A single long decode is NOT "the live decode, looking harder" —
+            // on this model it is a different and much worse decoder. Measured
+            // on device (baqarah_c2, word idx=1) the live 4 s window decoded
+            // real words ('فِيهِ هُدًى لِلْمُتَّق') out of the SAME audio that a
+            // 10 s verify window turned into hallucinated filler ('تفسير
+            // سرضةككبابلور ر سب الرحمن الرحيم'), a 15 s window into more of the
+            // same ('تفسير سرفضيلة الدكتبابلور محمد رات الرحمن الرحيم'), and a
+            // 21 s window into just 4 words. EVERY clean decode in that trace
+            // came from a ~4 s slice; EVERY long slice hallucinated. So the
+            // verifier now stitches the span out of [verifySliceSec]-second
+            // slices — the length the live path proves this model decodes well
+            // — instead of handing the recognizer one long buffer.
+            //
+            // THIS is what starved verification: a thin, hallucinated decode
+            // never reached saneHits >= 2 / need >= 8, so a doubt could only
+            // ever be resolved by the end-of-session repair swap ~20 s later.
+            //
+            // Soundness is NOT weakened by pooling: a wider pool of RELIABLE
+            // words makes "the word is absent" stronger evidence, not weaker.
+            val slices: List<FloatArray> = synchronized(audioSync) {
                 if (audioSize <= 0 || lastSpeechFrame < 0) return@synchronized null
-                var fromIdx = maxOf(0, audioSize - sampleRate * spanSec)
+                // Capture the buffer under the lock: ensureAudioCapacity()
+                // REALLOCATES it on growth, and reading the mutable field
+                // outside this block could index a stale array.
+                val buf = audio
+                fun isSpeech(i: Int): Boolean {
+                    val v = buf[i]
+                    return (if (v < 0f) -v else v) >= speechFrameThr
+                }
+                // ── ANCHOR THE WINDOW TO THE LAST SPEECH FRAME, NOT THE WRITE
+                //    CURSOR ────────────────────────────────────────────────────
+                // audioSize keeps advancing while the user is SILENT, and every
+                // verification call runs precisely when the user has stopped to
+                // wait for a verdict (the walk has frozen, so no new words
+                // arrive). A window measured back from audioSize is therefore
+                // mostly TRAILING SILENCE, and silence is what this recognizer
+                // hallucinates on. While the user is still reading — the normal
+                // case — lastSpeechFrame tracks audioSize and this is a no-op.
+                val speechEnd = (lastSpeechFrame + 1L).toInt().coerceIn(0, audioSize)
+                // Half a second of pad so a word's closing frames are not
+                // clipped (the fragment hazard minDecodeFrames guards against).
+                val toIdx = minOf(audioSize, speechEnd + sampleRate / 2)
+                var fromIdx = maxOf(0, toIdx - sampleRate * spanSec)
                 // Trim leading silence before the session's first speech frame,
                 // same rule as snapshotWindow().
-                if (sessionSpeechStart >= fromIdx && sessionSpeechStart < audioSize) {
+                if (sessionSpeechStart >= fromIdx && sessionSpeechStart < toIdx) {
                     fromIdx = sessionSpeechStart
                 }
-                val weight = audioSize - fromIdx
+                // Head-snap: a few seconds of lead-in silence at the front of
+                // the window is enough to make the CTC head hallucinate
+                // ("تفسير…"), so start at the first speech frame and keep only
+                // a quarter-second of run-up.
+                var head = fromIdx
+                while (head < toIdx && !isSpeech(head)) head++
+                if (head < toIdx) fromIdx = maxOf(fromIdx, head - sampleRate / 4)
+                val spanFrames = toIdx - fromIdx
                 // Never decode a sub-word window (< minDecodeFrames ≈ 1.5 s):
                 // a fragment slice produces bogus words (see snapshotWindow).
-                if (weight < minDecodeFrames) return@synchronized null
-                FloatArray(weight).also { System.arraycopy(audio, fromIdx, it, 0, weight) }
+                if (spanFrames < minDecodeFrames) return@synchronized null
+                val sliceLen = sampleRate * verifySliceSec
+                // Slice geometry comes from a pure helper so the coverage
+                // invariant — the LAST slice always ends exactly at toIdx, so
+                // the most recent speech is always decoded — is unit-tested
+                // rather than assumed.
+                val planned = planVerifySlices(
+                    fromIdx = fromIdx,
+                    toIdx = toIdx,
+                    sliceLen = sliceLen,
+                    hop = sampleRate * (verifySliceSec - 1),
+                    maxSlices = verifyMaxSlices
+                )
+                val out = ArrayList<FloatArray>(planned.size)
+                for (p in planned) {
+                    val s = p[0]
+                    val e = p[1]
+                    if (e - s < minDecodeFrames) continue
+                    // Speech-ratio gate, same rule as snapshotWindow(): a slice
+                    // padded with silence only yields hallucinated filler.
+                    var speechFrames = 0
+                    for (k in s until e) if (isSpeech(k)) speechFrames++
+                    if (speechFrames * 100L < (e - s) * 25L) continue
+                    out.add(FloatArray(e - s).also { System.arraycopy(buf, s, it, 0, e - s) })
+                }
+                if (out.isEmpty()) return@synchronized null
+                Log.i(
+                    TAG,
+                    "verifyTailWords(): span=${spanSec}s " +
+                        "tailSilence=${"%.1f".format((audioSize - toIdx) / 16000f)}s -> " +
+                        "${out.size} slice(s) of ${"%.1f".format(sliceLen / 16000f)}s"
+                )
+                out
             } ?: return emptyList()
-            Log.i(TAG, "verifyTailWords(): begin window=${"%.1f".format(src.size / 16000f)}s")
-            val rawText = rec.transcribe(src)
-            if (rawText.isBlank()) {
-                Log.w(TAG, "verifyTailWords(): EMPTY after ${System.currentTimeMillis() - t0}ms — inconclusive")
-                return emptyList()
+
+            val pooled = ArrayList<String>()
+            for ((i, slice) in slices.withIndex()) {
+                if (!running) break
+                val rawText = try {
+                    rec.transcribe(slice)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "verifyTailWords(): slice $i threw", t)
+                    continue
+                }
+                if (rawText.isBlank()) continue
+                val words = matcher?.clean(rawText)
+                    ?: rawText.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                Log.i(
+                    TAG,
+                    "verifyTailWords(): slice ${i + 1}/${slices.size} " +
+                        "${"%.1f".format(slice.size / 16000f)}s -> ${words.size}w " +
+                        "'${rawText.take(50)}'"
+                )
+                appendWithoutOverlap(pooled, words)
             }
-            val words = matcher?.clean(rawText)
-                ?: rawText.split(Regex("\\s+")).filter { it.isNotEmpty() }
-            Log.i(TAG, "verifyTailWords(): done ${System.currentTimeMillis() - t0}ms ${words.size}w '${rawText.take(80)}'")
-            return words
+            Log.i(
+                TAG,
+                "verifyTailWords(): done ${System.currentTimeMillis() - t0}ms " +
+                    "pooled=${pooled.size}w from ${slices.size} slice(s)"
+            )
+            return pooled
         } catch (t: Throwable) {
             Log.w(TAG, "verifyTailWords(): error after ${System.currentTimeMillis() - t0}ms", t)
             return emptyList()

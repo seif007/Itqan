@@ -1366,11 +1366,114 @@ verified build):
    truncate the transcript it is replacing), so an over-length swap is possible. Benign while the
    extra word is at the edge or OOV.
 
-And the standing weakness, now measured on Baqarah too: **`verifyTailWords` starvation.** c2's
-`verify idx=1` returned 6 / 7 / 4 words for 10 / 15 / 21 s spans against `need >= 8` → three
-INCONCLUSIVEs, so the candidate lingered until the final-decode swap cleared it; c3 returned
-5 / 11 / 11 and logged `ABSENT strike 1/2` (never confirmed). No false accusation either way, but
-each doubt burns ~20 s and delays resolution.
+### §4.25 — `verifyTailWords` starvation: the verifier was decoding the span as ONE long buffer
+
+**Symptom.** When the live windows missed a word, the app fired a verification decode. It came back
+too thin to satisfy the caller's sanity guards, so the verdict was INCONCLUSIVE, the candidate
+lingered, and the doubt was only ever resolved by the end-of-session repair swap — ~20 s later.
+Measured baqarah_c2 (`verify idx=1`, word `ذَٰلِكَ`):
+
+```
+verify idx=1 SKIPPED word='ذَٰلِكَ' verified=6w found=false    span=10s
+verify idx=1 INCONCLUSIVE — tail decode (6w, need >=8) saneHits=0
+verify idx=1 SKIPPED word='ذَٰلِكَ' verified=7w found=false    span=15s
+verify idx=1 INCONCLUSIVE — tail decode (7w, need >=8) saneHits=0
+verify idx=1 SKIPPED word='ذَٰلِكَ' verified=4w found=false    span=21s
+verify idx=1 INCONCLUSIVE — tail decode (4w, need >=8) saneHits=0
+```
+
+Note the inversion: the WIDER the wall-clock span, the FEWER words came back.
+
+**Root cause 1 — a long buffer is a different, worse decoder.** `verifyTailWords` ran the recognizer
+ONCE over the whole span, on the theory that a long full-context pass is "the live decode, looking
+harder". It is not. In the SAME trace, at the SAME moment, the live 4 s window decoded real words out
+of audio that the 10 s verify window turned into filler:
+
+```
+decodeWindow(): begin window=4,0s
+transcribe(): 400f  raw='فِيهِ هُدًى لِلْمُتَّق'                 <- live 4 s window, REAL
+verifyTailWords(): begin window=10,0s
+transcribe(): 1000f raw='تفسير سرضةككبابلور ر سب الرحمن الرحيم'   <- verify 10 s, HALLUCINATED
+```
+
+Every clean decode in that trace came from a ~4 s slice; every long slice hallucinated. `تفسير…` is
+this model's degradation signature.
+
+**Root cause 2 — the window was anchored to the write cursor, so it filled with trailing silence.**
+`fromIdx = audioSize - sampleRate * spanSec`, and `audioSize` keeps advancing while the user waits
+silently for a verdict. Widening the span — which the two-strike rule explicitly relies on ("the
+second strike looks at MORE audio") — therefore looked at MORE SILENCE, and silence is exactly what a
+CTC head hallucinates on.
+
+**Fix — `SherpaPipeline.verifyTailWords` now stitches the span out of live-window-sized slices.**
+
+1. The span is decoded as `verifySliceSec`-second slices (4 s, 3 s stride ⇒ 1 s overlap, capped at
+   `verifyMaxSlices` = 6) whose words are POOLED, instead of one long buffer. This is "the live
+   decoder, looking harder" done properly: it uses the length the live path proves this model decodes
+   well. Pooling does NOT weaken soundness — a wider pool of RELIABLE words makes "the word is
+   absent" stronger evidence, not weaker.
+2. The window's END is anchored to `lastSpeechFrame` (+0.5 s pad) rather than `audioSize`, and its
+   HEAD is snapped to the first speech frame (keeping a 0.25 s run-up). `spanSec` now buys ACTUAL
+   speech. While the user is still reading — the normal case — `lastSpeechFrame` tracks `audioSize`,
+   so both are no-ops.
+3. Each slice must clear a 25 % speech-ratio gate, the same rule `snapshotWindow()` uses.
+4. `planVerifySlices(...)` is a pure, unit-tested helper (`VerifySlicePlanTest`). It walks BACKWARDS
+   from the newest audio — the frozen candidate always sits in the most recent speech, so when the
+   slice cap binds it must be the OLDEST audio that is dropped — and guarantees:
+   - **contiguous coverage**: consecutive slices abut or overlap. A gap would leave words undecoded,
+     and an undecoded word looks ABSENT — manufacturing exactly the false evidence this verifier must
+     never produce;
+   - **the last slice ends exactly at `toIdx`**. A forward integer-division stride lands a few frames
+     short and would leave the newest audio undecoded; the unit test caught this (span 15 s produced
+     239998 instead of 240000) before it ever reached the device.
+5. `appendWithoutOverlap(...)` drops the ≤2 words repeated at a seam, compared on normalized forms, so
+   pooling cannot inflate the word count the caller's `saneHits` / `need >= 8` guards read.
+
+**Caller-side soundness (`RecitationApp`).** Because the slice cap can drop the oldest audio,
+"absent from the pool" is only evidence for a candidate the pool actually SPANNED. Condemnation now
+additionally requires the decode to BRACKET the candidate — a decoded word matching a target BEFORE
+`idxToVerify` and one matching a target AFTER it. `saneHits` alone was satisfiable by words far from
+the candidate. This never weakens the forgiveness path and never permits a false accusation.
+
+### Verified on device — §4.25
+
+Built + installed on the A05s, `fatihah.wav` / `baqarah_start.wav`. Three consecutive runs each:
+
+| run | target | result | verification behaviour |
+| --- | --- | --- | --- |
+| c39 | Al-Fatihah 29w | **PASS 29/29** | 3 slices → `pooled=10w` → `verify idx=9 found=true`; **0 INCONCLUSIVE, 0 strikes** |
+| c40 | Al-Fatihah 29w | **PASS 29/29** | no verification needed at all (`[6] (none)`) |
+| c41 | Al-Fatihah 29w | **PASS 29/29** | 3 slices → `pooled=10w` → `verify idx=10 found=true`; 0 INCONCLUSIVE, 0 strikes |
+| c4 | Al-Baqarah 1–5 36w | **PASS 36/36** | `verify idx=1` word `ذَٰلِكَ` → 3 slices → `pooled=9w` → **`found=true`** |
+| c5 | Al-Baqarah 1–5 36w | **PASS 36/36** | identical to c4: `pooled=9w` → `found=true` |
+| c6 | Al-Baqarah 1–5 36w | **PASS 36/36** | TWO candidates forgiven: `idx=1 ذَٰلِكَ` (`pooled=8w`) and `idx=16 وَٱلَّذِينَ` (`pooled=7w`) |
+
+**All six runs: 0 INCONCLUSIVE, 0 `ABSENT strike`, 0 false accusations** (`confirmed (auto-pause +
+popup): 0`). Before this fix the same two targets logged three INCONCLUSIVEs (c2) and a `strike 1/2`
+(c3) per run.
+
+**c4 is the decisive run: it is the exact c2 failure case.** Same word, same index, same 10 s span —
+and where the old build returned `verified=6w found=false` → three INCONCLUSIVEs → ~20 s of doubt,
+the new build returns `verified=9w found=true` and forgives on the FIRST attempt:
+
+```
+span=10s tailSilence=0,0s -> 3 slice(s) of 4,0s
+slice 1/3 4,0s -> 2w 'تفسير سر'                          <- hallucinated, tolerated
+slice 2/3 4,0s -> 5w 'ذَلِكَ الْكِتَابُ لَا رَيْبَ فِيهِ'  <- the flagged word IS decoded here
+slice 3/3 4,0s -> 2w 'هُدًى لِلْمُتَّقِينَ'
+done 1864ms pooled=9w from 3 slice(s)
+verify idx=1 SKIPPED word='ذَٰلِكَ' verified=9w found=true viaArticle=false
+```
+
+Every run finished `autoFinalize(): grace expired with N/N words decided (unheard=0 mistake=false)`
+→ `endOfRange(): pendingRemain=false wrong=0 skipped=0`, and `confirmed (auto-pause + popup): 0` —
+zero false accusations. Cost: `done ~1.9 s` for 3 slices (~0.6 s per slice), comparable to the single
+long decode it replaced.
+
+One detail worth keeping in mind: c6 forgave `idx=16 وَٱلَّذِينَ` on a `pooled=7w` decode, i.e.
+BELOW `minDecodeWords = 8`. That is correct, not a hole — the count/sanity guards gate CONDEMNATION
+only. A thin decode may always FORGIVE; it may never CONDEMN. The asymmetry is the whole point:
+a false "no mistake" costs nothing, a false mistake popup accuses the user of a recitation error.
 
 ## 5. Why the previous pipeline is gone
 

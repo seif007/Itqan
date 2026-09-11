@@ -4643,6 +4643,31 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             val saneHits = verifiedWords.count { vw ->
                                 normalizeForComparison(vw, viewModel.riwayah) in nearTargets
                             }
+                            // ── POSITIONAL-COVERAGE GUARD ── saneHits only proves
+                            // the decode heard words from the ±8 NEIGHBOURHOOD, which
+                            // words far from the candidate can satisfy on their own.
+                            // The verifier stitches its span out of short slices and
+                            // DROPS the oldest audio once its slice cap binds, so
+                            // "absent from the pool" is only evidence for a candidate
+                            // the pool actually SPANNED. Demand a decoded word
+                            // matching a target BEFORE idxToVerify and one matching a
+                            // target AFTER it; otherwise this decode says nothing about
+                            // this position and condemning on it would raise a false
+                            // mistake on a correctly-read word.
+                            var sawBefore = false
+                            var sawAfter = false
+                            for (vw in verifiedWords) {
+                                val vn = normalizeForComparison(vw, viewModel.riwayah)
+                                for (t in targetNorm.indices) {
+                                    if (targetNorm[t].isEmpty()) continue
+                                    if (!isWordMatch(vn, targetNorm[t])) continue
+                                    if (t < idxToVerify) sawBefore = true
+                                    if (t > idxToVerify) sawAfter = true
+                                }
+                            }
+                            val bracketsCandidate =
+                                (idxToVerify <= 0 || sawBefore) &&
+                                    (idxToVerify >= targetNorm.size - 1 || sawAfter)
                             // ── TOO-SHORT-DECODE GUARD ── A DECODE THAT DROPPED THE
                             // WORD ONLY PROVES ABSENCE IF IT IS BIG ENOUGH TO HAVE
                             // CONTAINED IT. On device a truncated/folded slice returns
@@ -4653,11 +4678,12 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             // weak — require two, so a single lucky token cannot
                             // license a condemnation.
                             val minDecodeWords = if (targetNorm.size <= 12) 3 else 8
-                            if (saneHits < 2 || verifiedWords.size < minDecodeWords) {
+                            if (saneHits < 2 || verifiedWords.size < minDecodeWords || !bracketsCandidate) {
                                 android.util.Log.i(
                                     "ItqanSherpa",
                                     "mistakeStop(): verify idx=$idxToVerify INCONCLUSIVE — tail decode " +
                                         "(${verifiedWords.size}w, need >=$minDecodeWords) saneHits=$saneHits " +
+                                        "brackets=$bracketsCandidate (before=$sawBefore after=$sawAfter) " +
                                         "over targets $nearFrom..$nearTo; not condemning (will retry)"
                                 )
                                 // Normal cooldown, NOT an immediate retry: every decode is
