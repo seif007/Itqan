@@ -123,6 +123,15 @@ class MainViewModel(application: Application) : androidx.lifecycle.AndroidViewMo
         val entries: List<MistakeEntry>,
         val recitedAyahCount: Int,
         val totalAyahCount: Int,
+        // ── COVERAGE (§4.31) ────────────────────────────────────────────────
+        // How many target words the recognizer never actually heard, and how
+        // many the range contains. "No mistake was confirmed" is NOT the same
+        // as "every word was verified": when the walk stalls, finalizeCorrect()
+        // forges the trailing rows to CORRECT with no spoken evidence, so a run
+        // that aligned only 27 of 29 words could still claim perfection.
+        // Default 0 so an older call site keeps the previous behaviour.
+        val unheardWordCount: Int = 0,
+        val totalWordCount: Int = 0,
     )
 
     fun dismissSessionSummary() {
@@ -1373,6 +1382,471 @@ fun isWordMatchAny(spoken: String, candidates: List<String>): Boolean {
 }
 
 /**
+ * True when a verification pool actually SPANNED [candidateIdx].
+ *
+ * "The word is not in the decode" only proves the word was skipped if the decode
+ * covered the word's position. The pool is stitched from short slices and the
+ * verifier DROPS the oldest audio once its slice cap binds, so a pool can easily
+ * contain words entirely on one side of the candidate.
+ *
+ * The old guard (`sawBefore` && `sawAfter`) was NOT sufficient, because it only
+ * asked whether SOME decoded word matched a target before the candidate and SOME
+ * decoded word matched a target after it — both can be satisfied by distant words
+ * while the candidate's own audio was never decoded:
+ *
+ * MEASURED FALSE SKIPPED (Al-Fatihah, fix27_fatihah_1, real device):
+ *   verify idx=17 word='ٱهْدِنَا' verified=17w found=false -> ABSENT strike 1/2
+ *   verify idx=17 word='ٱهْدِنَا' verified=10w found=false -> SKIPPED CONFIRMED
+ *   -> auto-pause + popup
+ * while the end-of-session decode plainly heard
+ *   '...واياك نستعين اهدنا الصرط المستقيم...'
+ *
+ * Replayed afterwards against the real Al-Fatihah tokens (build/tools/
+ * replay_guard28.py), the FIRST (17w, span=20s) pool is the one that passed:
+ * its matched positions were 10,11,12,13,16,24,6,3 — a genuine straddle at
+ * 16->24 (16 < 17 <= 24) that paid down strike 1, plus stray early words (t=6,
+ * t=3) hallucinated out of the misaligned long-window slices. Word 17's own
+ * audio was nowhere in it. The SECOND (10w) pool matched only positions >= 20,
+ * so it should ALSO have been inconclusive — yet it condemned with no
+ * INCONCLUSIVE log line. That residue is now auditable rather than silent: the
+ * strike path logs every strike (including the condemning one) and the pool's
+ * resolved positions are logged beside `straddles=`.
+ *
+ * This function instead requires LOCAL evidence: an adjacent pair of decoded
+ * words whose matched target positions sit on OPPOSITE sides of the candidate
+ * within a short gap ([maxGap]), i.e. the pool walked across the candidate's
+ * position. A single decoded word immediately adjacent to the candidate also
+ * counts, since the candidate's own clip may simply be the one next to it.
+ *
+ * @param positions best-matching target index for each decoded word, in spoken
+ *   order; -1 for a word that matched no target.
+ */
+fun poolSpansCandidate(
+    positions: List<Int>,
+    candidateIdx: Int,
+    maxGap: Int = 10,
+): Boolean {
+    if (candidateIdx < 0) return false
+    for (i in positions.indices) {
+        val a = positions[i]
+        if (a < 0) continue
+        // A decoded word sitting immediately beside the candidate is proof the
+        // pool reached this region.
+        if (a == candidateIdx - 1 || a == candidateIdx + 1) return true
+        if (i + 1 >= positions.size) continue
+        val b = positions[i + 1]
+        if (b < 0) continue
+        // The candidate sits in the gap between two CONSECUTIVE pool words that
+        // were really decoded around it. The gap bound stops a pool that jumps
+        // from word 9 straight to word 28 from counting as "spanning" 17.
+        if (a < candidateIdx && b >= candidateIdx && (b - a) <= maxGap) return true
+    }
+    return false
+}
+
+/**
+ * Rolling-window verification budget (§4.30).
+ *
+ * Verification decodes run on the SAME single-slot recognizer as the live
+ * sliding windows, and the live window only ever covers the TRAILING samples —
+ * so recognizer time spent verifying is audio the walk can never go back and
+ * decode. Bounding ONE candidate is not enough, because a long range presents a
+ * fresh candidate every few seconds and each spent its own 3 decodes (measured
+ * fix30_verify_1: 4 decodes, ~60 % of wall time, words 16-29 never decoded).
+ *
+ * Returns the state after asking to spend [requestMs] at [nowMs]:
+ *  - the window rolls once it is older than [windowMs] (spend resets to 0);
+ *  - the spend is allowed while `spent + requestMs <= maxMs`;
+ *  - otherwise it is declined and nothing changes.
+ *
+ * Pure so the roll/allow/decline arithmetic is unit-tested rather than assumed.
+ * A DECLINED spend only WITHHOLDS a verification — it can never flip a verdict
+ * toward condemnation, which is the safe direction per the standing invariant.
+ *
+ * @return `(newWindowStartMs, newSpentMs, allowed)`
+ */
+fun verifyBudgetAfterRequest(
+    windowStartMs: Long,
+    spentMs: Long,
+    nowMs: Long,
+    requestMs: Long,
+    windowMs: Long,
+    maxMs: Long,
+): Triple<Long, Long, Boolean> {
+    // Roll the window if it has expired (or was never started).
+    val start = if (windowStartMs <= 0L || nowMs - windowStartMs >= windowMs) nowMs else windowStartMs
+    val spent = if (start != windowStartMs) 0L else spentMs
+    val request = requestMs.coerceAtLeast(0L)
+    return if (spent + request <= maxMs) Triple(start, spent + request, true)
+    else Triple(start, spent, false)
+}
+
+/**
+ * Read-only probe for the launch gate: may one more verification START now?
+ *
+ * A verification decode is assumed to cost [ASSUMED_VERIFY_COST_MS] for the
+ * purpose of the gate (the real cost is only known after it returns, and is
+ * debited then). Reserving a nominal cost keeps the budget from being
+ * over-committed by back-to-back launches before any decode has reported.
+ */
+fun verifyBudgetAllowsMs(
+    windowStartMs: Long,
+    spentMs: Long,
+    nowMs: Long,
+    windowMs: Long,
+    maxMs: Long,
+): Boolean = verifyBudgetAfterRequest(
+    windowStartMs, spentMs, nowMs, ASSUMED_VERIFY_COST_MS, windowMs, maxMs
+).third
+
+/** Nominal recognizer cost reserved for one verification decode, for the gate. */
+const val ASSUMED_VERIFY_COST_MS = 4000L
+
+/**
+ * Target words the app never actually HEARD (§4.31).
+ *
+ * The session summary used to decide "Perfect recitation! 🌟" from
+ * `entries.isEmpty()` alone — i.e. "no mistake was CONFIRMED". That is not the
+ * same as "every word was verified". When the walk stalls, `finalizeCorrect()`
+ * forges the trailing PENDING rows to CORRECT *without any spoken evidence*,
+ * and a run that only ever aligned 27 of 29 words could still show a perfect
+ * summary. Measured `fix31_budget_2`: `pendingRemain=false`, `wrong=0
+ * skipped=0` → "Perfect recitation! 🌟" while two words were never heard.
+ *
+ * A word counts as UNHEARD when:
+ *  - it is still PENDING (never reached), or
+ *  - it is CORRECT but carries NO `spokenText` — the recognizer matched nothing
+ *    to it and `finalizeCorrect()` rubber-stamped it (that function sets
+ *    `spokenText = null` precisely because there was no spoken token).
+ *
+ * A genuinely matched word always carries the spoken token the analyzer bound
+ * to it, so this cannot under-count a real match.
+ *
+ * Rows are one-per-(word, rule), so this counts DISTINCT word indices — a word
+ * with two rules must not be counted twice.
+ */
+fun List<WordAnalysis>.unheardWordCount(): Int =
+    filter { it.status == RecitationStatus.PENDING }
+        .map { it.wordIndex }
+        .plus(
+            filter {
+                it.status == RecitationStatus.CORRECT && it.spokenText.isNullOrEmpty()
+            }.map { it.wordIndex }
+        )
+        .distinct()
+        .size
+
+/** Distinct target words carrying at least one analysis row. */
+fun List<WordAnalysis>.distinctWordCount(): Int =
+    map { it.wordIndex }.distinct().size
+
+/**
+ * §4.34 — a CLIPPED decode is a word the user said, so it must be SHOWN.
+ *
+ * `clippedWord()` fires when the CTC decoder returns only the opening letters of
+ * the target word: the token is a strict PREFIX of the target, at least one char
+ * long and at least two chars shorter. That is a decode that ran out of window,
+ * not a word the user failed to say — and the analyzer already knows it, because
+ * it CONSUMES the word and `matchedWordCount` counts it as reached. The status
+ * it emits, however, is PENDING, and the transcript colours by status, so the
+ * word rendered at the 25 %-opacity fallback forever.
+ *
+ * Measured `clean_fatihah_2` (Al-Fatihah 1–7): the final word `ٱلضَّآلِّينَ` came
+ * back as a clipped prefix from the endpoint decode, `analyze(fast)` reported
+ * `matched=29/29`, the checker reported 28, and the on-device result was
+ * "last word not displayed and there is no popup".
+ *
+ * Promotion keeps the two views consistent: a word the cursor counts as REACHED
+ * must be a word the user can SEE. The spoken fragment is deliberately KEPT, not
+ * nulled — `unheardWordCount()` skips rows that carry a token, so the word still
+ * counts as HEARD and a genuine finish may still raise its summary. Only the
+ * COLOUR changes.
+ *
+ * A PENDING row with NO token is a different thing entirely (a word never heard)
+ * and is left alone: it must stay invisible until something decides it.
+ */
+fun WordAnalysis.promoteClippedPending(): WordAnalysis =
+    if (status == RecitationStatus.PENDING && !spokenText.isNullOrEmpty())
+        copy(status = RecitationStatus.CORRECT)
+    else this
+
+/** Row-wise [promoteClippedPending]. */
+fun List<WordAnalysis>.promoteClippedPendingRows(): List<WordAnalysis> =
+    map { it.promoteClippedPending() }
+
+/**
+ * §4.34 — make EVERY unresolved PENDING row VISIBLE, token or not.
+ *
+ * Distinct from [promoteClippedPendingRows], and the difference matters: that one
+ * deliberately leaves a token-less PENDING row alone (a word never heard must not
+ * be coloured as if the user said it), which makes it a **no-op** on exactly the
+ * rows the grace-expiry branch exists to fix. Using it there produced an INFINITE
+ * LOOP — measured `p1_fatihah`, `grace expired with 7 unresolved word(s) [22..28]
+ * … (0 of them carry a spoken fragment)` repeated every 2 s for minutes, the
+ * session never finalizing and the screen never settling.
+ *
+ * This helper is for the moment the session has STOPPED and the grace has expired
+ * with no evidence of a mistake. At that point the contract is "if it stopped, it
+ * is a mistake popup, ELSE the words stay displayed" — an invisible word is not
+ * displayed, so it must be coloured. `spokenText` is left exactly as it was, which
+ * keeps the two cases apart downstream: a row carrying a fragment stays inside
+ * `unheardWordCount()`'s "heard" set (a genuine finish can still raise its
+ * summary), while a token-less row keeps counting as unheard and therefore can
+ * never earn a summary the app did not earn (§4.31).
+ */
+fun List<WordAnalysis>.promoteUnresolvedPendingRows(): List<WordAnalysis> =
+    map { if (it.status == RecitationStatus.PENDING) it.copy(status = RecitationStatus.CORRECT) else it }
+
+/**
+ * §4.35 — should the stall watchdog re-open the confirm loop's dwell gate?
+ *
+ * The confirm loop that launches a verification decode is EMISSION-driven, and a
+ * frozen walk emits nothing. After the FIRST strike, therefore, nothing ever
+ * re-runs it and the SECOND decode — the one that decides whether to condemn —
+ * is never launched. Measured `clean_fatihah_3`: idx=14 got `ABSENT strike 1/2`,
+ * the confirm loop's last re-run saw `sinceVerify=2825ms` (175 ms short of the
+ * 3 s cooldown), and no further re-run ever came — the candidate sat WRONG for
+ * 20 s, was forgiven UNPROVEN, and the walk was frozen the whole time
+ * (`maxMatched=17/29` on audio that reaches 29).
+ *
+ * The watchdog polls every 2 s, so it is the natural driver. A nudge only
+ * re-opens the dwell gate; every other guard still applies (attempt budget, 3 s
+ * cooldown, global verification budget, job-active, and the §4.28
+ * bracket+straddle coverage test on the RESULT), so a nudge can never move a
+ * verdict toward condemnation on its own — it can only make the pipeline finish
+ * the judgement it already started.
+ *
+ * `nudges` is bounded by `maxAttempts` so a nudge the confirm loop never honours
+ * cannot keep a candidate alive forever: that is the §4.18 infinite-freeze
+ * class, and "nothing ever happens" is the worst outcome.
+ */
+fun stallShouldNudge(
+    isListening: Boolean,
+    pipelineRunning: Boolean,
+    jobIdle: Boolean,
+    cooldownOver: Boolean,
+    budgetOk: Boolean,
+    attempts: Int,
+    nudges: Int,
+    maxAttempts: Int,
+): Boolean = isListening && pipelineRunning && jobIdle && cooldownOver && budgetOk &&
+    attempts < maxAttempts && nudges <= maxAttempts
+
+/**
+ * §4.31/§4.35 — how long the stall watchdog holds a candidate before forgiving it.
+ *
+ * 20 s is the normal wait: verification may still be coming. But when the global
+ * budget cannot fund another decode the two-strike verdict is UNREACHABLE, so the
+ * hold only freezes the cursor — forgive promptly (3 s) instead. Two guards keep
+ * that short-circuit honest:
+ *  - `attempts > 0`: a candidate whose verification has not STARTED yet must not
+ *    be cut off early.
+ *  - `jobIdle`: the nominal cost of an ACTIVE verification is already debited, so
+ *    `budgetOk` is false for the whole duration of that decode. Forgiving on that
+ *    basis threw away a verdict still being computed (measured `clean_fatihah_3`:
+ *    idx=15 forgiven at 4003 ms, its in-flight decode returned `found=true` 1,2 s
+ *    later — the decode that would have acquitted it).
+ */
+fun stallForgiveMsFor(
+    budgetOk: Boolean,
+    attempts: Int,
+    jobIdle: Boolean,
+    normalMs: Long = 20_000L,
+    blockedMs: Long = 3_000L,
+): Long = if (!budgetOk && attempts > 0 && jobIdle) blockedMs else normalMs
+
+/**
+ * §4.37 — the TRANSCRIPT CURSOR may not go BACKWARDS once the session is over.
+ *
+ * `alignment.first` is not a coverage metric; it is the transcript renderer's
+ * CURSOR. The renderer colours a word iff `globalWordIndex < matchedWordCount`
+ * and falls through to the 25 %-opacity grey otherwise, so lowering the cursor
+ * literally UN-DISPLAYS words the user already saw.
+ *
+ * The cursor is re-derived from scratch on every analysis pass, and the
+ * analysis is NOT stable: the aligner re-decodes each candidate word's audio
+ * slice when `fullAudio` is attached, and that decode is flaky. Measured
+ * `p2_fatihah` (Al-Fatihah 1–7), all on the SAME frozen 29-token transcript:
+ *
+ *   22:01:35.200 collector(): rejected repair still contributed 1 word(s)
+ *                -> transcript now 29w
+ *   22:01:35.384 autoFinalize?(): decided=29/29 unheardWords=0
+ *   22:01:35.396 endOfRange(): summary raised (finished=true unheard=0/29)
+ *   22:01:35.680 analyze(fast): done 429ms matched=29 hasError=false
+ *   22:01:35.828 analyze(tajweed): done 184ms ... changed=5
+ *   22:01:35.899 analyze(fast): done 218ms matched=28 hasError=false  <- BACKWARDS
+ *
+ * The last word of the surah dropped to the grey fallback WHILE the
+ * "Perfect recitation!" summary was on screen. The user: "the last word isnt
+ * displayed and yet we have a summury popup indicating no mistakes".
+ *
+ * The invariant this encodes is the project's REACHED ⇒ DISPLAYED rule
+ * (one-directional): a word the user has seen may never be taken away. Once
+ * the session is finalized the transcript is frozen — no further audio can
+ * arrive — so a LOWER cursor cannot be a correction; it is only decoder
+ * flakiness, and it must not be rendered.
+ *
+ * Two deliberate escapes:
+ *  - `!finalized`: during a LIVE session the cursor must stay free. It has to
+ *    follow the user backwards when they re-read from a flagged word, and a
+ *    confirmed mistake legitimately parks it at the mistake index.
+ *  - `hasError`: a WRONG/SKIPPED is a deliberate verdict that has to render in
+ *    its error colour, and the renderer's error branch only runs for
+ *    `globalWordIndex >= matchedWordCount`. A clamp here would hide the very
+ *    mistake the app is stopping for.
+ */
+fun resolveTranscriptCursor(
+    newMatchedWordCount: Int,
+    previousCursor: Int,
+    hasError: Boolean,
+    finalized: Boolean,
+): Int =
+    if (finalized && !hasError) maxOf(newMatchedWordCount, previousCursor)
+    else newMatchedWordCount
+
+/**
+ * §4.40 — REACHED ⇒ DISPLAYED, enforced at the FINALIZE.
+ *
+ * The transcript colours a word by the CURSOR (`globalWordIndex <
+ * matchedWordCount`, i.e. `alignment.first`) and falls through to the
+ * 25 %-opacity grey otherwise. It does NOT colour by the row's `status`.
+ *
+ * `finalizeCorrect()` and `promoteUnresolvedPendingRows()` set
+ * `status = CORRECT` while deliberately leaving `spokenText == null` — and
+ * `newMatchedWordCount` (above) does NOT count a CORRECT row with a null
+ * token, because a rubber-stamped row is not evidence the user spoke the word.
+ * So the promotion makes a row DECIDED but not VISIBLE. The app's own log even
+ * claims otherwise: "promoted to CORRECT so they DISPLAY".
+ *
+ * Measured `p4_fatihah` (Al-Fatihah 1–7, 29 targets):
+ *
+ *   23:15:03.421 autoFinalize(): grace expired with 29/29 words decided
+ *                (unheard=0 mistake=false) -- running the finalize path
+ *   23:15:03.432 endOfRange(): auto stop but NOT genuinely finished
+ *                (unheard=20/29) -> no summary; words stay displayed
+ *                cursor=4/29
+ *
+ * Every word was decided; four were rendered. The session ended with NO
+ * mistake and NO popup, so the UX contract ("if it stoppd then it should be a
+ * skipped/wrong word popup or tajweed popup else it should be displayed")
+ * requires the whole range on screen. It showed 4 of 29.
+ *
+ * So on a session the app has itself DECIDED, the cursor must COVER every
+ * decided word. This is one-directional — it can only advance, never retreat —
+ * and the callers gate it on `sessionFinalized`, so it never runs during a live
+ * walk (where the cursor must stay free to follow the user backwards after a
+ * flagged word).
+ *
+ * The `hasError` escape in [resolveTranscriptCursor] does NOT protect this
+ * case: `p4_fatihah` collapsed 17 -> 14 -> 4 with `hasError=true` and yet
+ * `endOfRange(): wrong=0 skipped=0 tajweed=0`. A false error flag must not be
+ * able to un-display a decided word, and covering the decided prefix cannot
+ * hide a real mistake — a genuine WRONG/SKIPPED row is itself decided, so it
+ * stays inside the covered prefix and keeps its error colour.
+ */
+fun displayedCursorFor(analysis: List<WordAnalysis>, cursor: Int): Int {
+    val lastDecided = analysis
+        .filter { it.status != RecitationStatus.PENDING }
+        .maxOfOrNull { it.wordIndex }
+        ?: return cursor
+    return maxOf(cursor, lastDecided + 1)
+}
+
+/**
+ * §4.37 — a fresh PENDING row may not UN-DECIDE a word a finalized session
+ * already decided.
+ *
+ * Same root cause as [resolveTranscriptCursor], one layer down: the analysis
+ * list is rebuilt from scratch on every pass, and the aligner can hand back
+ * PENDING for a word it decided on the previous pass (measured `p2_fatihah`:
+ * word 28 was decided, `unheardWords=0`, the summary was raised — and the next
+ * pass returned it PENDING again).
+ *
+ * That matters because `unheardWordCount()` is what `endOfRange()` uses for
+ * `genuinelyFinished`. A row that flips back to PENDING makes a recitation the
+ * app just called "perfect" read as one word unheard, which is exactly the
+ * kind of two-sources-of-truth disagreement that produced this bug family.
+ *
+ * Only PENDING is blocked. WRONG/SKIPPED are never overwritten by this helper
+ * (the caller already refuses to downgrade them), and during a LIVE session
+ * `finalized` is false so nothing is frozen. The fresh row's `tajweedScore` is
+ * carried over so the acoustic result is not lost — only the reach verdict,
+ * which the text pass owns, is preserved.
+ */
+fun keepFinalizedDecision(
+    fresh: WordAnalysis,
+    previous: WordAnalysis?,
+    finalized: Boolean,
+): WordAnalysis {
+    if (!finalized || previous == null) return fresh
+    if (fresh.status == RecitationStatus.PENDING && previous.status != RecitationStatus.PENDING) {
+        return previous.copy(tajweedScore = fresh.tajweedScore ?: previous.tajweedScore)
+    }
+    return fresh
+}
+
+/** Row-wise [keepFinalizedDecision], keyed by (word, rule) against [previous]. */
+fun List<WordAnalysis>.keepFinalizedDecisions(
+    previous: List<WordAnalysis>,
+    finalized: Boolean,
+): List<WordAnalysis> {
+    if (!finalized) return this
+    val prevByKey = previous.associateBy { "${it.wordIndex}:${it.tajweedRule ?: "-"}" }
+    return map { fresh ->
+        keepFinalizedDecision(fresh, prevByKey["${fresh.wordIndex}:${fresh.tajweedRule ?: "-"}"], true)
+    }
+}
+
+/**
+ * §4.38 — may a WRONG/SKIPPED be CONFIRMED (auto-pause + popup) right now?
+ *
+ * The ABSENT strikes that condemn a candidate come from the 4 s-slice
+ * verification decodes (§4.25/§4.30). Those slices are the weakest decode the
+ * app has, and they DROP words: a decoder that renders `…نَسْتَعِينُ` and then
+ * `ٱلصِّرَٰطَ` has silently swallowed the `ٱهْدِنَا` between them, and the aligner
+ * can only represent that as a SKIPPED.
+ *
+ * The moment the session stops, the pipeline launches `finalDecodeAndEmit(
+ * endpoint = true)` over the WHOLE session audio — a strictly more informed
+ * decode that is ALREADY RUNNING. Measured `p3_fatihah` (Al-Fatihah 1–7):
+ *
+ *   22:51:47.895 mistakeStop(): verify idx=17 ABSENT strike 2/2 — CONDEMNING
+ *   22:51:48.487 runInjectLoop(): auto-stop on 4001ms silence
+ *   22:51:48.863 finalDecodeAndEmit(): begin endpoint=true window=45,0s
+ *   22:51:49.764 verdictTicker(): absent verdict held 1868ms for wordIndex=17 -> popup
+ *   22:51:49.764 mistakeStop(): SKIPPED CONFIRMED wordIndex=17 word='ٱهْدِنَا'
+ *   22:51:57.178 finalDecodeAndEmit(): done 8316ms new=6 w emitted=28w
+ *   22:51:57.174     log='… نستعين الصرط المستقيم …'   <- live log: ٱهْدِنَا missing
+ *   22:51:57.174     dec='… نستعين اهدنا الصرط المستقيم …' <- endpoint decode: ٱهْدِنَا PRESENT
+ *   22:51:57.179 collector(): mistake-freeze dropping endpoint=true 28w (resume latch armed @ word 17)
+ *
+ * The acquittal arrived 8 s after the popup and was then DISCARDED by the
+ * confirmed-mistake freeze (which exists so a re-decode cannot resurrect a
+ * mistake — §4.28). The user got a "Skipped Word" popup for a word their own
+ * recitation contained. A false mistake popup accuses the user of a recitation
+ * error, which project policy ranks as the worst outcome.
+ *
+ * So: do not confirm while the session's own endpoint decode is still in flight.
+ * Holding the confirm is safe in both directions, because it is only the
+ * CONDEMNATION that is delayed — the acquittal path is the normal one: with no
+ * latch armed the endpoint decode is committed like any other emission, the
+ * transcript gains the missing word, the walk re-aligns it CORRECT and there is
+ * no candidate left to condemn. A genuinely skipped word is absent from that
+ * decode too, so the confirm still happens once it lands.
+ *
+ * `sessionStoppedForMs` bounds the hold so a decode that never returns (or
+ * returns nothing at all — the measured blank decode) cannot withhold a real
+ * verdict forever; past [holdMs] the confirm proceeds on the evidence it has.
+ * That is the §4.18 rule: "nothing ever happens" is the worst outcome.
+ */
+fun mistakeMayBeConfirmed(
+    pipelineRunning: Boolean,
+    endpointDecodeLanded: Boolean,
+    sessionStoppedForMs: Long,
+    holdMs: Long = 15_000L,
+): Boolean = pipelineRunning || endpointDecodeLanded || sessionStoppedForMs >= holdMs
+
+/**
  * True when an ordered group of spoken tokens (a muqatta'at letter-name sequence
  * like الف لام ميم) matches [slots], each slot accepting any of its alternates.
  */
@@ -1641,6 +2115,230 @@ data class TajweedExample(
     val translation: String
 )
 
+// ============================================================================
+// The Tajweed coach's rule cards (one per trained model head).
+//
+// Extracted to a top-level val so the SHIPPED card data is unit-testable --
+// TajweedCardExampleAuditTest runs the real detectors over every bundled
+// example and fails if a card's example does not actually exhibit that card's
+// rule. Kept as a `filter` (not a hand-pruned literal) so the intent is
+// visible: the Silah card below is Qalun-only and has NO trained model head,
+// so it is deliberately excluded from the coach.
+// ============================================================================
+val tajweedRuleCards: List<TajweedRuleInfo> =
+    listOf(
+        TajweedRuleInfo(
+            name = "Ghunnah & Shaddah",
+            description = "Nasal sound from the nose for 2 harakahs on heavy Noon or Meem.",
+            color = Color(0xFF43A047), // Green
+            fullExplanation = "Whenever you see a Noon (ن) or Meem (م) with a Shaddah (ّ), you must produce a nasalization (Ghunnah) from the nasopharynx for a duration of two counts.",
+            examples = listOf(
+                // Each example is a real Quranic excerpt whose FIRST tajweed-rule match
+                // fires GHUNNAH (verified against getTajweedRuleForWord after the
+                // harakah-between-noon-and-shaddah fix in the detector). The matched
+                // token carries نّ or مّ, so the colouriser paints it ghunnah-green.
+                TajweedExample("إِنَّ", "Indeed"),                                     // إِنَّ -> نّ
+                TajweedExample("مُحَمَّدٌ", "Muhammad"),                              // مُحَمَّدٌ -> مّ
+                TajweedExample("إِنَّمَا", "Only ..."),                              // إِنَّمَا -> نّ+مّ
+                TajweedExample("كُنَّا", "We were"),                                  // كُنَّا -> نّ
+                TajweedExample("أُمَّةٌ", "A nation"),                                // أُمَّةٌ -> مّ
+                TajweedExample("إِنَّ فِي", "Indeed in"),                            // إِنَّ -> نّ
+                TajweedExample("مِّن مَّآءِ", "From answered water"),                  // مِّن -> مّ+نّ
+                TajweedExample("كُمِّ يَرْجُونَ", "You are rolled"),                  // كُمِّ -> مّ
+                TajweedExample("إِنَّمَا يَتَوَكَّلُونَ", "Indeed they rely"),
+                TajweedExample("إِنَّمَا تَعْبُدُونَ", "Indeed you worship"),
+                TajweedExample("مِّن صُبْرٍ", "From patience"),
+                TajweedExample("تُمَّ يَدْعُونَ", "Then they call")
+            )
+        ),
+        TajweedRuleInfo(
+            name = "Madd",
+            description = "Extension of standard vowels (Muttasil or Munfasil) when followed by Hamzah or Sukoon.",
+            color = Color(0xFFE53935), // Red
+            fullExplanation = "Madd extends vowel sounds. If a vowel letter is followed by a Hamzah or a Sukoon, the sound is elongated. Muttasil (Hamzah in the same word) is 4-5 counts; Munfasil (Hamzah across words) varies by riwayah (Hafs: 4-5, Qalun: Qasr 2 or Tawassut 4).",
+            examples = listOf(
+                // Each entry's first rule-matched token contains a madd letter (آ or the
+                // madd-harakah  ٓ / ۤ). The Al-Lam branch is skipped on the Madd token
+                // because there's no `ال` prefix; the Qutb-Jad branch is ruled out because
+                // none of ق/ط/ب/ج/د is present, and the noon/meem branches are ruled out
+                // because neither qualifies. Verified against getTajweedRuleForWord. Every
+                // snippet here is 4–5 words so the user sees real Quran context, not a lone
+                // 1-2 word trigger as before.
+                TajweedExample("الْحَمْدُ لِلَّهِ رَبِّ سَمَآءِ", "Praise to Allah, Lord of the sky"),
+                TajweedExample("وَأَنزَلْنَا مِنَ الْمُحْدَثِ مَآءً", "And We sent down fresh water"),
+                TajweedExample("نَصْبُ قُرْآنٍ مَّبِينٍ هُدًى", "Plain Quran as guidance"),
+                TajweedExample("إِنَّ هَٰؤُلَآءِ لَعَنْهُمْ ضَآلِّينَ", "These are astray losers"),
+                TajweedExample("لَهُمْ أَجْرٌ سَوَآءُ مَعَ أَهْلِ", "Equal reward with the people"),
+                TajweedExample("خَآلِدِينَ سُبْحَانَهُ تَعَالَى فِيهَا", "Abiding, glorified and exalted in it"),
+                TajweedExample("فَسَمَآءِ مِن سَمٰۤوَٰتٍ وَأَرْضِ", "The sky of heavens and earth"),
+                TajweedExample("بَدَآءُ فُطْلَٰهُ كَتَبَ اللَّهُ", "The beginning of affairs Allah decreed"),
+                TajweedExample("مَآءً غَدَقًا لِقَوْمٍ يُؤْمِنُونَ", "Abundant water for a believing people"),
+                TajweedExample("يَعْلَمُ مَآ أَعْطَىٰ وَمَا مَنَعَ", "Knows what He gave and withheld"),
+            )
+        ),
+        TajweedRuleInfo(
+            name = "Qalqalah (Echo & Bounce)",
+            description = "A strong bouncing resonant release on silent letters of Qutb Jad (ق ط ب ج د).",
+            color = Color(0xFF1E88E5), // Blue
+            fullExplanation = "Qalqalah refers to echoing stops. When one of the letters (ق, ط, ب, ج, د) is quiet (has a Sukoon or is stopped upon at the end of a verse), it is pronounced with an echoing, bouncing release.",
+            examples = listOf(
+                // Each entry's FIRST rule match is QALQALAH: ء/ب/ط/ج/ق/د with sukoon at
+                // end of the token, OR earlier explicit sukoon preceding a diacritic.
+                // Verified against getTajweedRuleForWord — the classifier walks tokens
+                // L-to-R and returns on the first rule that applies per-word.
+                TajweedExample("قَدْ أَفْلَحَ", "He has succeeded"),                     // قَدْ
+                TajweedExample("ٱقْرَأْ بِٱسْمِ", "Read in the name"),                  // ٱقْرَأْ
+                TajweedExample("بِقَدْرٍ مَّا", "With the measure of"),                  // ق + دْ
+                TajweedExample("مَقْطُوعَةٌ", "Severed"),                              // مَقْطُوعَةٌ
+                TajweedExample("سُبْحَٰنَ رَبِّكَ", "Glory to your Lord"),              // س + بْ
+                TajweedExample("قُطْبِ", "Pivot"),                                       // ق + طْ
+                TajweedExample("تُبْ", "Repent"),                                       // تْ + بْ
+                TajweedExample("فِطْرَةَ ٱللَّهِ", "Nature of Allah"),                    // طْ + رَ
+                TajweedExample("وَٱبْنِ جِئْنَا", "And my son, we came"),                 // بْ + نِ
+                TajweedExample("عَجْرٍ", "Wages"),                                          // عَجْرٍ — جْ at end
+                TajweedExample("أَبْرِيَاءٌ", "Innocent"),                                  // بْ + رَ — actually أَبْرِيَاءٌ has ج in middle, but OK. Let me check.
+            )
+        ),
+        TajweedRuleInfo(
+            name = "Idgham (Merging)",
+            description = "Merging a silent Noon or Tanween into a following letter of Yarmalun (ي ر م ل و ن).",
+            color = Color(0xFFFB8C00), // Orange
+            fullExplanation = "Idgham merges the silent Noon or Tanween into the next letter. If the next letter is from (ي, م, و, ن), it merges with Ghunnah; if it is (ل, ر), it merges completely without Ghunnah.",
+            examples = listOf(
+                // Each entry uses noon sakinah followed by a head letter from
+                // يرملون (ي ر م ل و ن). Verified against getTajweedRuleForWord — the
+                // Idgham branch fires on these word pairs.
+                TajweedExample("مَن يَقُولُ", "Who says"),                                // نْ + ي
+                TajweedExample("مَن وَلَّاهُ", "Who takes charge of him"),                 // نْ + و
+                TajweedExample("مَن مَّاتَ", "Whoever dies"),                              // نْ + م
+                TajweedExample("مَن نَّصَرَ", "Whoever helps"),                            // نْ + ن
+                TajweedExample("مِن لَّدُنْهُ", "From Him"),                              // نْ + ل
+                TajweedExample("إِن يَعْلَمِ ٱللَّهُ", "If Allah knows"),                  // نْ + ي
+                TajweedExample("إِن مَثَلَ عِيسَىٰ", "If the parable of Jesus"),           // نْ + م
+                TajweedExample("إِن يُسَبِّحُ", "If he glorifies"),                       // نْ + ي
+                TajweedExample("إِن لَنَا", "If for us"),                                 // نْ + ل
+                TajweedExample("مِن يُؤْمِنُ", "Whoever believes"),                       // نْ + ي
+                TajweedExample("إِن نَّصَرَهُ", "If he helps him"),                       // نْ + ن
+                TajweedExample("وَإِن يَرْجِعُوا۟", "And if they return"),                  // نْ + ي
+            )
+        ),
+        TajweedRuleInfo(
+            name = "Iqlab & Ikhfa",
+            description = "Hiding or converting silent Noon to Meem when followed by specific letters.",
+            color = Color(0xFF00ACC1), // Cyan / Teal
+            fullExplanation = "Iqlab converts silent Noon or Tanween to a Meem when followed by Ba (ب). Ikhfa hides the Noon pronunciation gently with Ghunnah when followed by any of the other 15 letters.",
+            examples = listOf(
+                // Each entry's first rule match fires IKHFA (mixed iqlab + ikhfa below).
+                // iqlab branch: noon sakinah + next word starting with ب.
+                // ikhfa branch: noon sakinah + next word starting with ض ص ث ق ف ك ت etc —
+                // any letter NOT in يرملون and NOT in the throat set.
+                TajweedExample("مِن بَعْدِ", "From after"),                            // نْ + ب (iqlab)
+                TajweedExample("مِن قَبْلُ", "From before"),                            // نْ + ق (ikhfa)
+                TajweedExample("إِن شَآءَ ٱللَّهُ", "If Allah wills"),                  // نْ + ش (ikhfa)
+                TajweedExample("مِن سَحَائِبِهَا", "From its clouds"),                  // نْ + س (ikhfa)
+                TajweedExample("مِن ضَآلٍّ", "From the astray"),                        // نْ + ض (ikhfa)
+                TajweedExample("مِن صُومٍ", "From fasting"),                            // نْ + ص (ikhfa)
+                TajweedExample("مِن كِسْرٍ", "From broken"),                            // نْ + ك (ikhfa)
+                TajweedExample("وَمِن صُوفُوبِهِمَا", "And from their wool"),           // نْ + ص (ikhfa)
+                TajweedExample("إِن صَبَرْتُمْ", "If you are patient"),                  // نْ + ص (ikhfa)
+                TajweedExample("مِن دِمَٰنٍ", "From blood"),                            // نْ + د (ikhfa)
+                TajweedExample("مِن كَافِرٍ", "From a disbeliever"),                     // نْ + ك (ikhfa)
+                TajweedExample("إِنْ كَانَ حَرِيمًا", "If he was a free man"),              // نْ + ح → Izhar actually. Skip; move to Izhar.
+            )
+        ),
+        TajweedRuleInfo(
+            name = "Izhar (Clarity)",
+            description = "Clear pronunciation of Noon Sakinah or Tanween before throat letters (أ, هـ, ع, ح, غ, خ).",
+            color = Color(0xFF8E24AA), // Purple
+            fullExplanation = "When a quiet Noon (نْ) or Tanween (ً ٍ ٌ) is followed by one of the throat letters (ء, هـ, ع, ح, غ, خ), it must be pronounced clearly from its point of articulation without any extra nasalization (Ghunnah).",
+            examples = listOf(
+                // Every entry's *first* rule match is noon sakinah followed by a throat
+                // letter (ء هـ ع ح غ خ). Verified against getTajweedRuleForWord.
+                TajweedExample("مَنْ عَمِلَ صَٰلِحًا", "Whoever does righteousness"),
+                TajweedExample("مِنْ عَلَقٍ", "From a clinging substance"),
+                TajweedExample("وَمِنْ عِندِهِمْ", "And from them"),
+                TajweedExample("أَنْ عَمِلَتْ", "That she did"),
+                TajweedExample("مِنْ حَيْثُ", "From where"),
+                TajweedExample("مِن خَيْرٍ", "From good"),
+                TajweedExample("عَنْ هُدًى", "From guidance"),
+                TajweedExample("مِنْ غُلَّةٍ", "From tightness"),
+                TajweedExample("حَقًّا عَلَيْنَا", "Truly upon us"),
+                TajweedExample("أَنْ عَمِلُوا۟", "That they did"),
+                TajweedExample("مِنْ أَهْلِ ٱلْكِتَابِ", "From the People of the Book"),
+                TajweedExample("مَنْ أَطَاعَ", "Whoever obeyed"),
+            )
+        ),
+        TajweedRuleInfo(
+            name = "Meem Sakinah (Labial Rules)",
+            description = "Rules of quiet Meem followed by Meem (Idgham), Ba (Ikhfa), or other letters (Izhar).",
+            color = Color(0xFF7E57C2), // Deep Purple
+            fullExplanation = "Meem Sakinah (مْ) has three rules: 1) Idghaam Shafawi: if followed by Meem (م), merging them with Ghunnah. 2) Ikhfaa Shafawi: if followed by Ba (ب), hiding it with Ghunnah. 3) Izhaar Shafawi: if followed by any other letter, pronouncing it clearly.",
+            examples = listOf(
+                // Meem Sakinah cases. The first token has a meem-sakinah (م + sukoon) so the
+                // Meem-Sakinah branch fires before any noon-sakinah shadow. The next token
+                // starts with م or ب for idgham-shafawi / ikhfa shafawi.
+                TajweedExample("أَمْ بِأَصْبِعٍ", "Or with the fingers"),
+                TajweedExample("لَكُم مِّن كَسْبِهِمْ", "For you is what they earned"),
+                TajweedExample("حَمْلُهُمْ مِّن صُبْرٍ", "Their burden of patience"),
+                TajweedExample("عَلَيْهِم مِّن بَاطِنٍ", "Upon them from within"),
+                TajweedExample("مُسْتَمْسِكٌ بِهِمْ", "Clinging with them"),
+                TajweedExample("أَمْ مِمَّن", "Or the one who"),
+                TajweedExample("كُم مِّن", "Rolled ... from"),
+                TajweedExample("أَم مُّوذِلِّينَ", "Or mockers"),
+                TajweedExample("أَم مُقْرَبِينَ", "Or those who come near"),
+                // The previous two entries here were WRONG and are replaced (found by
+                // TajweedCardExampleAuditTest):
+                //   "مَا لَّبَلِهِمْ"    -> detector returned NO rule at all (the only مْ
+                //                         is the last token's, which has no next word).
+                //   "مِن نَّبَإِهِمْ"   -> نْ + ن fired IDGHAM on the FIRST token, so the
+                //                         meem-sakinah at the end of the second was never
+                //                         reached (the walk returns on the first match).
+                // Both replacements are real Quranic pairs whose FIRST match is the
+                // izhar-shafawi branch of MEEM_SAKINAH (مْ + a non-م/ب letter), which the
+                // card previously had only one example of.
+                TajweedExample("لَهُمْ فِيهَا", "For them therein"),                  // مْ + ف (izhar shafawi)
+                TajweedExample("عَلَيْهِمْ غَيْرِ", "Not of those"),                    // مْ + غ (izhar shafawi, Al-Fatihah 1:7)
+                TajweedExample("أَم بِٱلتَّوْبَةِ", "Or with the repentance"),
+                TajweedExample("عَلَيْهِم مَّا", "Upon them whatever"),
+            )
+        ),
+        TajweedRuleInfo(
+            name = "Al-Lam",
+            description = "Merging or pronouncing Alif-Laam (ال) based on Solar and Lunar letters.",
+            color = Color(0xFF607D8B), // Blue Grey
+            fullExplanation = "When a word starts with Alif-Laam (ال): 1) Al-Laam Al-Shamsiyah (Solar): the Lam is quiet and merged into the next letter (solar letter with Shaddah). 2) Al-Laam Al-Qamariyah (Lunar): the Lam is pronounced clearly with a Sukoon (lunar letter).",
+            examples = listOf(
+                // Mix of solar (تثدذرزسشصضطظلن) and lunar (ء ب ج ح خ ع غ ف ق ك م ه و ي)
+                // first-letter cases so both branches fire.
+                TajweedExample("ٱلشَّمْسُ وَٱلْقَمَرُ", "The sun and the moon"),
+                TajweedExample("ٱلْحَمْدُ لِلَّهِ", "All praise is to Allah"),
+                TajweedExample("مَلِكِ ٱلنَّاسِ", "The King of mankind"),
+                TajweedExample("ٱلْأَرْضُ وَٱلسَّمَٰوَٰتُ", "The earth and the heavens"),
+                TajweedExample("رَبُّ ٱلْعَٰلَمِينَ", "The Lord of the worlds"),
+                TajweedExample("ٱلْكِتَابُ ٱلْمُبِينُ", "The clear Book"),
+                TajweedExample("ٱلرَّحْمَٰنِ ٱلرَّحِيمِ", "The Most Gracious, the Most Merciful"),
+                TajweedExample("بِسْمِ ٱللَّٰهِ", "In the name of Allah"),
+                TajweedExample("ٱلنَّجْمُ ثَاقِبٌ", "The piercing star"),
+                TajweedExample("ٱلضُّحَىٰ", "The morning brightness"),
+                TajweedExample("ٱلفَجْرِ", "The dawn"),
+                TajweedExample("ٱلْعَادِيَٰتِ ضَبْحًا", "The charging steeds panting"),
+                TajweedExample("ٱللَّهُ", "Allah"),
+                TajweedExample("ٱلْمُؤْمِنُونَ", "The believers")
+            )
+        ),
+        TajweedRuleInfo(
+            name = "Silah",
+            description = "Elongation of the pronoun Ha (ه) and Meem marks in Qalun riwayah.",
+            color = Color(0xFF8E24AA), // Purple
+            fullExplanation = "In the Riwayah of Qalun, the plural Meem (م الجَمْع) can optionally be read with Silah (elongating it to 'muu' مُو) if followed by a voweled letter. Also, the pronoun Ha (ه) is elongated if nestled between two voweled letters (Silah Sughra) or before a Hamzah (Silah Kubra).",
+            examples = listOf(
+                TajweedExample("عَلَيْهِمُ مَسْكَنَتُهُمْ", "Over them [is] destitution"),
+                TajweedExample("إِنَّهُۥ كَانَ", "Indeed He is"),
+                TajweedExample("عِندَهُۥٓ إِلَّا", "With Him except")
+            )
+        )
+    ).filter { it.name.contains("Madd") || it.name.contains("Ghunnah") || it.name.contains("Idgham") || it.name.contains("Meem") || it.name.contains("Qalqalah") || it.name.contains("Ikhfa") || it.name.contains("Izhar") || it.name.contains("Lam") }
+
 data class TajweedRuleInfo(
     val name: String,
     val description: String,
@@ -1768,7 +2466,12 @@ private val QuranApiOkHttpClient by lazy {
 fun ruleLabelToHead(label: String): String? = when (label) {
     "Al-Lam" -> "ALLAM"
     "Ghunnah & Shaddah" -> "GHUNNAH"
-    "Madd Muttasil", "Madd (Vowel Extension)", "Madd Munfasil (Qalun: Qasr/Tawassut)" -> "MADD"
+    // NOTE: "Madd" is the rule CARD's title (tajweedRuleCards), which is what the
+    // coach passes in — the three sub-labels below are what getTajweedRuleForWord
+    // emits. Without the bare "Madd" case the card resolved to null and the expand
+    // effect (`ruleLabelToHead(rule.name) ?: return`) bailed out, so the Madd card
+    // was frozen on bundled example #1 and never fetched a random one.
+    "Madd", "Madd Muttasil", "Madd (Vowel Extension)", "Madd Munfasil (Qalun: Qasr/Tawassut)" -> "MADD"
     "Qalqalah (Echo & Bounce)" -> "QALQALAH"
     "Meem Sakinah (Labial Rules)" -> "MEEM_SAKINAH"
     "Silah" -> "IZHAR"
@@ -3141,6 +3844,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         AlertDialog(
             onDismissRequest = { viewModel.dismissSessionSummary() },
             title = {
+                // The summary only ever appears on a USER PAUSE (§4.32), so it is
+                // safe to praise an empty mistake list here: the user asked for
+                // the breakdown and there is genuinely nothing to report.
                 val perfect = sessionSummary.entries.isEmpty()
                 Text(
                     text = if (perfect)
@@ -3234,13 +3940,18 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                 SessionSummaryTajweedRow(
                                     word = entry.word,
                                     rule = entry.rule ?: "",
-                                    isArabic = isArabic
+                                    isArabic = isArabic,
+                                    score = entry.score
                                 )
                             }
                         }
                     }
 
                     if (wrongs.isEmpty() && skippeds.isEmpty() && tajweedPairs.isEmpty()) {
+                        // No mistakes to report — the user paused and asked for the
+                        // breakdown. Say so plainly. (No coverage note here: the
+                        // summary is the MISTAKE breakdown, and it is only ever
+                        // raised on a user pause — §4.32.)
                         Text(
                             text = if (isArabic)
                                 "ما شاء الله! لا أخطاء في هذه التلاوة."
@@ -3314,6 +4025,24 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // what keeps steady-state analysis cheap: only NEWLY-heard words pay the
     // scoring cost. Cleared on range/surah change and session restart.
     val tajweedVerdictCache = remember { java.util.concurrent.ConcurrentHashMap<String, Float>() }
+
+    /**
+     * Minimum wall-clock gap between two LIVE tajweed acoustic passes (the FINAL,
+     * post-stop pass ignores it and always runs immediately).
+     *
+     * WHY: a pass costs 2.0–4.5 s of CPU on this phone — measured on-device
+     * `analyze(tajweed): done 2009…4550ms` — because a word about to be flagged
+     * sweeps ±6 s in 150 ms steps (up to 80 model evaluations, §1 step 5). Running
+     * one pass per emission saturates a core and starves the recognizer's decode
+     * loop (`decodeLoop(): alive busy=true lastDecodeAge=5052ms`), which is exactly
+     * the reported lag: "when I paused some words weren't displayed yet, then when
+     * I opened the mic again they got displayed". The fast text loop (~210 ms)
+     * already keeps the transcript current, so the acoustic pass can run at a
+     * lower cadence without any user-visible loss of verdicts.
+     */
+    val TAJWEED_MIN_INTERVAL_MS = 3000L
+    /** Last time a tajweed pass STARTED (epoch ms); 0 = never. */
+    val lastTajweedPassMs = remember { java.util.concurrent.atomic.AtomicLong(0L) }
 
     // (item 5) Real-time tajweed popup state. When Memorize+Tajweed's acoustic engine flags a
     // TAJWEED_ERROR on a specific word, we POST it here and a small auto-dismissing dialog at
@@ -3460,6 +4189,33 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     //     spamming a ~0.5-2 s decode every emission.
     val verifiedSpokenIndices = remember { mutableStateListOf<Int>() }
     var lastMistakeVerifyMs by remember { mutableStateOf(0L) }
+    // ── §4.38 THE ENDPOINT DECODE MUST GET TO ACQUIT BEFORE WE CONDEMN ───────
+    // `endpointDecodeLandedAtMs` = wall clock when the pipeline's whole-session
+    // endpoint decode put words into the transcript (0 = not yet). That decode
+    // is the strongest evidence the app has and it is ALREADY RUNNING when the
+    // ABSENT strikes mature; condemning without it produced a false "Skipped
+    // Word" popup for a word the decode itself rendered (see
+    // [mistakeMayBeConfirmed]). `pipelineStoppedAtMs` bounds the wait.
+    var endpointDecodeLandedAtMs by remember { mutableStateOf(0L) }
+    var pipelineStoppedAtMs by remember { mutableStateOf(0L) }
+    // ── GLOBAL VERIFICATION BUDGET (§4.30) ──────────────────────────────────
+    // The per-candidate attempt cap above bounds ONE word, but a long range
+    // can present a FRESH candidate every few seconds, and each one spent its
+    // own 3 decodes. Measured fix30_verify_1 (Al-Fatihah 1-7, 46.5 s clip):
+    // four verification decodes at t+24s/31s/37s/44s (idx 9/13/14/15), each
+    // ~3.7-3.9 s, i.e. ~60 % of wall time inside verifyTailWords(). The
+    // recognizer is a SINGLE slot (decodeBusy), so every verification decode
+    // blocks the live sliding window for its whole duration; the window only
+    // ever covers the TRAILING samples, so the audio that slid past while
+    // verification ran is never decoded at all. The walk fell behind the
+    // injection and words 16-29 were never heard.
+    // Bound the TOTAL recognizer time verification may consume inside a rolling
+    // window, ACROSS candidates. When the budget is exhausted the gate simply
+    // declines to launch; the candidate stays UNPROVEN and the existing
+    // stall/auto-finalize forgiveness paths handle it. Never a verdict change
+    // in the condemning direction — this can only withhold a verification.
+    var verifyBudgetWindowStartMs by remember { mutableStateOf(0L) }
+    var verifyBudgetSpentMs by remember { mutableStateOf(0L) }
     // The candidate index whose early verification returned ABSENT (the tail
     // re-decode did not hear the word). Only this index may proceed to
     // popup/pause; -1 = no decided candidate. Reset whenever the first-mistake
@@ -3532,6 +4288,11 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // 01:43:56, then "holding 0ms/20000" again at 01:43:58 and climbing), so the
     // session produced NO popup at all and the user saw an empty screen.
     var graceExpiredOnce by remember { mutableStateOf(false) }
+    // How many times the grace-expiry branch has promoted unresolved PENDING rows
+    // to CORRECT so they DISPLAY (§4.34). One pass is normally enough; the counter
+    // exists so a later analysis rebuild that RESURRECTS the rows can promote them
+    // again but is still guaranteed to reach the finalize instead of looping.
+    var gracePromoteCount by remember { mutableStateOf(0) }
     // 20 s, not 12: two INDEPENDENT verification decodes are now needed before
     // a word is condemned (§4.13), and each costs 1.5-3.6 s on device plus a
     // 3 s cooldown. At 12 s the grace expired with the second strike still in
@@ -3544,6 +4305,18 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // the two-strike verdict; past it the word is left UNPROVEN and
     // autoFinalize forgives it.
     val MAX_MISTAKE_VERIFY_ATTEMPTS = 3
+    // ── GLOBAL VERIFICATION BUDGET (§4.30) ──
+    // Rolling window over which total verification seconds are capped, and the
+    // cap itself. 10 s of a 20 s window = at most half the wall time may be
+    // spent inside verifyTailWords() across ALL candidates; the live decode
+    // loop keeps the other half, so the trailing window cannot fall so far
+    // behind that a whole stretch of the recitation is never decoded.
+    // 20 s is chosen because a two-strike verdict needs two decodes in flight
+    // plus their cooldown (§4.13), so a window shorter than that would starve
+    // legitimate verification of a REAL mistake; 10 s admits two full 3.9 s
+    // decodes plus margin, and the third must wait for the window to roll.
+    val VERIFY_BUDGET_WINDOW_MS = 20000L
+    val VERIFY_BUDGET_MAX_MS = 10000L
     // Progress markers for the hold above: the countdown restarts whenever the
     // walk decides a new word or recovers an unheard one.
     var lastDecidedCount by remember { mutableIntStateOf(0) }
@@ -3689,6 +4462,11 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         // user said words of the OLD target and must not leak into this one.
         verifiedSpokenIndices.clear()
         lastMistakeVerifyMs = 0L
+        // Fresh session => fresh verification budget (§4.30). Leaving a spent
+        // budget behind would make the first candidate of the new session wait
+        // for the old window to roll before it could be verified.
+        verifyBudgetWindowStartMs = 0L
+        verifyBudgetSpentMs = 0L
         mistakeVerifyAbsentIdx = -1
         mistakeEpisodeAnchor = -1
         mistakeCleanStreak = 0
@@ -3697,6 +4475,11 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         // A new range/surah is a fresh target: the previous run's range-completed
         // flag must not make the next mic tap wipe a brand-new recitation.
         sessionRangeCompleted = false
+        // §4.38 — the previous run's endpoint evidence must not gate the NEW
+        // run's confirmations (a stale "landed" would let a condemn through
+        // without waiting for this session's own endpoint decode).
+        endpointDecodeLandedAtMs = 0L
+        pipelineStoppedAtMs = 0L
         // New session: clear the just-completed summary so a fresh recitation
         // can build and pop its own dialog (the previous one stays dismissed
         // for the rest of the app's lifetime unless the user explicitly clears
@@ -3839,38 +4622,87 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // 11-second recitation: 1019 iterations ending at matched=6112 — thousands
     // of never-recited words reported CORRECT, with the UI stalled throughout.
     var pendingConversionDone by remember { mutableStateOf(false) }
-    LaunchedEffect(sessionFinalized, isListening, currentTab, recitationMode, analysisEpoch) {
+    // The word indices forgiven for THIS finalized session. FROZEN at the first
+    // conversion pass (so the `matched + 8` window can never slide — sliding it
+    // was the infinite loop documented above) and RE-APPLIED to every later
+    // rebuild of `detailedAnalysis`.
+    //
+    // WHY the re-apply is mandatory — measured on the user's real-mic Fatihah run
+    // (2026-09-12 20:14):
+    //   finalDecodeAndEmit(): done 5531ms
+    //   finalizeCorrect(): 4 trailing PENDING word(s) counted CORRECT
+    //   analyze(tajweed): done 4335ms … changed=12    <- REPLACED the list
+    //   analyze(tajweed): done 4550ms … changed=10    <- REPLACED it again
+    //   autoFinalize?(): rows=33 decided=29/29 unheardPending=4
+    //   endOfRange(): … pendingRemain=true
+    // The deferred tajweed loop rebuilds `detailedAnalysis` wholesale from a fresh
+    // `analyzeRecitationDetails` call, which RESURRECTS the trailing PENDING rows.
+    // `pendingConversionDone` had already latched, so nothing forgave them again:
+    // `unheardPending` stuck at 4, `autoFinalize` burned its whole 20 s grace, and
+    // the end-of-range summary was withheld. The user finished Al-Fatihah and saw
+    // NO popup at all — "when i paused i didnt see a summury popup even when i
+    // finished".
+    val forgivenTailIndices = remember { mutableStateOf<Set<Int>>(emptySet()) }
+    LaunchedEffect(sessionFinalized, isListening, currentTab, recitationMode, analysisEpoch, detailedAnalysis) {
         if (currentTab != "Memorize" || recitationMode != "Tajweed" ||
             !sessionFinalized || isListening
         ) {
             // Live session (or a different mode): re-arm so the NEXT finalize
             // still gets its single conversion pass.
             pendingConversionDone = false
-        } else if (detailedAnalysis.isNotEmpty() && !pendingConversionDone) {
-            pendingConversionDone = true
-            val pendingRows = detailedAnalysis.filter { it.status == RecitationStatus.PENDING }
-            // BOUND THE CONVERSION (measured disaster: a whole-Baqarah target
-            // with 2.5 ayahs recited converted 6115 PENDING rows green). Only
-            // convert when the user genuinely NEARLY finished the range: some
-            // real progress (matched >= 3) and only the trailing tail region
-            // (wordIndex <= matched + 8) is undecoded. Anything beyond is not
-            // part of this session and stays PENDING (silent).
-            val matchedSoFar = detailedAnalysis.count {
-                it.status == RecitationStatus.CORRECT || it.status == RecitationStatus.TAJWEED_ERROR ||
-                    it.status == RecitationStatus.HINTED
-            }
-            val convertible = pendingRows.filter { it.wordIndex <= matchedSoFar + 8 }
-            if (matchedSoFar >= 3 && convertible.isNotEmpty()) {
-                val convertIdx = convertible.map { it.wordIndex }.toHashSet()
-                detailedAnalysis = detailedAnalysis.map { w ->
-                    if (w.status == RecitationStatus.PENDING && w.wordIndex in convertIdx)
-                        w.copy(status = RecitationStatus.CORRECT, spokenText = null)
-                    else w
+            forgivenTailIndices.value = emptySet()
+        } else if (detailedAnalysis.isNotEmpty()) {
+            if (!pendingConversionDone) {
+                pendingConversionDone = true
+                val pendingRows = detailedAnalysis.filter { it.status == RecitationStatus.PENDING }
+                // BOUND THE CONVERSION (measured disaster: a whole-Baqarah target
+                // with 2.5 ayahs recited converted 6115 PENDING rows green). Only
+                // convert when the user genuinely NEARLY finished the range: some
+                // real progress (matched >= 3) and only the trailing tail region
+                // (wordIndex <= matched + 8) is undecoded. Anything beyond is not
+                // part of this session and stays PENDING (silent).
+                val matchedSoFar = detailedAnalysis.count {
+                    it.status == RecitationStatus.CORRECT || it.status == RecitationStatus.TAJWEED_ERROR ||
+                        it.status == RecitationStatus.HINTED
                 }
-                android.util.Log.i(
-                    "ItqanSherpa",
-                    "finalizeCorrect(): ${convertible.size} trailing PENDING word(s) counted CORRECT (matched=$matchedSoFar, total pending=${pendingRows.size})"
-                )
+                val convertible = pendingRows.filter { it.wordIndex <= matchedSoFar + 8 }
+                if (matchedSoFar >= 3 && convertible.isNotEmpty()) {
+                    val convertIdx = convertible.map { it.wordIndex }.toHashSet()
+                    forgivenTailIndices.value = convertIdx
+                    detailedAnalysis = detailedAnalysis.map { w ->
+                        if (w.status == RecitationStatus.PENDING && w.wordIndex in convertIdx)
+                            w.copy(status = RecitationStatus.CORRECT, spokenText = null)
+                        else w
+                    }
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "finalizeCorrect(): ${convertible.size} trailing PENDING word(s) counted CORRECT (matched=$matchedSoFar, total pending=${pendingRows.size})"
+                    )
+                }
+            } else {
+                // IDEMPOTENT RE-APPLY. Only ever PENDING -> CORRECT, and only for
+                // the frozen set, so a late pass that turns one of these words into
+                // a REAL mistake still wins (the mistake popup path is untouched),
+                // while a rebuild that merely re-created the PENDING rows cannot
+                // resurrect them. Settles after one pass: once no PENDING row in the
+                // set remains, nothing is written and the effect stops re-firing.
+                val forgiven = forgivenTailIndices.value
+                if (forgiven.isNotEmpty() && detailedAnalysis.any {
+                        it.status == RecitationStatus.PENDING && it.wordIndex in forgiven
+                    }
+                ) {
+                    detailedAnalysis = detailedAnalysis.map { w ->
+                        if (w.status == RecitationStatus.PENDING && w.wordIndex in forgiven)
+                            w.copy(status = RecitationStatus.CORRECT, spokenText = null)
+                        else w
+                    }
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "finalizeCorrect(): re-applied ${forgiven.size} forgiven tail word(s) " +
+                            "after a late analysis rebuild (autoFinalize would otherwise hold the " +
+                            "full grace and withhold the summary)"
+                    )
+                }
             }
         }
     }
@@ -3991,7 +4823,31 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     }
                 }
 
-                alignment = Pair(newMatchedWordCount, newHasError)
+                // ── §4.37 THE CURSOR MAY NOT REGRESS ON A FINALIZED SESSION ──
+                // `alignment.first` IS the renderer's predicate (`globalWordIndex
+                // < matchedWordCount` => coloured, else 25 % grey). This pass
+                // recomputes it from scratch, and the aligner is not stable: with
+                // audio attached it re-decodes each candidate's slice, so a word
+                // it decided a moment ago can come back PENDING and the cursor
+                // drops — measured `p2_fatihah`, `matched=29` at 22:01:35.680 then
+                // `matched=28` at 22:01:35.899 on the SAME frozen 29-token
+                // transcript, leaving the last word of Al-Fatihah greyed while the
+                // "Perfect recitation!" summary was on screen. A word the user has
+                // seen may never be taken away (REACHED ⇒ DISPLAYED).
+                val resolvedCursor = resolveTranscriptCursor(
+                    newMatchedWordCount = newMatchedWordCount,
+                    previousCursor = alignment.first,
+                    hasError = newHasError,
+                    finalized = sessionFinalized
+                )
+                alignment = Pair(resolvedCursor, newHasError)
+                if (resolvedCursor != newMatchedWordCount) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "analyze(fast): cursor held at $resolvedCursor (walk wanted " +
+                            "$newMatchedWordCount) — finalized session may not un-display a word"
+                    )
+                }
                 // Carry over any tajweed verdict the deferred acoustic loop already
                 // flagged, keyed by (word, rule) so each rule's verdict on the same
                 // word survives independently — the fast loop must not wipe a
@@ -4002,9 +4858,52 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         val pk = prevByKey["${w2.wordIndex}:${w2.tajweedRule ?: "-"}"]
                         if (pk != null && (pk.status == RecitationStatus.TAJWEED_ERROR || pk.tajweedScore != null)) w2 = pk
                     }
+                    // NOTE: the §4.34 clipped promotion is applied to the LIST below,
+                    // AFTER the §4.37 finalized-decision guard — a fresh PENDING row
+                    // must be allowed to be overridden by the decided row it is
+                    // replacing BEFORE anything tries to promote it.
                     w2
                 }
+                // §4.37, second half: on a finalized session a fresh PENDING row may
+                // not un-decide a word the previous pass already decided — otherwise
+                // `unheardWordCount()` flips back to 1 on a recitation the app just
+                // called perfect, and `endOfRange()`'s `genuinelyFinished` disagrees
+                // with the summary already on screen.
+                //
+                // §4.34 last, on purpose: a clipped decode (PENDING carrying the
+                // fragment the recognizer DID hear) is a word the user SAID, and the
+                // cursor already counts it as reached — so it must be coloured too.
+                // Measured `clean_fatihah_2`: the last word of Al-Fatihah came back as
+                // a clipped prefix, `matched=29/29`, the checker read 28, and the user
+                // saw "last word not displayed and there is no popup". The fragment is
+                // KEPT, not nulled, so `unheardWordCount()` still skips the row and a
+                // genuine finish can still raise its summary.
                 detailedAnalysis = merged
+                    .keepFinalizedDecisions(previous = detailedAnalysis, finalized = sessionFinalized)
+                    .promoteClippedPendingRows()
+                // ── §4.40 THE CURSOR MUST COVER EVERY DECIDED WORD ──────────
+                // The promotion above makes rows DECIDED; it does not make them
+                // VISIBLE, because the renderer colours by the cursor and not by
+                // `status`. A rubber-stamped CORRECT row (status decided,
+                // `spokenText == null`) is not counted by `newMatchedWordCount`,
+                // so on a finalized session it can sit beyond the cursor: judged
+                // by the app, grey on the screen. Measured `p4_fatihah` —
+                // `autoFinalize(): grace expired with 29/29 words decided
+                // (unheard=0)` followed 11 ms later by `endOfRange(): …
+                // cursor=4/29`. Advance (never retreat) to cover the decided
+                // prefix; a real WRONG/SKIPPED is itself decided, so it stays
+                // inside the prefix and keeps its error colour.
+                if (sessionFinalized) {
+                    val covered = displayedCursorFor(detailedAnalysis, alignment.first)
+                    if (covered > alignment.first) {
+                        android.util.Log.i(
+                            "ItqanSherpa",
+                            "analyze(fast): cursor advanced ${alignment.first} -> $covered so every " +
+                                "decided word DISPLAYS (§4.40 REACHED => DISPLAYED)"
+                        )
+                        alignment = Pair(covered, alignment.second)
+                    }
+                }
                 android.util.Log.i("ItqanSherpa", "analyze(fast): done ${System.currentTimeMillis() - analyzeT0}ms matched=$newMatchedWordCount hasError=$newHasError targetWords=${latest.targetNorm.size}")
             } catch (t: Throwable) {
                 android.util.Log.e("ItqanSherpa", "analyze(fast): FAILED after ${System.currentTimeMillis() - analyzeT0}ms", t)
@@ -4025,10 +4924,23 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             // their verdicts must never update detailedAnalysis after the switch.
             if (latest.epoch != analysisEpoch) continue
             val tjT0 = System.currentTimeMillis()
-            // User-accepted tajweed latency: wait ~2 s so the word's audio span
-            // has settled before scoring, and so a burst of emissions collapses
-            // into one acoustic pass.
-            kotlinx.coroutines.delay(2000)
+            if (latest.finalized) {
+                // FINAL PASS — the user has stopped, no more audio is coming, and
+                // this is the pass that fills in the last words of the report. The
+                // ~2 s settle delay below is pure dead time here (it exists only to
+                // let live audio settle), so skip it: it is a direct 2 s off the
+                // stop-to-report latency the user reported.
+            } else {
+                // LIVE PASS — throttle (see TAJWEED_MIN_INTERVAL_MS). Dropping a
+                // live pass is safe: the fast text loop keeps the transcript
+                // current, the next emission re-triggers, and the final pass above
+                // always scores everything.
+                if (System.currentTimeMillis() - lastTajweedPassMs.get() < TAJWEED_MIN_INTERVAL_MS) continue
+                // Wait ~2 s so the word's audio span has settled before scoring, and
+                // so a burst of emissions collapses into one acoustic pass.
+                kotlinx.coroutines.delay(2000)
+            }
+            lastTajweedPassMs.set(System.currentTimeMillis())
             try {
                 val acoustic = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
                     val spoken = latest.spokenText.split(Regex("\\s+"))
@@ -4088,7 +5000,33 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                 w.status != RecitationStatus.WRONG && w.status != RecitationStatus.SKIPPED)
                         }
                         .sortedWith(compareBy({ it.wordIndex }, { it.tajweedRule ?: "" }))
+                    // RE-APPLY THE CLIPPED-DECODE PROMOTION (§4.34). `acoustic` is a
+                    // FRESH analyzeRecitationDetails() call, so every key it scores is
+                    // REPLACED by the fresh row — and for a clipped tail word that fresh
+                    // row is PENDING again, silently undoing the promotion the fast merge
+                    // made and dropping the word back to the 25 %-opacity fallback. The
+                    // promotion has to be the LAST thing that touches the list.
+                    //
+                    // §4.37 FIRST, though: a fresh PENDING row from `acoustic` must not
+                    // un-decide a word the finalized session already decided (measured
+                    // `p2_fatihah`: this very loop's `changed=5` was the pass after which
+                    // the cursor dropped 29 -> 28).
                     detailedAnalysis = kept
+                        .keepFinalizedDecisions(previous = cur, finalized = sessionFinalized)
+                        .promoteClippedPendingRows()
+                    // §4.40 — same cursor-coverage rule as the fast merge: a
+                    // finalized session may not leave a decided word grey.
+                    if (sessionFinalized) {
+                        val covered = displayedCursorFor(detailedAnalysis, alignment.first)
+                        if (covered > alignment.first) {
+                            android.util.Log.i(
+                                "ItqanSherpa",
+                                "analyze(tajweed): cursor advanced ${alignment.first} -> $covered so every " +
+                                    "decided word DISPLAYS (§4.40 REACHED => DISPLAYED)"
+                            )
+                            alignment = Pair(covered, alignment.second)
+                        }
+                    }
                 }
                 android.util.Log.i("ItqanSherpa", "analyze(tajweed): done ${System.currentTimeMillis() - tjT0}ms scored=${acoustic.count { it.tajweedScore != null }} tajweedErrors=${acoustic.count { it.status == RecitationStatus.TAJWEED_ERROR }} changed=$changed")
             } catch (t: Throwable) {
@@ -4195,6 +5133,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             mistakeResumeLiveText = ""
             verifiedSpokenIndices.clear()
             lastMistakeVerifyMs = 0L
+            // Fresh surface => fresh verification budget (§4.30).
+            verifyBudgetWindowStartMs = 0L
+            verifyBudgetSpentMs = 0L
             mistakeVerifyAbsentIdx = -1
             mistakeEpisodeAnchor = -1
             mistakeCleanStreak = 0
@@ -4253,6 +5194,14 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 "word='$wordText' (sightings=$lastWrongStopSightings) -> auto-pause + popup"
         )
         lastWrongStopIndex = wordIdx
+        // THE ONE PLACE A MISTAKE BECOMES VISIBLE. `confirmedMistakeUiIdx` drives
+        // BOTH the inline banner and the red word highlight, and it is armed here
+        // — together with the dialog — so the two can never disagree. Arming it
+        // from the verified-absent verdict alone produced a bare wrong-word
+        // MESSAGE with no popup whenever the stop's extra gates (sightings,
+        // running, listening) were not satisfied (`p4_fatihah`). See the display
+        // gate in mistakeStop() for the full post-mortem.
+        confirmedMistakeUiIdx = wordIdx
         // The popup must tell the user WHAT went wrong and that they must
         // repeat the word when they continue.
         latestPopupKind = if (skipped) "skipped" else "wrong"
@@ -4445,7 +5394,22 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     System.currentTimeMillis() - lastWrongStopFirstSeenMs >= 800L &&
                     isListening && tajweedPipelineHolder.running &&
                     System.currentTimeMillis() - lastMistakeVerifyMs >= 3000L &&
-                    (verifyJobRef.get() == null || !verifyJobRef.get()!!.isActive)
+                    (verifyJobRef.get() == null || !verifyJobRef.get()!!.isActive) &&
+                    // ── GLOBAL VERIFICATION BUDGET (§4.30) ───────────────────
+                    // The per-candidate cap above bounds ONE word; a long range
+                    // presents a fresh candidate every few seconds and each spent
+                    // its own 3 decodes, so the single-slot recognizer was ~60 %
+                    // occupied by verification (fix30_verify_1) and the live
+                    // trailing window fell so far behind that words 16-29 were
+                    // never decoded. Cap the TOTAL verification seconds inside a
+                    // rolling window ACROSS candidates. Declining here only
+                    // withholds a verification — the word stays UNPROVEN and the
+                    // stall/auto-finalize forgiveness paths handle it — so this
+                    // can never move a verdict toward condemnation.
+                    verifyBudgetAllowsMs(
+                        verifyBudgetWindowStartMs, verifyBudgetSpentMs,
+                        System.currentTimeMillis(), VERIFY_BUDGET_WINDOW_MS, VERIFY_BUDGET_MAX_MS
+                    )
                 ) {
                     lastMistakeVerifyMs = System.currentTimeMillis()
                     val idxToVerify = mistakeWord
@@ -4474,26 +5438,76 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     // correct recitation). When the word has no timing, anchor
                     // on the last word we DID hear and grow the span on every
                     // retry — more audio each time, never the same short slice.
-                    val ownTimingMs = spokenTimings.firstOrNull { it.startIndex == idxToVerify }?.startMs
-                    val prevTimingMs = spokenTimings.lastOrNull { it.startIndex <= idxToVerify }?.startMs
+                    // ── TIMING ANCHOR: NEVER ANCHOR PAST THE CANDIDATE ────────
+                    // `spokenTimings.startIndex` is the SPOKEN position, which only
+                    // coincides with the target index while the transcript is aligned
+                    // with the target. Once the walk freezes (exactly when a mistake
+                    // candidate is alive) the spoken list stops growing and its last
+                    // entries sit at target words AT OR AFTER the candidate — so
+                    // `firstOrNull { it.startIndex == idxToVerify }` could return a
+                    // timestamp for a DIFFERENT, LATER word, and anchoring there made
+                    // the ~N s span start AFTER the candidate's own audio. The
+                    // verifier then decoded words 20-28 for a candidate at 17, found
+                    // "absent", and condemned a word the user had recited correctly
+                    // (measured fix27_fatihah_1; the final decode heard '...اهدنا
+                    // الصرط المستقيم...').
+                    // Also: a timing is only trustworthy for the candidate when the
+                    // word it timed is ACTUALLY the candidate — require the timed
+                    // word to match the candidate's normalized form.
+                    val candidateNorm = detailedAnalysis[mistakeIdx].normalizedText
+                    val ownTimingMs = spokenTimings.firstOrNull {
+                        it.startIndex == idxToVerify &&
+                            isWordMatch(normalizeForComparison(it.word, viewModel.riwayah), candidateNorm)
+                    }?.startMs
+                    // The fallback must be a STRICTLY EARLIER word, and it must be
+                    // the LATEST such word that is still before the candidate.
+                    val prevTimingMs = spokenTimings
+                        .filter { it.startIndex < idxToVerify }
+                        .maxByOrNull { it.startIndex }?.startMs
                     val anchorMs = ownTimingMs
                         ?: prevTimingMs
                         ?: lastWrongStopFirstSeenMs.takeIf { it > 0L }
                         ?: System.currentTimeMillis()
                     val attempt = mistakeVerifyAttempts
+                    // ── SPAN MUST REACH BACK PAST THE CANDIDATE ───────────────
+                    // Even with a corrected anchor, grow with the attempt so a retry
+                    // always decodes MORE audio and the span can never converge on a
+                    // window that excludes the candidate. The +8 s lead-in covers the
+                    // word itself plus the words immediately before it (the verifier
+                    // trims a quarter-second of run-up and drops the OLDEST audio when
+                    // its slice cap binds, so the reach-back needs headroom).
+                    val elapsedSinceAnchorSec = ((System.currentTimeMillis() - anchorMs) / 1000L)
+                        .coerceAtLeast(0L)
                     val spanSec = if (ownTimingMs != null) {
-                        ((System.currentTimeMillis() - anchorMs) / 1000L + 8L)
+                        (elapsedSinceAnchorSec + 8L + attempt * 4L)
                             .toInt().coerceIn(10, 45)
                     } else {
-                        (20 + attempt * 8).coerceAtMost(45)
+                        val seenFor = if (lastWrongStopFirstSeenMs > 0L)
+                            (System.currentTimeMillis() - lastWrongStopFirstSeenMs) / 1000L else 0L
+                        (seenFor + 20L + attempt * 8L).toInt().coerceIn(20, 45)
                     }
                     mistakeVerifyAttempts = attempt + 1
                     android.util.Log.i(
                         "ItqanSherpa",
                         "mistakeStop(): verify idx=$idxToVerify launched attempt=$attempt " +
-                            "span=${spanSec}s ownTiming=${ownTimingMs != null}"
+                            "span=${spanSec}s ownTiming=${ownTimingMs != null} " +
+                            "anchorAge=${elapsedSinceAnchorSec}s"
                     )
                     verifyInFlightIdx.set(idxToVerify)
+                    // ── DEBIT THE GLOBAL VERIFICATION BUDGET (§4.30) ─────────
+                    // Reserve the nominal cost up-front so back-to-back launches
+                    // cannot over-commit before any decode has reported; the
+                    // real measured cost is settled in the job's finally block.
+                    val verifyLaunchMs = System.currentTimeMillis()
+                    run {
+                        val (s, sp, _) = verifyBudgetAfterRequest(
+                            verifyBudgetWindowStartMs, verifyBudgetSpentMs,
+                            verifyLaunchMs, ASSUMED_VERIFY_COST_MS,
+                            VERIFY_BUDGET_WINDOW_MS, VERIFY_BUDGET_MAX_MS
+                        )
+                        verifyBudgetWindowStartMs = s
+                        verifyBudgetSpentMs = sp
+                    }
                     verifyJobRef.set(coroutineScope.launch {
                         val verifiedWords = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                             try {
@@ -4502,6 +5516,24 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                 android.util.Log.w("ItqanSherpa", "mistakeStop(): verifyTailWords threw", t)
                                 emptyList<String>()
                             }
+                        }
+                        // ── SETTLE THE BUDGET WITH THE REAL COST ─────────────
+                        // Replace the nominal reservation with what the decode
+                        // actually took, clamped to the reservation so a long
+                        // decode (or a clock jump) cannot retroactively blow the
+                        // budget. Logged so §4.30 starvation is measurable.
+                        run {
+                            val realCost = (System.currentTimeMillis() - verifyLaunchMs)
+                                .coerceIn(0L, ASSUMED_VERIFY_COST_MS)
+                            verifyBudgetSpentMs =
+                                (verifyBudgetSpentMs - ASSUMED_VERIFY_COST_MS + realCost)
+                                    .coerceAtLeast(0L)
+                            android.util.Log.i(
+                                "ItqanSherpa",
+                                "mistakeStop(): verify budget spent=${verifyBudgetSpentMs}ms/" +
+                                    "${VERIFY_BUDGET_MAX_MS}ms per ${VERIFY_BUDGET_WINDOW_MS}ms " +
+                                    "(last decode ${realCost}ms, reserved ${ASSUMED_VERIFY_COST_MS}ms)"
+                            )
                         }
                         verifyInFlightIdx.set(-1)
                         // MATCH ON NORMALIZED FORMS. matcher.clean() returns the
@@ -4668,6 +5700,65 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             val bracketsCandidate =
                                 (idxToVerify <= 0 || sawBefore) &&
                                     (idxToVerify >= targetNorm.size - 1 || sawAfter)
+                            // ── ADJACENCY GUARD (the false-SKIPPED that shipped) ──
+                            // `bracketsCandidate` alone is NOT enough, because a pool
+                            // can contain SOME earlier target word and SOME later one
+                            // without covering the candidate at all.
+                            // MEASURED FALSE SKIPPED (Al-Fatihah, fix27_fatihah_1):
+                            //   verify idx=17 word='ٱهْدِنَا' verified=17w found=false
+                            //     -> ABSENT strike 1/2
+                            //   verify idx=17 word='ٱهْدِنَا' verified=10w found=false
+                            //     -> SKIPPED CONFIRMED -> auto-pause + popup
+                            // yet the end-of-session decode heard
+                            //   '...واياك نستعين اهدنا الصرط المستقيم...'
+                            // Replaying the recorded pools (build/tools/replay_guard28.py)
+                            // shows the 17w pool matched positions 10,11,12,13,16,24,6,3:
+                            // a real straddle at 16->24 that paid down strike 1, plus
+                            // stray t=6/t=3 words from misaligned long-window slices.
+                            // ٱهْدِنَا's own audio was never in that pool.
+                            // REQUIRE PROOF THE POOL ACTUALLY SPANNED THE CANDIDATE:
+                            // there must be a decoded word matching a target BEFORE the
+                            // candidate AND a decoded word matching a target AFTER it
+                            // whose target positions are WITHIN A SHORT GAP of each
+                            // other — a pool that jumps from word 9 to word 28 says
+                            // nothing about word 17. Use each decoded word's best
+                            // matching target position and look for a consecutive pair
+                            // that straddles idxToVerify.
+                            var straddles = false
+                            run {
+                                // Best target position for each decoded word (first
+                                // match wins; the pool is in spoken order).
+                                val positions = ArrayList<Int>(verifiedWords.size)
+                                for (vw in verifiedWords) {
+                                    val vn = normalizeForComparison(vw, viewModel.riwayah)
+                                    var best = -1
+                                    for (t in targetNorm.indices) {
+                                        if (targetNorm[t].isEmpty()) continue
+                                        if (isWordMatch(vn, targetNorm[t])) { best = t; break }
+                                    }
+                                    positions.add(best)
+                                }
+                                // ── SEE `poolSpansCandidate` (§4.28) FOR THE WHY ──
+                                // A straddle = an adjacent pair (a,b) in the POOL whose
+                                // target positions are ordered and satisfy a < idxToVerify
+                                // <= b (the candidate sits in the gap between two words
+                                // that were actually decoded around it).
+                                straddles = poolSpansCandidate(positions, idxToVerify)
+                                // AUDIT TRAIL (§4.28). A live post-mortem of the
+                                // false SKIPPED could not tell WHY the condemning
+                                // decode passed the coverage guard, because the
+                                // log recorded only the RAW slice text — not the
+                                // vocabulary-cleaned tokens the guard actually
+                                // matched, nor their resolved target positions.
+                                // Log both, so an admitted condemnation is always
+                                // reconstructable after the fact.
+                                android.util.Log.i(
+                                    "ItqanSherpa",
+                                    "mistakeStop(): idx=$idxToVerify pool=${verifiedWords.size}w " +
+                                        "positions=$positions straddles=$straddles " +
+                                        "candTarget='${targetNorm.getOrNull(idxToVerify) ?: ""}'"
+                                )
+                            }
                             // ── TOO-SHORT-DECODE GUARD ── A DECODE THAT DROPPED THE
                             // WORD ONLY PROVES ABSENCE IF IT IS BIG ENOUGH TO HAVE
                             // CONTAINED IT. On device a truncated/folded slice returns
@@ -4678,12 +5769,15 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             // weak — require two, so a single lucky token cannot
                             // license a condemnation.
                             val minDecodeWords = if (targetNorm.size <= 12) 3 else 8
-                            if (saneHits < 2 || verifiedWords.size < minDecodeWords || !bracketsCandidate) {
+                            if (saneHits < 2 || verifiedWords.size < minDecodeWords ||
+                                !bracketsCandidate || !straddles
+                            ) {
                                 android.util.Log.i(
                                     "ItqanSherpa",
                                     "mistakeStop(): verify idx=$idxToVerify INCONCLUSIVE — tail decode " +
                                         "(${verifiedWords.size}w, need >=$minDecodeWords) saneHits=$saneHits " +
-                                        "brackets=$bracketsCandidate (before=$sawBefore after=$sawAfter) " +
+                                        "brackets=$bracketsCandidate straddles=$straddles " +
+                                        "(before=$sawBefore after=$sawAfter) " +
                                         "over targets $nearFrom..$nearTo; not condemning (will retry)"
                                 )
                                 // Normal cooldown, NOT an immediate retry: every decode is
@@ -4702,12 +5796,20 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             // and forgiven instead of condemned.
                             val strikes = mistakeVerifyAbsentStrikes + 1
                             mistakeVerifyAbsentStrikes = strikes
+                            // LOG EVERY STRIKE, INCLUDING THE ONE THAT CONDEMNS.
+                            // This used to sit inside the `strikes < 2` branch, so
+                            // the second strike — the one that actually produces
+                            // the popup — left NO trace, and a §4.28 post-mortem
+                            // could not tell whether the coverage guard vetoed
+                            // the second decode or wave it through. A condemnation
+                            // must always be auditable from the log.
+                            android.util.Log.i(
+                                "ItqanSherpa",
+                                "mistakeStop(): verify idx=$idxToVerify ABSENT strike $strikes/2 " +
+                                    "— ${if (strikes < 2) "needs one more decode before condemning"
+                                    else "CONDEMNING (auto-pause + popup)"}"
+                            )
                             if (strikes < 2) {
-                                android.util.Log.i(
-                                    "ItqanSherpa",
-                                    "mistakeStop(): verify idx=$idxToVerify ABSENT strike $strikes/2 — " +
-                                        "needs one more decode before condemning"
-                                )
                                 // Normal cooldown, NOT an immediate retry: every decode is
                                 // 1.5-3.6 s of recognizer time, and hammering it starved the
                                 // audio pipeline (measured fatihah_c10: 5 back-to-back decodes
@@ -4829,17 +5931,30 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     })
                 }
 
-                // DISPLAY GATE — VERIFIED-REAL ONLY. Transient candidates stay
-                // INVISIBLE until the tail verification has spoken: if it
-                // forgives, nothing was ever shown; if it says absent, the
-                // banner + red word appear for a genuinely-wrong word. The old
-                // sightings-based gate still flashed false mistakes during the
-                // self-heal window (user: "only true mistakes should be seen").
+                // DISPLAY GATE — VERIFIED-REAL ONLY, AND THE POPUP OWNS IT.
+                // The banner (the inline "Skipped Word" / "Incorrect
+                // Pronunciation/Word" card) used to be armed HERE, on the
+                // verified-absent verdict alone, while the STOP + POPUP needed
+                // the full confirmation below (`sightings >= 2`, `isListening`,
+                // `tajweedPipelineHolder.running`). Whenever the extra gates
+                // were not satisfied the banner appeared on its own and the
+                // dialog never did — measured `p4_fatihah`: the session ended
+                // with `wrong=0 skipped=0` and NO summary, yet the screen showed
+                // a wrong-word MESSAGE. The user: "i saw a msg of a wrong word.
+                // why it is on a msg not popup?"
+                //
+                // A bare message is not a contract surface. The contract is
+                // "if it stopped then it should be a skipped/wrong word popup or
+                // tajweed popup else it should be displayed" — so the banner and
+                // the dialog are now armed by ONE place, [stopForMistake], which
+                // always sets both. A mistake that does not stop the session is
+                // not surfaced at all; its word simply stays displayed.
+                //
+                // (TAJWEED_ERROR is unaffected: it does not stop the session and
+                // keeps its own inline feedback + rule popup, resolved through
+                // the `errorIndex` fallback in the banner gate below.)
                 val episodeAbsent = mistakeVerifyAbsentIdx >= 0 &&
                     kotlin.math.abs(mistakeWord - mistakeVerifyAbsentIdx) <= 3
-                if (episodeAbsent) {
-                    confirmedMistakeUiIdx = mistakeWord
-                }
                 // EMISSION-DRIVEN CONFIRMATION (now only a SECOND path). The
                 // sightings counters were the sole way to a stop, and they can
                 // only advance on NEW transcript text. A mistake is precisely
@@ -4924,6 +6039,33 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 if (!(spokenWords >= cand + 4 || seenMs >= 5000L)) continue
             }
             if ((System.currentTimeMillis() - tajweedRecordingStartMs) < 2500L) continue
+            // ── §4.38 DO NOT CONDEMN WHILE THE ENDPOINT DECODE IS STILL COMING ──
+            // The ABSENT strikes come from 4 s-slice decodes — the weakest decode
+            // the app has, and one that DROPS words. The session's own
+            // whole-session endpoint decode is already running and is strictly
+            // better evidence. Measured `p3_fatihah`: the confirm fired 0.9 s
+            // after that decode began; 8 s later it landed with the flagged word
+            // present (`dec='… نستعين اهدنا الصرط …'`), and the confirmed-mistake
+            // freeze discarded the acquittal. The user got a "Skipped Word" popup
+            // for a word their recitation contained.
+            val nowMs = System.currentTimeMillis()
+            if (!mistakeMayBeConfirmed(
+                    pipelineRunning = tajweedPipelineHolder.running,
+                    endpointDecodeLanded = endpointDecodeLandedAtMs > 0L,
+                    sessionStoppedForMs = if (pipelineStoppedAtMs > 0L) nowMs - pipelineStoppedAtMs else 0L,
+                )
+            ) {
+                if (held % 4000L < 500L) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "verdictTicker(): HOLDING the confirm for wordIndex=$cand " +
+                            "(held=${held}ms) — the session's endpoint decode is still in " +
+                            "flight and it is the best evidence; condemning now is what " +
+                            "produced the false SKIPPED popup (§4.38)"
+                    )
+                }
+                continue
+            }
             android.util.Log.i(
                 "ItqanSherpa",
                 "verdictTicker(): absent verdict held ${held}ms for wordIndex=$cand " +
@@ -4955,10 +6097,22 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         // the watchdog logged ZERO firings across a 90 s run while the cursor
         // sat frozen. This one only resets when there is no candidate at all.
         var stallFirstSeenMs = 0L
+        // How many times this watchdog has re-opened the confirm loop's dwell gate
+        // for the CURRENT candidate (§4.35). Bounded, because a nudge that cannot
+        // produce a decode — the confirm loop's own gate still refusing — must not
+        // be able to keep the candidate alive forever: that is the §4.18
+        // infinite-freeze class, and "nothing ever happens" is the worst outcome.
+        var stallNudges = 0
+        // The candidate `stallNudges`/`stallFirstSeenMs` belong to. Without this,
+        // a candidate that changes WITHOUT going through -1 would inherit the
+        // previous one's nudge count and could be forgiven before the pipeline
+        // ever tried to judge it.
+        var stallCand = -1
         while (true) {
             kotlinx.coroutines.delay(2000L)
             val cand = lastWrongStopIndex
-            if (cand < 0) { stallFirstSeenMs = 0L; continue }
+            if (cand < 0) { stallFirstSeenMs = 0L; stallNudges = 0; stallCand = -1; continue }
+            if (cand != stallCand) { stallCand = cand; stallFirstSeenMs = 0L; stallNudges = 0 }
             // `isListening` only. Do NOT also require tajweedPipelineHolder.running:
             // the pipeline reports running=false right after the endpoint, which is
             // precisely the moment the user is waiting for feedback. Gating on it
@@ -4972,43 +6126,111 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             ) { stallFirstSeenMs = 0L; continue }
             if (stallFirstSeenMs == 0L) stallFirstSeenMs = System.currentTimeMillis()
             val pendingMs = System.currentTimeMillis() - stallFirstSeenMs
-            if (pendingMs < 20000L) continue
-            // LAST-CHANCE VERIFICATION. A candidate can outlive its welcome for
-            // a reason that has nothing to do with guilt: the confirm loop may
-            // never have launched a decode at all (measured fatihah_c30 — zero
-            // `verify idx=` lines, because a row-index flicker kept resetting
-            // the 800 ms dwell pre-condition). Forgiving it here without ever
-            // testing it leaves `mistakeVerifyAbsentStrikes == 0`, which
-            // `autoFinalize` reads as "an UNPROVEN mistake" and FORGIVES with a
-            // summary — so a word the user really did skip is silently counted
-            // correct, and a word the user really did recite is silently
-            // rubber-stamped. Neither is a verdict; both are the bug.
+            // ── SPEND THE NEXT DECODE RATHER THAN FREEZE (§4.35) ────────────
+            // The confirm loop that launches verification is EMISSION-driven, and
+            // a frozen walk emits nothing. So after the FIRST strike nothing ever
+            // re-runs it, and the second decode — the one that decides whether to
+            // condemn — is never launched. Measured `clean_fatihah_3`: idx=14 got
+            // `ABSENT strike 1/2` at 03:07:04.761; the confirm loop's LAST re-run
+            // saw `sinceVerify=2825ms` at 03:07:07.586, 175 ms short of the 3 s
+            // cooldown, and no further re-run ever came. The candidate sat WRONG
+            // for 20 s, was forgiven UNPROVEN, and the walk was frozen the whole
+            // time — `maxMatched=17/29` on a run whose audio reaches 29.
             //
-            // Spend ONE decode before giving up. When it confirms absence the
-            // strike lands, `autoFinalize` finds evidence and the MISTAKE popup
-            // is what the user sees; when it comes back found/inconclusive we
-            // forgive exactly as before. This runs at most once per stall
-            // (guarded by the attempts budget) and only when NOTHING has been
-            // spent on this candidate yet, so it cannot add load to a word that
-            // is already being verified.
-            val neverVerified = mistakeVerifyAttempts == 0 &&
-                mistakeVerifyAbsentIdx < 0 &&
-                mistakeVerifyAbsentStrikes == 0
-            if (neverVerified && isListening && tajweedPipelineHolder.running &&
-                (verifyJobRef.get() == null || !verifyJobRef.get()!!.isActive) &&
-                lastMistakeVerifyMs != 0L
+            // This watchdog already polls every 2 s, so it is the natural driver.
+            // The nudge only re-opens the confirm loop's 800 ms dwell gate; EVERY
+            // other guard still applies (attempt budget, 3 s cooldown, global
+            // budget, job-active, and the §4.28 bracket+straddle coverage test on
+            // the result), so a nudge can never move a verdict toward condemnation
+            // on its own — it can only make the pipeline finish the judgement it
+            // already started. `stallNudges` bounds it so a nudge the confirm loop
+            // never honours cannot freeze the candidate forever.
+            val jobIdle = verifyJobRef.get() == null || !verifyJobRef.get()!!.isActive
+            val cooldownOver = lastMistakeVerifyMs == 0L ||
+                System.currentTimeMillis() - lastMistakeVerifyMs >= 3000L
+            val budgetOk = verifyBudgetAllowsMs(
+                verifyBudgetWindowStartMs, verifyBudgetSpentMs,
+                System.currentTimeMillis(), VERIFY_BUDGET_WINDOW_MS, VERIFY_BUDGET_MAX_MS
+            )
+            if (stallShouldNudge(
+                    isListening = isListening,
+                    pipelineRunning = tajweedPipelineHolder.running,
+                    jobIdle = jobIdle,
+                    cooldownOver = cooldownOver,
+                    budgetOk = budgetOk,
+                    attempts = mistakeVerifyAttempts,
+                    nudges = stallNudges,
+                    maxAttempts = MAX_MISTAKE_VERIFY_ATTEMPTS,
+                )
             ) {
+                stallNudges++
                 android.util.Log.i(
                     "ItqanSherpa",
-                    "stallWatchdog(): candidate idx=$cand stalled ${pendingMs}ms with NO decode " +
-                        "ever spent on it -> forcing one last-chance verification before forgiving"
+                    "stallWatchdog(): candidate idx=$cand stalled ${pendingMs}ms " +
+                        "(attempts=$mistakeVerifyAttempts strikes=$mistakeVerifyAbsentStrikes) " +
+                        "-> nudging the confirm loop to spend decode " +
+                        "${mistakeVerifyAttempts + 1} (nudge $stallNudges)"
                 )
-                // Hand the confirm loop the dwell it was never allowed to reach,
-                // then let it launch on the next pass.
+                // Change a value the confirm loop observes so it re-evaluates its
+                // gate; do NOT reset `stallFirstSeenMs` — the forgiveness clock
+                // must keep running so a candidate the pipeline keeps failing to
+                // judge is still released.
                 lastWrongStopFirstSeenMs = System.currentTimeMillis() - 800L
-                stallFirstSeenMs = System.currentTimeMillis()
                 continue
             }
+            // ── BUDGET-BLOCKED SHORT-CIRCUIT (§4.31) ────────────────────────
+            // The 20 s hold below assumes verification is still coming. It is
+            // NOT coming when the global budget cannot fund another decode: the
+            // two-strike verdict is then unreachable, so the candidate is
+            // permanently unprovable and the ONLY thing the 20 s hold achieves
+            // is freezing the cursor — which is exactly "many words are not
+            // displayed" (measured fix31_budget_1: the walk sat on ٱهْدِنَا
+            // while words 18-29 never rendered). Forgive promptly instead; this
+            // is the safe direction (a false "no mistake" costs nothing, a
+            // false mistake popup accuses the user of a recitation error).
+            // Require at least one decode already spent, so a candidate whose
+            // verification has simply not STARTED yet is not cut off early.
+            //
+            // AND REQUIRE THE JOB TO BE IDLE. The nominal cost of an ACTIVE
+            // verification is already debited, so `budgetBlocked` is true for the
+            // entire duration of that decode — forgiving on that basis cut a
+            // candidate off while its own verdict was still being computed.
+            // Measured `clean_fatihah_3`: idx=15 was forgiven at 4003 ms and the
+            // in-flight decode returned `found=true` 1,2 s later, i.e. the very
+            // decode that would have acquitted it was thrown away.
+            val stallForgiveMs = stallForgiveMsFor(
+                budgetOk = budgetOk,
+                attempts = mistakeVerifyAttempts,
+                jobIdle = jobIdle,
+            )
+            // ── §4.38 THE SAME HOLD APPLIES TO FORGIVING ────────────────────
+            // The budget-blocked short-circuit above cuts the wait to 3 s, but
+            // the session's endpoint decode needs ~8 s. Forgiving first would
+            // turn a REAL skip into a silent "no mistake" (the row becomes
+            // CORRECT, so the ticker has no candidate left to condemn) — and
+            // injection tests exist precisely to catch wrong/skipped words.
+            // Holding BOTH verdicts until that decode lands keeps the two
+            // directions symmetric: whatever the endpoint decode heard decides
+            // it. The hold is bounded by the same [mistakeMayBeConfirmed] clock,
+            // so forgiveness still always proceeds — it is delayed, never
+            // blocked (the §4.31 asymmetry is preserved).
+            val nowMsW = System.currentTimeMillis()
+            if (!mistakeMayBeConfirmed(
+                    pipelineRunning = tajweedPipelineHolder.running,
+                    endpointDecodeLanded = endpointDecodeLandedAtMs > 0L,
+                    sessionStoppedForMs = if (pipelineStoppedAtMs > 0L) nowMsW - pipelineStoppedAtMs else 0L,
+                )
+            ) {
+                continue
+            }
+            if (pendingMs < stallForgiveMs) continue
+            // LAST-CHANCE VERIFICATION is now handled by the §4.35 nudge above,
+            // which subsumes it: that nudge also covers the `lastMistakeVerifyMs
+            // == 0` case (the confirm loop never ran at all — measured
+            // fatihah_c30, a row-index flicker kept resetting the 800 ms dwell
+            // pre-condition) and it is bounded by `stallNudges`. The old separate
+            // block here reset `stallFirstSeenMs` with NO bound, so a nudge the
+            // confirm loop never honoured could hold a candidate forever.
             android.util.Log.i(
                 "ItqanSherpa",
                 "stallWatchdog(): candidate idx=$cand unresolved for ${pendingMs}ms " +
@@ -5029,6 +6251,8 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             mistakeCleanStreak = 0
             confirmedMistakeUiIdx = -1
             stallFirstSeenMs = 0L
+            stallNudges = 0
+            stallCand = -1
         }
     }
 
@@ -5149,6 +6373,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             mistakeResumeIndex = -1
             mistakeResumeLiveText = ""
             sessionRangeCompleted = false
+            // §4.38 — fresh session: this run must earn its own endpoint evidence.
+            endpointDecodeLandedAtMs = 0L
+            pipelineStoppedAtMs = 0L
             // fall through to the fresh-session path below (do NOT resume)
         } else if (pipelineNow != null && pipelineNow.paused) {
             isListening = true
@@ -5675,6 +6902,10 @@ val audio = if (tajweedPipelineHolder.running) {
                     currentWordCount = 0
                     spokenTimings.clear()
                     sessionFinalized = false
+                    // §4.38 — a brand-new utterance: the PREVIOUS session's
+                    // endpoint evidence and stop clock must not gate this one.
+                    endpointDecodeLandedAtMs = 0L
+                    pipelineStoppedAtMs = 0L
                     // Resume-from-mistake re-seat: this fresh session is the
                     // "continue reading from the wrong word" flow. The display
                     // transcript is restored to the words BEFORE the mistake
@@ -5713,6 +6944,31 @@ val audio = if (tajweedPipelineHolder.running) {
                 if (!ev.freshSession && mistakeResumeIndex >= 0 && currentTab == "Memorize") {
                     android.util.Log.i("ItqanSherpa", "collector(): mistake-freeze dropping endpoint=${ev.endpoint} ${ev.partial.size}w (resume latch armed @ word $mistakeResumeIndex)")
                     return@collect
+                }
+                // ── §4.38 THE ENDPOINT DECODE'S EVIDENCE, RECORDED BEFORE ANY FREEZE ──
+                // Two wall clocks the confirm gate needs. `pipelineStoppedAtMs` is
+                // when we first noticed the session had ended (the pipeline reports
+                // running=false right after the endpoint) and bounds the wait;
+                // `endpointDecodeLandedAtMs` is when the whole-session decode put
+                // words into the transcript — the acquittal the ABSENT strikes are
+                // not allowed to pre-empt. Both are recorded HERE, above the
+                // mistake-freeze, because that freeze `return@collect`s and would
+                // otherwise swallow the very evidence this section exists for.
+                if (!tajweedPipelineHolder.running && currentTab == "Memorize" &&
+                    pipelineStoppedAtMs == 0L
+                ) {
+                    pipelineStoppedAtMs = System.currentTimeMillis()
+                }
+                if (!ev.freshSession && !tajweedPipelineHolder.running &&
+                    ev.partial.isNotEmpty() && endpointDecodeLandedAtMs == 0L
+                ) {
+                    endpointDecodeLandedAtMs = System.currentTimeMillis()
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "collector(): endpoint decode LANDED with ${ev.partial.size}w after the " +
+                            "session stopped — the confirm gate (§4.38) may now judge; " +
+                            "latency=${endpointDecodeLandedAtMs - pipelineStoppedAtMs}ms"
+                    )
                 }
                 // Words shown are RAW in the Tajweed Rules Coach tab: the pipeline's
                 // AyahWordMatcher filters against the Memorize target vocabulary
@@ -6399,10 +7655,13 @@ spokenTimings.clear()
         }
 
         // (item 5) Real-time tajweed mistake popup. Fires when the acoustic model flags a
-        // TAJWEED_ERROR on a specific word during Memorize+Tajweed. Deliberately does NOT
-        // pause the recitation: the analysis loop keeps running, this dialog posts itself
-        // on top, auto-dismisses after 4 s, and the user keeps reading. The `latestTajweedPopup`
-        // state (and its 4 s auto-timer) lives next to detailedAnalysis above.
+        // TAJWEED_ERROR on a specific word during Memorize+Tajweed. It PAUSES the mic so the
+        // user can re-read from that word, and it STAYS ON SCREEN UNTIL THE USER DISMISSES IT
+        // (user: "the popup stays until the user dismiss it"). There is deliberately NO
+        // auto-dismiss timer: the only clears are the user's Close/back, a new range/surah
+        // selection (3942), and leaving the Memorize tab (4501). An earlier version of this
+        // comment claimed a 4 s auto-timer — there has never been one, and adding one would
+        // break the contract.
         latestTajweedPopup?.let { (ruleLabel, wordIdx) ->
             // The popup serves three flows. "tajweed" (TAJWEED_ERROR): the
             // acoustic model flagged a rule violation; the popup names the rule
@@ -6415,6 +7674,15 @@ spokenTimings.clear()
             val popupScore = if (latestPopupKind == "tajweed") {
                 detailedAnalysis.forWordIndex(wordIdx)?.tajweedScore
             } else null
+            // THE POPUP MUST NAME THE WORD (user: "i noticed it didnt write the
+            // word in the popup. just the rule and the score"). For "wrong"/
+            // "skipped" the pair's first element already IS the word text; for
+            // "tajweed" it is the RULE, so resolve the word from the same
+            // (word, rule) row the score is read from. MULTI-RULE SAFE: rows are
+            // resolved by wordIndex, never by list position.
+            val popupWord = if (latestPopupKind == "tajweed") {
+                detailedAnalysis.forWordIndex(wordIdx)?.text.orEmpty()
+            } else ruleLabel
             val localizedRule = getAppString(isArabic, ruleLabel)
             val popupTitle = when (latestPopupKind) {
                 "wrong" -> getAppString(isArabic, "Wrong Word")
@@ -6431,12 +7699,25 @@ spokenTimings.clear()
                     "The word \"%s\" was not heard. Re-read it, then continue from there."
                 ).replace("%s", ruleLabel)
                 else -> {
+                    // Name the word first, then the rule verdict, then the score —
+                    // "The word "ذَٰلِكَ": Review your Madd application. Your Madd
+                    // score: 46%." Without the leading clause the popup said only
+                    // which RULE failed, leaving the user to guess which word.
                     val base = formatPerRuleVerdict(isArabic, false, ruleLabel)
+                    val named = if (popupWord.isNotEmpty())
+                        getAppString(isArabic, "The word \"%s\": ").replace("%s", popupWord) + base
+                    else base
                     if (popupScore != null) {
-                        base + " " + getAppString(isArabic, "Your %s score: %d%%.")
+                        // The score template's key carries a DOUBLED `%%` (escaped for the
+                        // printf-style body), and `getAppString` returns the key VERBATIM in
+                        // English -- so the English popup rendered a literal `35%%` while the
+                        // Arabic branch mapped it to a single `٪`. Collapse it here; the Arabic
+                        // translation has no `%%` so this is a no-op for it.
+                        named + " " + getAppString(isArabic, "Your %s score: %d%%.")
                             .replace("%s", localizedRule)
                             .replace("%d", popupScore.toString())
-                    } else base
+                            .replace("%%", "%")
+                    } else named
                 }
             }
             AlertDialog(
@@ -6560,210 +7841,9 @@ spokenTimings.clear()
         if (currentTab == "Tajweed") {
             // Tajweed companion learning & reference hub
             var activePracticeRule by remember { mutableStateOf<String?>(null) }
-            val rulesList = remember {
-                listOf(
-                    TajweedRuleInfo(
-                        name = "Ghunnah & Shaddah",
-                        description = "Nasal sound from the nose for 2 harakahs on heavy Noon or Meem.",
-                        color = Color(0xFF43A047), // Green
-                        fullExplanation = "Whenever you see a Noon (ن) or Meem (م) with a Shaddah (ّ), you must produce a nasalization (Ghunnah) from the nasopharynx for a duration of two counts.",
-                        examples = listOf(
-                            // Each example is a real Quranic excerpt whose FIRST tajweed-rule match
-                            // fires GHUNNAH (verified against getTajweedRuleForWord after the
-                            // harakah-between-noon-and-shaddah fix in the detector). The matched
-                            // token carries نّ or مّ, so the colouriser paints it ghunnah-green.
-                            TajweedExample("إِنَّ", "Indeed"),                                     // إِنَّ -> نّ
-                            TajweedExample("مُحَمَّدٌ", "Muhammad"),                              // مُحَمَّدٌ -> مّ
-                            TajweedExample("إِنَّمَا", "Only ..."),                              // إِنَّمَا -> نّ+مّ
-                            TajweedExample("كُنَّا", "We were"),                                  // كُنَّا -> نّ
-                            TajweedExample("أُمَّةٌ", "A nation"),                                // أُمَّةٌ -> مّ
-                            TajweedExample("إِنَّ فِي", "Indeed in"),                            // إِنَّ -> نّ
-                            TajweedExample("مِّن مَّآءِ", "From answered water"),                  // مِّن -> مّ+نّ
-                            TajweedExample("كُمِّ يَرْجُونَ", "You are rolled"),                  // كُمِّ -> مّ
-                            TajweedExample("إِنَّمَا يَتَوَكَّلُونَ", "Indeed they rely"),
-                            TajweedExample("إِنَّمَا تَعْبُدُونَ", "Indeed you worship"),
-                            TajweedExample("مِّن صُبْرٍ", "From patience"),
-                            TajweedExample("تُمَّ يَدْعُونَ", "Then they call")
-                        )
-                    ),
-                    TajweedRuleInfo(
-                        name = "Madd",
-                        description = "Extension of standard vowels (Muttasil or Munfasil) when followed by Hamzah or Sukoon.",
-                        color = Color(0xFFE53935), // Red
-                        fullExplanation = "Madd extends vowel sounds. If a vowel letter is followed by a Hamzah or a Sukoon, the sound is elongated. Muttasil (Hamzah in the same word) is 4-5 counts; Munfasil (Hamzah across words) varies by riwayah (Hafs: 4-5, Qalun: Qasr 2 or Tawassut 4).",
-                        examples = listOf(
-                            // Each entry's first rule-matched token contains a madd letter (آ or the
-                            // madd-harakah  ٓ / ۤ). The Al-Lam branch is skipped on the Madd token
-                            // because there's no `ال` prefix; the Qutb-Jad branch is ruled out because
-                            // none of ق/ط/ب/ج/د is present, and the noon/meem branches are ruled out
-                            // because neither qualifies. Verified against getTajweedRuleForWord. Every
-                            // snippet here is 4–5 words so the user sees real Quran context, not a lone
-                            // 1-2 word trigger as before.
-                            TajweedExample("الْحَمْدُ لِلَّهِ رَبِّ سَمَآءِ", "Praise to Allah, Lord of the sky"),
-                            TajweedExample("وَأَنزَلْنَا مِنَ الْمُحْدَثِ مَآءً", "And We sent down fresh water"),
-                            TajweedExample("نَصْبُ قُرْآنٍ مَّبِينٍ هُدًى", "Plain Quran as guidance"),
-                            TajweedExample("إِنَّ هَٰؤُلَآءِ لَعَنْهُمْ ضَآلِّينَ", "These are astray losers"),
-                            TajweedExample("لَهُمْ أَجْرٌ سَوَآءُ مَعَ أَهْلِ", "Equal reward with the people"),
-                            TajweedExample("خَآلِدِينَ سُبْحَانَهُ تَعَالَى فِيهَا", "Abiding, glorified and exalted in it"),
-                            TajweedExample("فَسَمَآءِ مِن سَمٰۤوَٰتٍ وَأَرْضِ", "The sky of heavens and earth"),
-                            TajweedExample("بَدَآءُ فُطْلَٰهُ كَتَبَ اللَّهُ", "The beginning of affairs Allah decreed"),
-                            TajweedExample("مَآءً غَدَقًا لِقَوْمٍ يُؤْمِنُونَ", "Abundant water for a believing people"),
-                            TajweedExample("يَعْلَمُ مَآ أَعْطَىٰ وَمَا مَنَعَ", "Knows what He gave and withheld"),
-                        )
-                    ),
-                    TajweedRuleInfo(
-                        name = "Qalqalah (Echo & Bounce)",
-                        description = "A strong bouncing resonant release on silent letters of Qutb Jad (ق ط ب ج د).",
-                        color = Color(0xFF1E88E5), // Blue
-                        fullExplanation = "Qalqalah refers to echoing stops. When one of the letters (ق, ط, ب, ج, د) is quiet (has a Sukoon or is stopped upon at the end of a verse), it is pronounced with an echoing, bouncing release.",
-                        examples = listOf(
-                            // Each entry's FIRST rule match is QALQALAH: ء/ب/ط/ج/ق/د with sukoon at
-                            // end of the token, OR earlier explicit sukoon preceding a diacritic.
-                            // Verified against getTajweedRuleForWord — the classifier walks tokens
-                            // L-to-R and returns on the first rule that applies per-word.
-                            TajweedExample("قَدْ أَفْلَحَ", "He has succeeded"),                     // قَدْ
-                            TajweedExample("ٱقْرَأْ بِٱسْمِ", "Read in the name"),                  // ٱقْرَأْ
-                            TajweedExample("بِقَدْرٍ مَّا", "With the measure of"),                  // ق + دْ
-                            TajweedExample("مَقْطُوعَةٌ", "Severed"),                              // مَقْطُوعَةٌ
-                            TajweedExample("سُبْحَٰنَ رَبِّكَ", "Glory to your Lord"),              // س + بْ
-                            TajweedExample("قُطْبِ", "Pivot"),                                       // ق + طْ
-                            TajweedExample("تُبْ", "Repent"),                                       // تْ + بْ
-                            TajweedExample("فِطْرَةَ ٱللَّهِ", "Nature of Allah"),                    // طْ + رَ
-                            TajweedExample("وَٱبْنِ جِئْنَا", "And my son, we came"),                 // بْ + نِ
-                            TajweedExample("عَجْرٍ", "Wages"),                                          // عَجْرٍ — جْ at end
-                            TajweedExample("أَبْرِيَاءٌ", "Innocent"),                                  // بْ + رَ — actually أَبْرِيَاءٌ has ج in middle, but OK. Let me check.
-                        )
-                    ),
-                    TajweedRuleInfo(
-                        name = "Idgham (Merging)",
-                        description = "Merging a silent Noon or Tanween into a following letter of Yarmalun (ي ر م ل و ن).",
-                        color = Color(0xFFFB8C00), // Orange
-                        fullExplanation = "Idgham merges the silent Noon or Tanween into the next letter. If the next letter is from (ي, م, و, ن), it merges with Ghunnah; if it is (ل, ر), it merges completely without Ghunnah.",
-                        examples = listOf(
-                            // Each entry uses noon sakinah followed by a head letter from
-                            // يرملون (ي ر م ل و ن). Verified against getTajweedRuleForWord — the
-                            // Idgham branch fires on these word pairs.
-                            TajweedExample("مَن يَقُولُ", "Who says"),                                // نْ + ي
-                            TajweedExample("مَن وَلَّاهُ", "Who takes charge of him"),                 // نْ + و
-                            TajweedExample("مَن مَّاتَ", "Whoever dies"),                              // نْ + م
-                            TajweedExample("مَن نَّصَرَ", "Whoever helps"),                            // نْ + ن
-                            TajweedExample("مِن لَّدُنْهُ", "From Him"),                              // نْ + ل
-                            TajweedExample("إِن يَعْلَمِ ٱللَّهُ", "If Allah knows"),                  // نْ + ي
-                            TajweedExample("إِن مَثَلَ عِيسَىٰ", "If the parable of Jesus"),           // نْ + م
-                            TajweedExample("إِن يُسَبِّحُ", "If he glorifies"),                       // نْ + ي
-                            TajweedExample("إِن لَنَا", "If for us"),                                 // نْ + ل
-                            TajweedExample("مِن يُؤْمِنُ", "Whoever believes"),                       // نْ + ي
-                            TajweedExample("إِن نَّصَرَهُ", "If he helps him"),                       // نْ + ن
-                            TajweedExample("وَإِن يَرْجِعُوا۟", "And if they return"),                  // نْ + ي
-                        )
-                    ),
-                    TajweedRuleInfo(
-                        name = "Iqlab & Ikhfa",
-                        description = "Hiding or converting silent Noon to Meem when followed by specific letters.",
-                        color = Color(0xFF00ACC1), // Cyan / Teal
-                        fullExplanation = "Iqlab converts silent Noon or Tanween to a Meem when followed by Ba (ب). Ikhfa hides the Noon pronunciation gently with Ghunnah when followed by any of the other 15 letters.",
-                        examples = listOf(
-                            // Each entry's first rule match fires IKHFA (mixed iqlab + ikhfa below).
-                            // iqlab branch: noon sakinah + next word starting with ب.
-                            // ikhfa branch: noon sakinah + next word starting with ض ص ث ق ف ك ت etc —
-                            // any letter NOT in يرملون and NOT in the throat set.
-                            TajweedExample("مِن بَعْدِ", "From after"),                            // نْ + ب (iqlab)
-                            TajweedExample("مِن قَبْلُ", "From before"),                            // نْ + ق (ikhfa)
-                            TajweedExample("إِن شَآءَ ٱللَّهُ", "If Allah wills"),                  // نْ + ش (ikhfa)
-                            TajweedExample("مِن سَحَائِبِهَا", "From its clouds"),                  // نْ + س (ikhfa)
-                            TajweedExample("مِن ضَآلٍّ", "From the astray"),                        // نْ + ض (ikhfa)
-                            TajweedExample("مِن صُومٍ", "From fasting"),                            // نْ + ص (ikhfa)
-                            TajweedExample("مِن كِسْرٍ", "From broken"),                            // نْ + ك (ikhfa)
-                            TajweedExample("وَمِن صُوفُوبِهِمَا", "And from their wool"),           // نْ + ص (ikhfa)
-                            TajweedExample("إِن صَبَرْتُمْ", "If you are patient"),                  // نْ + ص (ikhfa)
-                            TajweedExample("مِن دِمَٰنٍ", "From blood"),                            // نْ + د (ikhfa)
-                            TajweedExample("مِن كَافِرٍ", "From a disbeliever"),                     // نْ + ك (ikhfa)
-                            TajweedExample("إِنْ كَانَ حَرِيمًا", "If he was a free man"),              // نْ + ح → Izhar actually. Skip; move to Izhar.
-                        )
-                    ),
-                    TajweedRuleInfo(
-                        name = "Izhar (Clarity)",
-                        description = "Clear pronunciation of Noon Sakinah or Tanween before throat letters (أ, هـ, ع, ح, غ, خ).",
-                        color = Color(0xFF8E24AA), // Purple
-                        fullExplanation = "When a quiet Noon (نْ) or Tanween (ً ٍ ٌ) is followed by one of the throat letters (ء, هـ, ع, ح, غ, خ), it must be pronounced clearly from its point of articulation without any extra nasalization (Ghunnah).",
-                        examples = listOf(
-                            // Every entry's *first* rule match is noon sakinah followed by a throat
-                            // letter (ء هـ ع ح غ خ). Verified against getTajweedRuleForWord.
-                            TajweedExample("مَنْ عَمِلَ صَٰلِحًا", "Whoever does righteousness"),
-                            TajweedExample("مِنْ عَلَقٍ", "From a clinging substance"),
-                            TajweedExample("وَمِنْ عِندِهِمْ", "And from them"),
-                            TajweedExample("أَنْ عَمِلَتْ", "That she did"),
-                            TajweedExample("مِنْ حَيْثُ", "From where"),
-                            TajweedExample("مِن خَيْرٍ", "From good"),
-                            TajweedExample("عَنْ هُدًى", "From guidance"),
-                            TajweedExample("مِنْ غُلَّةٍ", "From tightness"),
-                            TajweedExample("حَقًّا عَلَيْنَا", "Truly upon us"),
-                            TajweedExample("أَنْ عَمِلُوا۟", "That they did"),
-                            TajweedExample("مِنْ أَهْلِ ٱلْكِتَابِ", "From the People of the Book"),
-                            TajweedExample("مَنْ أَطَاعَ", "Whoever obeyed"),
-                        )
-                    ),
-                    TajweedRuleInfo(
-                        name = "Meem Sakinah (Labial Rules)",
-                        description = "Rules of quiet Meem followed by Meem (Idgham), Ba (Ikhfa), or other letters (Izhar).",
-                        color = Color(0xFF7E57C2), // Deep Purple
-                        fullExplanation = "Meem Sakinah (مْ) has three rules: 1) Idghaam Shafawi: if followed by Meem (م), merging them with Ghunnah. 2) Ikhfaa Shafawi: if followed by Ba (ب), hiding it with Ghunnah. 3) Izhaar Shafawi: if followed by any other letter, pronouncing it clearly.",
-                        examples = listOf(
-                            // Meem Sakinah cases. The first token has a meem-sakinah (م + sukoon) so the
-                            // Meem-Sakinah branch fires before any noon-sakinah shadow. The next token
-                            // starts with م or ب for idgham-shafawi / ikhfa shafawi.
-                            TajweedExample("أَمْ بِأَصْبِعٍ", "Or with the fingers"),
-                            TajweedExample("لَكُم مِّن كَسْبِهِمْ", "For you is what they earned"),
-                            TajweedExample("حَمْلُهُمْ مِّن صُبْرٍ", "Their burden of patience"),
-                            TajweedExample("عَلَيْهِم مِّن بَاطِنٍ", "Upon them from within"),
-                            TajweedExample("مُسْتَمْسِكٌ بِهِمْ", "Clinging with them"),
-                            TajweedExample("أَمْ مِمَّن", "Or the one who"),
-                            TajweedExample("كُم مِّن", "Rolled ... from"),
-                            TajweedExample("أَم مُّوذِلِّينَ", "Or mockers"),
-                            TajweedExample("أَم مُقْرَبِينَ", "Or those who come near"),
-                            TajweedExample("مَا لَّبَلِهِمْ", "Whatever [they] please"),
-                            TajweedExample("مِن نَّبَإِهِمْ", "From their news"),
-                            TajweedExample("أَم بِٱلتَّوْبَةِ", "Or with the repentance"),
-                            TajweedExample("عَلَيْهِم مَّا", "Upon them whatever"),
-                        )
-                    ),
-                    TajweedRuleInfo(
-                        name = "Al-Lam",
-                        description = "Merging or pronouncing Alif-Laam (ال) based on Solar and Lunar letters.",
-                        color = Color(0xFF607D8B), // Blue Grey
-                        fullExplanation = "When a word starts with Alif-Laam (ال): 1) Al-Laam Al-Shamsiyah (Solar): the Lam is quiet and merged into the next letter (solar letter with Shaddah). 2) Al-Laam Al-Qamariyah (Lunar): the Lam is pronounced clearly with a Sukoon (lunar letter).",
-                        examples = listOf(
-                            // Mix of solar (تثدذرزسشصضطظلن) and lunar (ء ب ج ح خ ع غ ف ق ك م ه و ي)
-                            // first-letter cases so both branches fire.
-                            TajweedExample("ٱلشَّمْسُ وَٱلْقَمَرُ", "The sun and the moon"),
-                            TajweedExample("ٱلْحَمْدُ لِلَّهِ", "All praise is to Allah"),
-                            TajweedExample("مَلِكِ ٱلنَّاسِ", "The King of mankind"),
-                            TajweedExample("ٱلْأَرْضُ وَٱلسَّمَٰوَٰتُ", "The earth and the heavens"),
-                            TajweedExample("رَبُّ ٱلْعَٰلَمِينَ", "The Lord of the worlds"),
-                            TajweedExample("ٱلْكِتَابُ ٱلْمُبِينُ", "The clear Book"),
-                            TajweedExample("ٱلرَّحْمَٰنِ ٱلرَّحِيمِ", "The Most Gracious, the Most Merciful"),
-                            TajweedExample("بِسْمِ ٱللَّٰهِ", "In the name of Allah"),
-                            TajweedExample("ٱلنَّجْمُ ثَاقِبٌ", "The piercing star"),
-                            TajweedExample("ٱلضُّحَىٰ", "The morning brightness"),
-                            TajweedExample("ٱلفَجْرِ", "The dawn"),
-                            TajweedExample("ٱلْعَادِيَٰتِ ضَبْحًا", "The charging steeds panting"),
-                            TajweedExample("ٱللَّهُ", "Allah"),
-                            TajweedExample("ٱلْمُؤْمِنُونَ", "The believers")
-                        )
-                    ),
-                    TajweedRuleInfo(
-                        name = "Silah",
-                        description = "Elongation of the pronoun Ha (ه) and Meem marks in Qalun riwayah.",
-                        color = Color(0xFF8E24AA), // Purple
-                        fullExplanation = "In the Riwayah of Qalun, the plural Meem (م الجَمْع) can optionally be read with Silah (elongating it to 'muu' مُو) if followed by a voweled letter. Also, the pronoun Ha (ه) is elongated if nestled between two voweled letters (Silah Sughra) or before a Hamzah (Silah Kubra).",
-                        examples = listOf(
-                            TajweedExample("عَلَيْهِمُ مَسْكَنَتُهُمْ", "Over them [is] destitution"),
-                            TajweedExample("إِنَّهُۥ كَانَ", "Indeed He is"),
-                            TajweedExample("عِندَهُۥٓ إِلَّا", "With Him except")
-                        )
-                    )
-                ).filter { it.name.contains("Madd") || it.name.contains("Ghunnah") || it.name.contains("Idgham") || it.name.contains("Meem") || it.name.contains("Qalqalah") || it.name.contains("Ikhfa") || it.name.contains("Izhar") || it.name.contains("Lam") }
-            }
+            // Canonical card list (see tajweedRuleCards at the top level) --
+            // kept as a remember so the LazyColumn keys stay stable.
+            val rulesList = remember { tajweedRuleCards }
             
             LazyColumn(
                 modifier = Modifier.weight(1f).fillMaxWidth(),
@@ -8133,6 +9213,10 @@ spokenTimings.clear()
                                 detailedAnalysis = emptyList()
                                 sessionFinalized = false
                                 sessionRangeCompleted = false
+                                // §4.38 — an explicit Restart is a fresh session:
+                                // clear the previous run's endpoint evidence.
+                                endpointDecodeLandedAtMs = 0L
+                                pipelineStoppedAtMs = 0L
                                 mistakeResumeIndex = -1
                                 mistakeResumeLiveText = ""
                                 hintActive = false
@@ -8161,63 +9245,31 @@ spokenTimings.clear()
                 }
                 Spacer(modifier = Modifier.height(8.dp))
                 
-                // Show Error Banner if applicable.
-                // Tajweed mode: WRONG/SKIPPED banners are gated on the
-                // multi-emission confirmation evidence (confirmedMistakeUiIdx)
-                // so a transient single-window decode artifact never flashes a
-                // false mistake (measured on-device: window#3 dropped two words
-                // and flashed "skipped"; window#4 restored them 1.2 s later).
-                // TAJWEED_ERROR feedback keeps its instant yellow banner — its
-                // acoustic verdicts already carry their own bounded
-                // confirmation search. Tarteel mode: unchanged instant banner.
-                val bannerIdx = if (recitationMode == "Tajweed") {
-                    if (confirmedMistakeUiIdx >= 0) confirmedMistakeUiIdx
-                    else detailedAnalysis.forWordIndex(errorIndex)
-                        ?.takeIf { it.status == RecitationStatus.TAJWEED_ERROR }
-                        ?.let { errorIndex }
-                        ?: -1
-                } else errorIndex
-                if (currentTab == "Memorize" && bannerIdx >= 0) {
-                    val currentAnalysis = detailedAnalysis.forWordIndex(bannerIdx)
-                    if (currentAnalysis != null) {
-                        val isTajweedError = currentAnalysis.status == RecitationStatus.TAJWEED_ERROR && recitationMode == "Tajweed"
-                        val isWrongWord = currentAnalysis.status == RecitationStatus.WRONG
-                        val isSkippedWord = currentAnalysis.status == RecitationStatus.SKIPPED
-                        
-                        if (isTajweedError || isWrongWord || isSkippedWord) {
-                            val bannerColor = if (isTajweedError) Color(0xFFFFF9C4) else MaterialTheme.colorScheme.errorContainer
-                            val borderColor = if (isTajweedError) Color(0xFFFBC02D) else MaterialTheme.colorScheme.error
-                            val iconColor = if (isTajweedError) Color(0xFFF57F17) else MaterialTheme.colorScheme.error
-                            
-                            val title = when {
-                                isTajweedError -> "Tajweed Feedback (${currentAnalysis.tajweedRule ?: "Rule"})"
-                                isSkippedWord -> "Skipped Word"
-                                else -> "Incorrect Pronunciation/Word"
-                            }
-                            
-                            val message = when {
-                                isTajweedError -> currentAnalysis.tajweedAcousticFeedback ?: "Review ${currentAnalysis.tajweedRule} here."
-                                isSkippedWord -> "You skipped the word: ${currentAnalysis.text}"
-                                else -> "Expected ${currentAnalysis.text}, but heard something else."
-                            }
-                            
-                            Card(
-                                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                                colors = CardDefaults.cardColors(containerColor = bannerColor),
-                                border = BorderStroke(1.dp, borderColor)
-                            ) {
-                                Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.Warning, contentDescription = "Notice", tint = iconColor, modifier = Modifier.size(24.dp))
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Column {
-                                        Text(title, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = iconColor)
-                                        Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                // ── NO INLINE MISTAKE MESSAGE (removed) ──────────────────────
+                // There used to be a "Wrong Word" / "Skipped Word" / "Tajweed
+                // Feedback" Card here — an inline banner inside the transcript
+                // area. It is GONE, by explicit instruction:
+                //
+                //   "i dont want messages neither for wrong/skipped/tajweed
+                //    mistakes nor for good recitations. only popups indicating
+                //    the type of mistake and the word and if for tajweed
+                //    indicating the rule and the %."
+                //
+                // The mistake surface is the DIALOG (`latestTajweedPopup`,
+                // rendered further up): title = the mistake TYPE
+                // (Wrong Word / Skipped Word / Tajweed Mistake — <rule>), body =
+                // the WORD, plus the RULE and the SCORE % for tajweed. It is
+                // raised by `stopForMistake`, which is also the only place that
+                // arms `confirmedMistakeUiIdx` — so the banner could never have
+                // been shown alone anyway (§4.39), and now it cannot be shown at
+                // all.
+                //
+                // The inline surface was the direct cause of the user's report
+                // "i saw a msg of a wrong word. why it is on a msg not popup?":
+                // the banner was armed by the verified-absent verdict on its own,
+                // while the dialog additionally needed `sightings >= 2`,
+                // `isListening` and `pipeline.running` — so a bare message could
+                // appear where a popup belonged. One surface, one rule.
                 
                 val listState = androidx.compose.foundation.lazy.rememberLazyListState()
                 
@@ -8386,161 +9438,28 @@ spokenTimings.clear()
                     }
 
                     // Detailed feedback scrolls along at the end of the LazyColumn
-                    if (spokenText.isNotEmpty() && currentTab == "Memorize") {
-                        item {
-                            Spacer(modifier = Modifier.height(16.dp))
-                            val wrongs = detailedAnalysis.filter { it.status == RecitationStatus.WRONG }
-                            // Mid-session a target word the STT frontier hasn't
-                            // reached yet can carry a transient candidate
-                            // SKIPPED verdict -- those must NOT flash a mistake
-                            // card. Only the finalized session's skips are real.
-                            val skippeds = if (sessionFinalized)
-                                detailedAnalysis.filter { it.status == RecitationStatus.SKIPPED }
-                            else emptyList()
-                            
-                            if (wrongs.isNotEmpty() || skippeds.isNotEmpty()) {
-                                Card(
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.15f)
-                                    ),
-                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.3f)),
-                                    shape = RoundedCornerShape(16.dp)
-                                ) {
-                                    Column(modifier = Modifier.padding(16.dp)) {
-                                        Text(
-                                            text = getAppString(isArabic, "Recitation Mistakes Detected"),
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.error
-                                        )
-                                        Spacer(modifier = Modifier.height(8.dp))
-                                        
-                                        if (wrongs.isNotEmpty()) {
-                                            Text(
-                                                text = getAppString(isArabic, "Wrong Words Spoken:"),
-                                                style = MaterialTheme.typography.bodyMedium,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = MaterialTheme.colorScheme.onErrorContainer
-                                            )
-                                            wrongs.forEach { analysis ->
-                                                Row(
-                                                    modifier = Modifier.padding(vertical = 4.dp),
-                                                    verticalAlignment = Alignment.CenterVertically
-                                                ) {
-                                                    Icon(
-                                                        imageVector = Icons.Filled.Close,
-                                                        contentDescription = "Wrong Word",
-                                                        tint = MaterialTheme.colorScheme.error,
-                                                        modifier = Modifier.size(16.dp)
-                                                    )
-                                                    Spacer(modifier = Modifier.width(6.dp))
-                                                    Text(
-                                                        text = if (isArabic) "خطأ في كلمة \"${analysis.text}\"" else "Incorrect word: \"${analysis.text}\"",
-                                                        style = MaterialTheme.typography.bodySmall,
-                                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                    )
-                                                    if (analysis.tajweedRule != null) {
-                                                        Spacer(modifier = Modifier.width(6.dp))
-                                                        SuggestionChip(
-                                                            onClick = {},
-                                                            label = { Text("${getAppString(isArabic, "Tajweed: ")}${getAppString(isArabic, analysis.tajweedRule)}", fontSize = 10.sp) },
-                                                            colors = SuggestionChipDefaults.suggestionChipColors(
-                                                                containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f),
-                                                                labelColor = MaterialTheme.colorScheme.onTertiaryContainer
-                                                            )
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                            Spacer(modifier = Modifier.height(8.dp))
-                                        }
-                                        
-                                        if (skippeds.isNotEmpty()) {
-                                            Text(
-                                                text = getAppString(isArabic, "Skipped Words:"),
-                                                style = MaterialTheme.typography.bodyMedium,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = MaterialTheme.colorScheme.onErrorContainer
-                                            )
-                                            skippeds.forEach { analysis ->
-                                                Row(
-                                                    modifier = Modifier.padding(vertical = 4.dp),
-                                                    verticalAlignment = Alignment.CenterVertically
-                                                ) {
-                                                    Icon(
-                                                        imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                                                        contentDescription = "Skipped Word",
-                                                        tint = Color(0xFFFB8C00),
-                                                        modifier = Modifier.size(16.dp)
-                                                    )
-                                                    Spacer(modifier = Modifier.width(6.dp))
-                                                    Text(
-                                                        text = if (isArabic) "تخطي كلمة \"${analysis.text}\"" else "Skipped word: \"${analysis.text}\"",
-                                                        style = MaterialTheme.typography.bodySmall,
-                                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                    )
-                                                    if (analysis.tajweedRule != null) {
-                                                        Spacer(modifier = Modifier.width(6.dp))
-                                                        SuggestionChip(
-                                                            onClick = {},
-                                                            label = { Text("${getAppString(isArabic, "Tajweed: ")}${getAppString(isArabic, analysis.tajweedRule)}", fontSize = 10.sp) },
-                                                            colors = SuggestionChipDefaults.suggestionChipColors(
-                                                                containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f),
-                                                                labelColor = MaterialTheme.colorScheme.onTertiaryContainer
-                                                            )
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if (
-                                // The "Excellent recitation" encouragement now only
-                                // appears AFTER the user (or the auto-stop silence
-                                // timer) has paused the mic, AND the selected range
-                                // is still incomplete (at least one PENDING target
-                                // word remains). Before this gate the card was
-                                // shown live during recitation, which is jarring —
-                                // a real-time "you've been perfect!" while the user
-                                // is still mid-ayah made the verdict look premature.
-                                // We also require the user is currently paused: an
-                                // active session shows the live word-tracking
-                                // feedback, not a summary card.
-                                !isListening &&
-                                detailedAnalysis.any { it.status == RecitationStatus.CORRECT } &&
-                                detailedAnalysis.any { it.status == RecitationStatus.PENDING }
-                            ) {
-                                Card(
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.2f)
-                                    ),
-                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)),
-                                    shape = RoundedCornerShape(16.dp)
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(16.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Filled.CheckCircle,
-                                            contentDescription = "Perfect Recitation",
-                                            tint = MaterialTheme.colorScheme.primary
-                                        )
-                                        Spacer(modifier = Modifier.width(12.dp))
-                                        Text(
-                                            text = getAppString(isArabic, "Excellent recitation so far! Keep going with perfect accuracy."),
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            fontWeight = FontWeight.Medium,
-                                            color = MaterialTheme.colorScheme.onPrimaryContainer
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // ── NO INLINE MISTAKE REPORT (removed) ───────────────────
+                    // A "Recitation Mistakes Detected" Card used to be appended
+                    // at the end of the transcript here, listing every WRONG and
+                    // SKIPPED word. It is GONE, by explicit instruction:
+                    //
+                    //   "i dont want messages neither for wrong/skipped/tajweed
+                    //    mistakes nor for good recitations. only popups indicating
+                    //    the type of mistake and the word and if for tajweed
+                    //    indicating the rule and the %. and when we pause or finish
+                    //    we have the summary."
+                    //
+                    // This card was almost certainly the "msg of a wrong word"
+                    // in the report "i saw a msg of a wrong word. why it is on a
+                    // msg not popup?": it is a MESSAGE, not a dialog, and it is
+                    // not tied to any stop — it simply rendered whenever the
+                    // analysis happened to hold a WRONG row.
+                    //
+                    // The mistake surface is now ONLY the dialog
+                    // (latestTajweedPopup), raised by stopForMistake(): type +
+                    // word, plus the rule and the score % for tajweed. The
+                    // end-of-session report is the SUMMARY dialog, raised on a
+                    // pause or a genuine finish.
                 }
             }
         }
@@ -8795,8 +9714,30 @@ spokenTimings.clear()
                                             "summary so the mistake popup is what the user sees"
                                     )
                                 }
+                                // ── WHEN THE SUMMARY MAY BE RAISED (§4.32) ──
+                                // The user's contract, stated twice:
+                                //   "if it stoppd then it should be a skipped/wrong
+                                //    word popup or tajweed popup else it should be
+                                //    displayed. not getting a summury popup (unless
+                                //    i click pause)"
+                                //   "no summury shown when finished in this test! fix it"
+                                // Reconciled: the summary appears on a GENUINE
+                                // FINISH (the whole range was actually heard) and
+                                // on a USER PAUSE — but NEVER for a mid-range
+                                // stall, which is what produced a "finished"
+                                // dialog over a recitation the app had only
+                                // partly heard.
+                                //
+                                // `!pendingRemain` alone was NOT enough: when the
+                                // walk stalls, finalizeCorrect() forges the tail
+                                // CORRECT with no spoken evidence, so pendingRemain
+                                // reads false on a run that aligned 27 of 29.
+                                // `unheardWordCount() == 0` is the real test — every
+                                // word carries a spoken match.
+                                val genuinelyFinished = detailedAnalysis.unheardWordCount() == 0
                                 if (sessionFinalized && !pendingRemain &&
-                                    viewModel.sessionSummaryToShow == null && !mistakeMustWin
+                                    viewModel.sessionSummaryToShow == null && !mistakeMustWin &&
+                                    (userInitiatedStop || genuinelyFinished)
                                 ) {
                                     // The recitation reached the end of its selected range with no
                                     // PENDING (un-scored) words left: mark the run as range-completed
@@ -8810,6 +9751,44 @@ spokenTimings.clear()
                                         entries = mistakeEntries,
                                         recitedAyahCount = newCompletedCount,
                                         totalAyahCount = (chargeRangeEnd - chargeRangeStart + 1).coerceAtLeast(1),
+                                        // Diagnostics only — the dialog shows the
+                                        // MISTAKES, not a coverage note.
+                                        unheardWordCount = detailedAnalysis.unheardWordCount(),
+                                        totalWordCount = detailedAnalysis.distinctWordCount(),
+                                    )
+                                    android.util.Log.i(
+                                        "ItqanSherpa",
+                                        "endOfRange(): summary raised " +
+                                            "(userPause=$userInitiatedStop finished=$genuinelyFinished " +
+                                            "entries=${mistakeEntries.size} " +
+                                            "unheard=${detailedAnalysis.unheardWordCount()}/" +
+                                            "${detailedAnalysis.distinctWordCount()}) " +
+                                            // §4.37 — THE DISPLAY PROOF. The transcript colours a word
+                                            // iff `globalWordIndex < alignment.first`, and the rows are
+                                            // complete (AnalyzerRowCompletenessTest), so `cursor >= total`
+                                            // is exactly "every word of the range is rendered". A dump
+                                            // cannot show colour; this number can, so log it on every
+                                            // summary and check it against the harness verdict.
+                                            "cursor=${alignment.first}/" +
+                                            "${detailedAnalysis.distinctWordCount()} " +
+                                            (if (alignment.first >= detailedAnalysis.distinctWordCount())
+                                                "-> ALL WORDS DISPLAYED"
+                                            else "-> ${detailedAnalysis.distinctWordCount() - alignment.first} word(s) still grey")
+                                    )
+                                } else if (sessionFinalized && !pendingRemain && !mistakeMustWin &&
+                                    !userInitiatedStop && !genuinelyFinished
+                                ) {
+                                    // Mid-range stall: the app stopped, no mistake
+                                    // was provable, and the range was NOT fully
+                                    // heard. Per the contract this must show NO
+                                    // popup at all — the words stay on screen.
+                                    android.util.Log.i(
+                                        "ItqanSherpa",
+                                        "endOfRange(): auto stop but NOT genuinely finished " +
+                                            "(unheard=${detailedAnalysis.unheardWordCount()}/" +
+                                            "${detailedAnalysis.distinctWordCount()}) -> no summary; " +
+                                            "words stay displayed " +
+                                            "cursor=${alignment.first}/${detailedAnalysis.distinctWordCount()}"
                                     )
                                 } else if (sessionFinalized && pendingRemain) {
                                     // The range is NOT complete (words the decoder never heard
@@ -8974,6 +9953,7 @@ spokenTimings.clear()
                     autoFinalizeDone = false
                     mistakeHoldSinceMs = 0L
                     graceExpiredOnce = false
+                    gracePromoteCount = 0
                     lastDecidedCount = 0
                     lastUnheardCount = Int.MAX_VALUE
                     return@LaunchedEffect
@@ -8984,15 +9964,44 @@ spokenTimings.clear()
                 // diagnosable from the run itself instead of guessed at.
                 run {
                     val decided = detailedAnalysis.map { it.wordIndex }.toHashSet().size
-                    val unheard = detailedAnalysis.count {
+                    // TWO DIFFERENT COUNTS, and conflating them was the bug (§4.34).
+                    // `pendingEmpty` = a PENDING row with NO candidate token — the only
+                    // shape the original guard was written for.
+                    // `unheardWords` = EVERY word holding a PENDING row, candidate or not.
+                    // A word carrying a candidate token is an UNRESOLVED JUDGEMENT, not a
+                    // decided word, so it must block a clean finish.
+                    val pendingEmpty = detailedAnalysis.count {
                         it.status == RecitationStatus.PENDING && it.spokenText.isNullOrEmpty()
                     }
+                    val unheardWords = detailedAnalysis
+                        .filter { it.status == RecitationStatus.PENDING }
+                        .map { it.wordIndex }.toHashSet().size
                     android.util.Log.i(
                         "ItqanSherpa",
                         "autoFinalize?(): rows=${detailedAnalysis.size} decided=$decided/${targetOrig.size} " +
-                            "unheardPending=$unheard alreadyShowing=${viewModel.sessionSummaryToShow != null} " +
+                            "unheardPending=$pendingEmpty unheardWords=$unheardWords " +
+                            "alreadyShowing=${viewModel.sessionSummaryToShow != null} " +
                             "done=$autoFinalizeDone"
                     )
+                    // DUMP THE UNDECIDED ROWS. The two shapes below are indistinguishable
+                    // from the counts alone and need opposite handling, so print the
+                    // status AND the candidate token of every row that is not a decided
+                    // CORRECT/TAJWEED_ERROR/HINTED:
+                    //   PENDING + spokenText  -> the analysis matched a token but never
+                    //                            returned a verdict (unresolved judgement)
+                    //   CORRECT + no spoken   -> finalizeCorrect()'s rubber stamp
+                    val undecided = detailedAnalysis.filter {
+                        it.status == RecitationStatus.PENDING ||
+                            (it.status == RecitationStatus.CORRECT && it.spokenText.isNullOrEmpty())
+                    }
+                    if (undecided.isNotEmpty()) {
+                        android.util.Log.i(
+                            "ItqanSherpa",
+                            "autoFinalize(): undecided rows = " + undecided.joinToString(" | ") {
+                                "w${it.wordIndex}/${it.text}:${it.status}:spoken='${it.spokenText ?: "-"}'"
+                            }
+                        )
+                    }
                 }
                 if (autoFinalizeDone) return@LaunchedEffect
                 if (viewModel.sessionSummaryToShow != null) return@LaunchedEffect
@@ -9001,10 +10010,23 @@ spokenTimings.clear()
                 if (total == 0) return@LaunchedEffect
                 // detailedAnalysis holds ONE ROW PER (WORD, RULE), so count
                 // distinct word indices, not rows.
-                val decidedWords = detailedAnalysis.map { it.wordIndex }.toHashSet()
-                val unheard = detailedAnalysis.count {
-                    it.status == RecitationStatus.PENDING && it.spokenText.isNullOrEmpty()
-                }
+                //
+                // ONLY A NON-PENDING ROW IS A DECISION (§4.34). A PENDING row is a
+                // placeholder whether or not it carries a candidate token, so it must
+                // not count toward `decidedWords` either.
+                val decidedWords = detailedAnalysis
+                    .filter { it.status != RecitationStatus.PENDING }
+                    .map { it.wordIndex }.toHashSet()
+                // UNRESOLVED CANDIDATES COUNT AS UNHEARD (§4.34). The old test only
+                // looked at PENDING rows with a BLANK spokenText, so a word holding a
+                // candidate token — a judgement the verifier had not yet returned a
+                // verdict for — read as "heard". `cleanFinish` then fired, the range was
+                // declared complete, and the word was left at the 25 %-opacity fallback
+                // with NO popup and NO summary: the user's "last word not displayed and
+                // there is no popup".
+                val unheard = detailedAnalysis
+                    .filter { it.status == RecitationStatus.PENDING }
+                    .map { it.wordIndex }.toHashSet().size
                 val mistakeOutstanding = detailedAnalysis.any {
                     it.status == RecitationStatus.WRONG || it.status == RecitationStatus.SKIPPED
                 }
@@ -9162,6 +10184,77 @@ spokenTimings.clear()
                         // straight through to the finalize.
                         return@LaunchedEffect
                     }
+                    // ── THE GRACE EXPIRED WITH UNRESOLVED WORDS AND NO MISTAKE ──
+                    // A PENDING row that survived the whole grace is a judgement the
+                    // verifier never returned a verdict for. There is NO evidence the
+                    // word was wrong — a confirmed mistake would have taken the branch
+                    // above — and per project policy a false accusation is worse than a
+                    // missed skip, so we do not accuse. But we must not leave the word
+                    // INVISIBLE either: the contract is "if it stopped, it is a mistake
+                    // popup, ELSE the words stay displayed" (measured clean_fatihah_2:
+                    // `endOfRange(): auto stop but NOT genuinely finished (unheard=1/29)
+                    // -> no summary` and the last word sat at the 25 %-opacity fallback
+                    // with nothing on screen at all).
+                    //
+                    // So make the row VISIBLE the way finalizeCorrect() forgives a
+                    // trailing PENDING word: `status = CORRECT`, `spokenText` left as it
+                    // is. The token is load-bearing — a row that carries one is a CLIPPED
+                    // decode (a word the user did say) and stays inside the "heard" set,
+                    // so a genuine finish can still raise its summary; a row with NO
+                    // token keeps `unheardWordCount()` counting it, so a recitation we
+                    // could not judge can never produce a "perfect" SUMMARY it did not
+                    // earn (§4.31). Either way the word becomes VISIBLE.
+                    //
+                    // PROMOTE **EVERY** PENDING ROW, TOKEN OR NOT. Using
+                    // `promoteClippedPendingRows()` here was a NO-OP for the rows this
+                    // branch exists for: a word the decoder never reached has
+                    // `spokenText == null`, and that helper deliberately leaves such rows
+                    // alone. The result was an INFINITE LOOP — measured `p1_fatihah`:
+                    // `grace expired with 7 unresolved word(s) [22..28] … (0 of them carry
+                    // a spoken fragment)` repeated every 2 s for minutes, the session
+                    // never finalizing and the screen never settling.
+                    val unresolvedIdx = detailedAnalysis
+                        .filter { it.status == RecitationStatus.PENDING }
+                        .map { it.wordIndex }.toHashSet()
+                    if (unresolvedIdx.isNotEmpty()) {
+                        val heard = detailedAnalysis.count {
+                            it.status == RecitationStatus.PENDING && !it.spokenText.isNullOrEmpty()
+                        }
+                        detailedAnalysis = detailedAnalysis.promoteUnresolvedPendingRows()
+                        // §4.40 — the promotion decides the rows, but the
+                        // renderer colours by the CURSOR, so the words this
+                        // branch exists to DISPLAY would stay grey. Advance the
+                        // cursor over the newly-decided prefix in the same
+                        // breath as the promotion, otherwise the very next
+                        // `endOfRange()` reports "words stay displayed
+                        // cursor=4/29" (measured `p4_fatihah`).
+                        val coveredAfterPromote = displayedCursorFor(detailedAnalysis, alignment.first)
+                        if (coveredAfterPromote > alignment.first) {
+                            android.util.Log.i(
+                                "ItqanSherpa",
+                                "autoFinalize(): cursor advanced ${alignment.first} -> " +
+                                    "$coveredAfterPromote so the ${unresolvedIdx.size} promoted " +
+                                    "word(s) actually DISPLAY (§4.40 REACHED => DISPLAYED)"
+                            )
+                            alignment = Pair(coveredAfterPromote, alignment.second)
+                        }
+                        gracePromoteCount++
+                        android.util.Log.i(
+                            "ItqanSherpa",
+                            "autoFinalize(): grace expired with ${unresolvedIdx.size} unresolved " +
+                                "word(s) $unresolvedIdx and NO evidenced mistake -> promoted to " +
+                                "CORRECT so they DISPLAY ($heard of them carry a spoken fragment, so " +
+                                "they still count as heard; the rest stay 'unheard' and block a " +
+                                "summary) [promotion #$gracePromoteCount]"
+                        )
+                        // ONE promotion pass is enough for the UI to repaint, so return
+                        // and let the next evaluation see a clean list and finalize. If a
+                        // later analysis rebuild RESURRECTS the rows, promote again — but
+                        // this time FALL THROUGH to the finalize instead of returning, so
+                        // a rebuild loop can never hold the session open forever (the
+                        // §4.18 class: "nothing ever happens" is the worst outcome).
+                        if (gracePromoteCount <= 1) return@LaunchedEffect
+                    }
                 }
                 mistakeHoldSinceMs = 0L
                 android.util.Log.i(
@@ -9183,6 +10276,7 @@ spokenTimings.clear()
                 autoFinalizeDone = !finalizeWithheld.value
                 if (finalizeWithheld.value) {
                     graceExpiredOnce = false
+                    gracePromoteCount = 0
                 }
             }
             if (tajweedStatusText.isNotEmpty()) {
@@ -9730,6 +10824,7 @@ fun getAppString(isArabic: Boolean, key: String): String {
         // --- Real-time tajweed mistake popup (memorize+tajweed) ---
         "Tajweed Mistake" -> "خطأ في التجويد"
         "Your %s score: %d%%." -> "نتيجتك في %s: %d٪."
+        "The word \"%s\": " -> "الكلمة \"%s\": "
         // --- Wrong/skipped word auto-pause popup (resume-from-mistake flow) ---
         "Wrong Word" -> "كلمة خاطئة"
         "Skipped Word" -> "كلمة لم تُسمع"
@@ -9813,17 +10908,27 @@ fun getAppString(isArabic: Boolean, key: String): String {
 }
 
 /**
- * Resolves the per-rule verdict templates ("good_rule_application_template" /
- * "review_your_rule_template") with the already-localized rule name. Used by the Tajweed Rules
- * Coach so the verdict message reads naturally in Arabic ("تطبيق جيد لحكم قلقلة") instead of the
- * English "Good Qalqalah application".
+ * Resolves the per-rule verdict templates with the already-localized rule name. Used by the
+ * Tajweed Rules Coach so the verdict message reads naturally in Arabic ("تطبيق جيد لحكم قلقلة")
+ * instead of the English "Good Qalqalah application".
+ *
+ * The two template keys live ONLY in the Arabic branch of `getAppString` -- which opens with
+ * `if (!isArabic) return key`, so asking for them in English returned the raw key and the popup
+ * rendered the literal `review_your_rule_template`. The user hit this on a real mic run:
+ * popup body read `The word "…": review_your_rule_template Your Madd score: 46%.`
+ * (found by TajweedPopupWordTest). The English prose is therefore supplied HERE, not via the
+ * table, so it can never regress into a raw key again.
  */
 fun formatPerRuleVerdict(isArabic: Boolean, passed: Boolean, ruleName: String): String {
-    val template = getAppString(
-        isArabic,
-        if (passed) "good_rule_application_template" else "review_your_rule_template"
-    )
     val localizedRule = getAppString(isArabic, ruleName)
+    val template = if (isArabic) {
+        getAppString(
+            true,
+            if (passed) "good_rule_application_template" else "review_your_rule_template"
+        )
+    } else {
+        if (passed) "Good %s application." else "Review your %s application."
+    }
     return template.replace("%s", localizedRule)
 }
 
@@ -9949,7 +11054,8 @@ private fun SessionSummaryRow(
 private fun SessionSummaryTajweedRow(
     word: String,
     rule: String,
-    isArabic: Boolean
+    isArabic: Boolean,
+    score: Float? = null
 ) {
     Row(
         modifier = Modifier.padding(vertical = 4.dp),
@@ -9967,5 +11073,18 @@ private fun SessionSummaryTajweedRow(
             fontWeight = FontWeight.SemiBold,
             color = Color(0xFF7E57C2)
         )
+        // The tajweed SCORE belongs on the row: the user asked for
+        // "the word + tajweed rules + the tajweed score for the tajweed
+        // mistakes" in the summary, exactly as the mistake popup shows.
+        // Kept optional so a row whose score never landed still renders.
+        if (score != null) {
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = "${score.toInt()}%",
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFF7E57C2)
+            )
+        }
     }
 }

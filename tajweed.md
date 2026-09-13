@@ -1475,6 +1475,1245 @@ BELOW `minDecodeWords = 8`. That is correct, not a hole — the count/sanity gua
 only. A thin decode may always FORGIVE; it may never CONDEMN. The asymmetry is the whole point:
 a false "no mistake" costs nothing, a false mistake popup accuses the user of a recitation error.
 
+### 4.26 The Madd card never refreshed, and two bundled Meem Sakinah examples taught the wrong rule
+
+The user asked for an audit of the coach's example data, because both failure modes are silent —
+nothing crashes, the card just teaches the wrong thing:
+
+> "if the random examples we get are really containing the rule (for example if I want to train for
+> madd it always gives me an example containing madd) and if there is other rules in the example I
+> get the score for each rule in the result."
+
+The card list was extracted out of the composable into a top-level
+`val tajweedRuleCards: List<TajweedRuleInfo>` so the **shipped** data is unit-testable, and
+`TajweedCardExampleAuditTest` now runs the two real detector chains over every bundled example.
+
+**Finding 1 — `ruleLabelToHead` had no `"Madd"` case, so the Madd card was frozen.**
+The rule cards carry *display* titles; the detectors emit *sub-labels*. The mapping covered
+`"Madd Muttasil"`, `"Madd (Vowel Extension)"` and `"Madd Munfasil (Qalun: Qasr/Tawassut)"` but not
+the bare card title `"Madd"`. Three consequences, all real:
+
+1. The card-expand effect starts with `val head = ruleLabelToHead(rule.name) ?: return@LaunchedEffect`,
+   so for Madd it returned early: `generateRandomQuranExample` was never called and the card stayed
+   on `rule.examples.first()` forever. The user's *"it always gives me an example containing madd"*
+   was true but for the wrong reason — it was always the SAME example.
+2. The supplemental score rows resolve a head to a display name with
+   `rulesList.firstOrNull { ruleLabelToHead(it.name) == head }?.name ?: head`. For MADD that lookup
+   missed and fell through to the raw head string, so the row rendered as `MADD:` — untranslated
+   (`getAppString(true, "MADD")` has no entry) and in the theme colour instead of madd-red, because
+   `tajweedHeadColor(ruleLabelToHead("MADD"))` was also null.
+3. Fixed by adding `"Madd"` to the MADD branch of `ruleLabelToHead`. Purely additive:
+   `getTajweedRuleForWord` never emits the bare label, so the generator's matching is unchanged —
+   only the card-title lookup starts working.
+
+**Finding 2 — two bundled Meem Sakinah examples did not contain Meem Sakinah.**
+
+| example | what the detector actually found | why |
+|---|---|---|
+| `مَا لَّبَلِهِمْ` | *(nothing)* | the only `مْ` is the last token's, and a trailing meem-sakinah with **no next word** yields no rule at all |
+| `مِن نَّبَإِهِمْ` | `IDGHAM, GHUNNAH` | `نْ + ن` fires Idgham on the FIRST token, and the walk **returns on the first match**, so the meem-sakinah at the end of the second token is never reached |
+
+Both replaced with real Quranic pairs whose first match is the izhar-shafawi branch of MEEM_SAKINAH
+(`مْ` + a non-`م`/`ب` letter), a sub-case the card previously had only one example of:
+
+```
+TajweedExample("لَهُمْ فِيهَا", "For them therein")        // مْ + ف
+TajweedExample("عَلَيْهِمْ غَيْرِ", "Not of those")         // مْ + غ  (Al-Fatihah 1:7)
+```
+
+**Finding 3 — the multi-rule reachability check was a tautology.** The first version of the audit
+asserted `all ⊆ primary ∪ (all - primary)`, which is true by construction and can never fail. The
+row *set* really is complete by construction; what can break is how a row **resolves for display**
+(head → card label → Arabic string → rule colour → calibrated threshold). That is what a missing
+`"Madd" -> "MADD"` case actually broke, so the assertion was rewritten to pin exactly that, plus the
+`headToFriendlyLabel` → `ruleLabelToHead` round-trip that `analyzeRecitationDetails` composes when it
+labels every multi-rule row.
+
+**Verified** — `TajweedCardExampleAuditTest`, 5/5 passing:
+
+```
+tests=5 failures=0 errors=0
+  PASS every scoreable head is fully resolvable for display
+  PASS head to friendly label round-trips through ruleLabelToHead
+  PASS every bundled example exhibits its own card's rule
+  PASS report the rules each bundled example actually contains
+  PASS every card maps to a trained model head
+```
+
+The audit dump is also the reference for **which rules each example really teaches** — e.g. the
+Ghunnah card's `إِنَّمَا` reports `primary=[GHUNNAH]` while `detectRulesForWord` also sees `MADD`,
+which is precisely the case the supplemental pass exists to turn into a second score row.
+
+### 4.27 The popup named only the rule, the summary was withheld by a rebuild, and the acoustic pass starved the decoder
+
+The user's first **real-microphone** run (not injection) produced three reports in one message. All
+three were reproduced from the on-device log (`build/tools/logs/app_only.txt`, 484 app-only lines
+extracted from a 323 k-line raw dump):
+
+> "for fatihah when i paused there is some words arent displayed then when i opend the mic again they
+> got displayed and finished fatihah without errors. so i think there is a problem of time of
+> processing words, it needs to be faster if possible. also when i paused i didnt see a summury popup
+> even when i finished. so you have to fix it. then i tried baqarah and got a tajweed error and i
+> noticed it didnt write the word in the popup. just the rule and the score. i want the words to be
+> included in the mistakes popups and in the summury."
+
+**Finding 1 — the tajweed popup never named the word.** `latestTajweedPopup` is a
+`Pair(String, Int)` whose first element is the **rule** for `kind="tajweed"` and the **word** for
+`kind="wrong"/"skipped"`. The renderer read `ruleLabel` in all three branches, so the tajweed body
+could only ever say which *rule* failed. The log shows it plainly:
+
+```
+tajweedPop(): TAJWEED_ERROR wordIndex=18 rule=Madd (Vowel Extension) score=46 -> pushing popup
+```
+
+`wordIndex=18` was in hand the whole time — the popup simply never resolved it. Fixed by deriving
+`popupWord` from `detailedAnalysis.forWordIndex(wordIdx)?.text` (**resolved by word index, never by
+list position**, so a multi-rule word still names the right text) and prefixing the body with
+`The word "%s": ` (with an Arabic entry added to `getAppString`). The wrong/skipped branches already
+carried the word via `ruleLabel`, so only the tajweed branch changed.
+
+> The **summary** needed no change at all: `MistakeEntry.word` was already populated and the dialog
+> already renders it through `SessionSummaryRow` / `SessionSummaryTajweedRow`. The user simply never
+> reached the summary — Finding 2.
+
+**Finding 2 — the end-of-range summary was withheld because a late analysis rebuild resurrected the
+forgiven tail.** The chain, in order, from the log:
+
+```
+finalDecodeAndEmit(): done 5531ms
+finalizeCorrect(): 4 trailing PENDING word(s) counted CORRECT (matched=25, total pending=4)
+analyze(tajweed): done 4335ms … changed=12      <- REBUILT detailedAnalysis wholesale
+analyze(tajweed): done 4550ms … changed=10      <- REBUILT it again
+autoFinalize?(): rows=33 decided=29/29 unheardPending=4
+endOfRange(): … pendingRemain=true              <- summary withheld
+```
+
+`finalizeCorrect()` had already latched `pendingConversionDone = true`, so when the deferred tajweed
+loop replaced `detailedAnalysis` wholesale from a fresh `analyzeRecitationDetails` call, the four
+PENDING rows came back and **nothing forgave them again**. `unheardPending` stuck at 4, the
+`pendingRemain` gate vetoed the summary, `autoFinalize` burned its full 20 s grace, and the user saw
+no popup. Fixed by freezing the forgiven index set and re-applying it **idempotently** whenever
+`detailedAnalysis` changes:
+
+```kotlin
+val forgivenTailIndices = remember { mutableStateOf<Set<Int>>(emptySet()) }
+LaunchedEffect(… , detailedAnalysis) {
+    if (!pendingConversionDone) { …freeze the set, convert once… }
+    else { …re-apply PENDING->CORRECT for the FROZEN set only… }
+}
+```
+
+Only `PENDING -> CORRECT` is ever written, and only for the frozen set, so a late pass that turns one
+of these words into a **real** mistake still wins (the mistake-popup path is untouched) and a rebuild
+that merely re-created the rows cannot resurrect them. The effect settles after one pass: once no
+PENDING row in the set remains, nothing is written and it stops re-firing. The `matched + 8` bound
+from §4.19/§4.17 is retained, so a whole-Baqarah target with 2.5 ayahs recited still cannot convert
+six thousand rows green.
+
+**Finding 3 — the acoustic pass, not the text pass, was the latency — and it starved the decoder.**
+Measured on this phone:
+
+| loop | per-pass time |
+|---|---|
+| `analyze(fast)` (text verdicts) | **~210 ms** |
+| `analyze(tajweed)` (acoustic verdicts) | **2 009 – 6 047 ms** (2.0/2.0/2.3/2.4/2.8/3.2/3.4/4.3/4.6/6.0 s) |
+
+The cost is dominated by the bounded confirmation search (§1 step 5): a word about to be flagged
+sweeps ±6 s in 150 ms steps — up to ~80 model evaluations — *per flagged word*. Because passes were
+emitted far faster than they could complete, the loop saturated a core and starved the decode loop
+directly:
+
+```
+decodeLoop(): alive busy=true lastDecodeAge=5052ms
+```
+
+which is exactly the reported symptom — *"when i paused there is some words arent displayed then when
+i opend the mic again they got displayed"*. Fixed by rate-limiting **live** passes to at least one per
+3 s (`TAJWEED_MIN_INTERVAL_MS`) while letting the **final** pass (`latest.finalized`, after the user
+stops) skip both the throttle and the 2 s settle delay — that delay is dead time once no more audio is
+coming, and removing it is a direct 2 s off the stop-to-report latency. Dropping a live pass is safe:
+the fast text loop keeps the transcript current, the next emission re-triggers a pass, and the final
+pass always scores everything.
+
+**Broken-code flag:** the summary was withheld *silently* — no log line said "summary suppressed
+because a rebuild resurrected 4 PENDING rows". The `pendingRemain` veto is correct (it exists so the
+summary cannot bury an unrecited tail) but it is undebuggable from the log alone. Any future
+regression here should first grep for the new line
+`finalizeCorrect(): re-applied N forgiven tail word(s) after a late analysis rebuild`.
+
+#### 4.27.1 Two more popup bugs the new test found — the body was leaking internal keys
+
+Writing `TajweedPopupWordTest` immediately paid for itself: pinning the *exact* body composition
+exposed two defects that no log line could ever show, because they are pure string-table bugs.
+
+**Bug A — the English popup printed the raw key `review_your_rule_template`.**
+`getAppString` opens with `if (!isArabic) return key`, and the two verdict templates
+(`good_rule_application_template` / `review_your_rule_template`) exist **only** in the Arabic branch
+of the `when`. So the English body literally read:
+
+```
+The word "ٱلضَّآلِّينَ": review_your_rule_template Your Madd (Vowel Extension) score: 35%.
+```
+
+Fixed by moving the English prose into `formatPerRuleVerdict` itself (`"Review your %s application."`
+/ `"Good %s application."`) instead of asking the table for a key it does not contain. The Arabic
+path still resolves through the table, so it is byte-identical to before.
+
+**Bug B — the English popup printed a doubled `35%%`.**
+The score key is `"Your %s score: %d%%."`; the `%%` is an escape for the caller's own `%d`
+substitution, but because English returns the key verbatim that escape was never collapsed, while
+the Arabic translation uses a single `٪`. Fixed with a trailing `.replace("%%", "%")` (a no-op for
+Arabic, which has no `%%`).
+
+Both are pinned by regression tests (`the English verdict template is real prose, never a raw key`,
+`the score renders one percent sign in both languages`), and the helper composes the string exactly
+as the composable does, so a future edit cannot silently drop the word, re-leak a key, or double a
+percent sign.
+
+**The popup does NOT auto-dismiss — and an earlier comment claimed it did.**
+`RecitationApp.kt` carried a comment asserting the dialog "auto-dismisses after 4 s" and referring
+to a "4 s auto-timer". There has never been one. Auditing every write to `latestTajweedPopup` gives
+exactly three clears: the user's Close/back (6768/6792), a new range or surah selection (3942), and
+leaving the Memorize tab (4501). Nothing is time-based, which is the contract the user restated:
+*"the popup stays until the user dismiss it."* The stale comment was corrected in place, because the
+next reader would otherwise "restore" a timer that must not exist.
+
+#### 4.27.2 Verified on device (Al-Fatihah, real-mic path + injection)
+
+**Fix B — the summary is back.** A clean injection run on Al-Fatihah produced:
+
+```
+autoFinalize?(): rows=29 decided=29/29 unheardPending=1 alreadyShowing=false done=false
+autoFinalize?(): rows=29 decided=29/29 unheardPending=0 alreadyShowing=false done=false
+autoFinalize(): grace expired with 29/29 words decided (unheard=0 mistake=false) -- running the finalize path
+endOfRange(): sessionFinalized=true pendingRemain=false newCompleted=7 wrong=0 skipped=0 tajweed=0
+```
+
+and the dialog was confirmed on screen by `uiautomator dump`:
+
+```
+Perfect recitation!
+Surah 1, Ayahs 1 - 7
+Masha'Allah — no mistakes in this recitation.
+Close
+```
+
+The user's broken run had `unheardPending=4` -> `pendingRemain=true` -> **no dialog at all**. The
+pause/resume run also exercised the re-apply directly:
+
+```
+finalizeCorrect(): 9 trailing PENDING word(s) counted CORRECT (matched=21, total pending=9)
+finalizeCorrect(): re-applied 9 forgiven tail word(s) after a late analysis rebuild
+```
+
+**Fix C — the throttle holds and the decoder recovers.** Across the same window:
+
+| | user's run (before) | after |
+|---|---|---|
+| live `analyze(tajweed)` passes in ~45 s | 30+ (one per emission) | **8-16** (one per >=3 s) |
+| worst `lastDecodeAge` | **5 052 ms** | 774-1 388 ms once the first pass settles |
+| per-pass time | 2.0-6.0 s | 2.0-3.5 s (typical) |
+
+**Fix A — the push path is airtight, the detector is simply conservative.** Across 7 injection runs
+only 2 produced a `TAJWEED_ERROR` at all, and **in both the popup was pushed** — never a scored error
+without a popup:
+
+| run | tajweed passes | passes with errors | popups pushed |
+|---|---|---|---|
+| fix27_fatihah_1 | 8 | 0 | 0 |
+| fix27_pauseresume_1 | 10 | **1** | **1** |
+| fix27_popcap_1 | 10 | 0 | 0 |
+| fix27_popcap_2 | 11 | 0 | 0 |
+| fix27_popcap_3 | 10 | **1** | **1** |
+| fix27_popcap_4 | 16 | 0 | 0 |
+| fix27_popup_proof | 9 | 0 | 0 |
+
+Both firings were `wordIndex=28 rule=Madd (Vowel Extension)` with `score=35` and `score=53`, i.e. the
+last word (ٱلضَّآلِّينَ) when the recitation was imperfect enough to flag — the same rule/word class
+as the user's Baqarah report. `wordIndex 28` resolves through the same
+`detailedAnalysis.forWordIndex(28)` row that supplied the score, so the body now reads
+`The word "ٱلضَّآلِّينَ": Review your Madd (Vowel Extension) application. Your Madd (Vowel Extension)
+score: 53%.`
+
+**Found while testing — a false-positive `SKIPPED`.** One run aborted at
+`SKIPPED CONFIRMED wordIndex=17 word='ٱهْدِنَا'` while the transcript had in fact reached the end of
+Al-Fatihah, and the full-context pass decoded `وَإِيَّاكَ نَعْبُدُ` and `ٱلْمُسْتَقِيمَ` around it. This is
+the documented verification-flakiness (the same bytes score very differently run to run), **not** a
+regression from §4.27 — but it is recorded here because a false SKIPPED costs the user a false popup,
+which the MEMORY.md invariant forbids. **Fixed in §4.28** — the coverage guard now requires proof the
+verification pool actually spanned the candidate (`poolSpansCandidate`), and a device re-run of the
+same input yields `VERDICT: PASS — clean recitation, no mistakes` with zero confirmed verdicts.
+
+### 4.28 The false SKIPPED: the verification decode never covered the word
+
+The run recorded in §4.27.2 ended with a false `SKIPPED` on ٱهْدِنَا and auto-paused the user. This
+section is its root cause and fix. The failure was NOT the "same bytes decode differently" flakiness
+— it was a **span geometry** bug that made several guards read "absent" from a decode that had never
+covered the word at all.
+
+**The evidence.** The final full-session decode, 13 s later, plainly heard the word:
+
+```
+verify idx=17 SKIPPED word='ٱهْدِنَا' verified=10w found=false   <- condemned here
+finalDecodeAndEmit(): done ... w emitted=29w
+  dec='... واياك نستعين اهدنا الصرط المستقيم صرط الذين انعمت عليهم ...'
+```
+
+**Root cause 1 — the timing anchor resolved to a LATER word.** `spokenTimings.startIndex` is the
+**spoken** position, which only coincides with the target index while the transcript tracks the
+target. The walk had frozen at `matched=17` (that is what a live mistake candidate *is*), so
+`firstOrNull { it.startIndex == idxToVerify }` missed and the fallback
+`lastOrNull { it.startIndex <= idxToVerify }` returned the timestamp of a **later** word. The span
+was then measured from a point *after* the candidate, so it slid entirely off the word:
+
+```
+verify idx=17 launched attempt=1 span=11s ownTiming=true
+verifyTailWords(): span=11s -> 4 slice(s)
+  slice 1/4 -> 'صِرَاطَ الَّذِينَ أَنْعَم'          <- word 20
+  slice 2/4 -> 'الَّذِينَ أَنْعَمْتَ عَلَيْهِمْ غَيْرِ الْمَغْضُوب'
+  slice 3/4 -> 'الْمَغْضُوبِ عَلَيْهِمْ وَلَا الضَّالّ'   <- word 28
+```
+
+*Every* decoded word was ≥ 20; ٱهْدِنَا (17) was never in the audio. Fixed by (a) requiring the
+timed word to actually **match** the candidate's normalized form, (b) taking the fallback only from
+**strictly earlier** words, and (c) growing the span with each attempt so a retry can never converge
+on a window that excludes the candidate.
+
+**Root cause 2 — the coverage guard (`bracketsCandidate = sawBefore && sawAfter`) cannot prove
+coverage, and the condemning decode was admitted through it.** The old guard asked only whether *any*
+matched word sat before the candidate and *any* after. It is not a proof that the candidate's own
+audio was inside the span, because the verifier stitches its window from short slices and **drops the
+oldest audio when its slice cap binds** — so a pool can hold early words and late words and still
+never contain the candidate.
+
+Reconstructed after the fact by replaying the **recorded pool** through both guards
+(`build/tools/replay_guard28.py`: real Al-Fatihah tokens + the real `normalize`/`isWordMatch` rules +
+the real `appendWithoutOverlap` pooling):
+
+| pool | words | matched target positions | `sawBefore` | `sawAfter` | OLD guard | new `poolSpansCandidate` |
+|---|---|---|---|---|---|---|
+| attempt 0, span=20s | 17 | 10,11,12,13,16,24,6,3 | **true** | **true** | **passes → strike 1** | true (16→24) |
+| attempt 1, span=11s | 10–12 | 20,21,22,21,22,23,24,25,23,27 | ? | true | ? | false |
+
+**What is proven.** Attempt 0's pool matched word 16 (`نَسْتَعِينُ`) and word 24 (`غَيْرِ`) — a genuine
+straddle (16 < 17 ≤ 24, gap 8) — plus two stray early words (t=6, t=3) hallucinated out of the
+20-second window's misaligned slices. It therefore passed every guard and paid down **strike 1**
+(`ABSENT strike 1/2` at 21:04:49.126). The candidate's own audio was nowhere in it: the pool runs
+10→12, then 13→16, then jumps to 24, then back to 6 and 3.
+
+**What is NOT proven, and is flagged rather than asserted.** Attempt 1's pool, as printed, matched
+only positions ≥ 20, so under BOTH guards it should have been inconclusive (`sawBefore=false`). Yet
+the log shows **no `INCONCLUSIVE` line anywhere in the run** and strike 2 fired silently at
+21:04:57.403. Two facts explain the discrepancy and neither has been closed out:
+1. **The `strikes >= 2` path emits no log at all** — only `strikes < 2` logs
+   (`if (strikes < 2) { Log…; return@launch }`, then it falls through to set the absent verdict
+   silently). So a veto-vs-condemn decision on the second attempt is **invisible in the log**.
+2. **`matcher.clean()` rewrites pool tokens to global-vocabulary forms before matching.** The pool the
+   app matched was not the raw slice text this replay used; a garbage token can be restored to *any*
+   Quran word, including an early one, which can flip `sawBefore` to true. That is the most likely
+   reason attempt 1 was admitted — **not verified**, because the log does not record the cleaned pool.
+   This is a real logging gap: `verifyTailWords()` prints the raw slice text, never the cleaned
+   tokens or the matched positions, so an admitted condemnation cannot be audited after the fact.
+
+**The fix — `poolSpansCandidate` + logging.** A pure, unit-testable function that demands *local*
+evidence: an adjacent pair of matched positions straddling the candidate within a short gap
+(default 10), or a matched word immediately beside it. Applied in line with the existing size/saneHits
+guards; the INCONCLUSIVE log now reports `straddles=`, and the strike path logs
+`ABSENT strike n/2` **unconditionally** so a silent second strike can no longer hide a veto decision.
+
+> **Correction to an earlier draft of this section.** It asserted that the *"pool of words 20–28"*
+> (the 11 s attempt) satisfied the old guard via `الرَّحِيمِ` (t=9) / `الضَّالّ` (t=28). The replay
+> contradicts that: the t=9/t=28 pairing appears in **neither** recorded pool, and attempt 1's matched
+> positions are all ≥ 20 so it is `sawBefore=false` under the old guard too. The pool that actually
+> passed a guard was **attempt 0**, via the genuine 16→24 straddle plus stray t=6/t=3 words. The
+> attempt-1 admission remains **unexplained and unlogged** — see item 2 above.
+
+> **Why this direction is the safe one.** Per the standing invariant, the guards gate
+> **condemnation only** — a false "no mistake" costs nothing, a false mistake popup accuses the user
+> of a recitation error. Tightening the coverage proof can only ever move a verdict from "condemned"
+> to "inconclusive, retry", which is exactly the trade this project has chosen every time.
+
+### 4.29 The summary showed the rule but not the score
+
+The user's second request in the same message:
+
+> "when we have the summury : if there is mistakes it shows as the mistake (wrong or skipped word or
+> tajweed mistake) and shows the word + tajweed rules + the tajweed score for the tajweed mistakes"
+
+The routing was already correct — `entries.isEmpty()` chooses "Perfect recitation! 🌟" and any
+mistake switches the title to "Recitation Summary", with wrong / skipped / tajweed rendered as three
+separate sections. Two things were nonetheless wrong:
+
+1. **`SessionSummaryTajweedRow` never rendered the score.** The data was already there:
+   `MistakeEntry.score = wa.tajweedScore?.toFloat()` is populated at construction and survives the
+   `encodeToJson` / `parseMistakeEntries` round-trip — the row simply ignored it. The composable now
+   takes an optional `score` and prints `46%` beside the rule, matching the mistake popup (§4.27.1).
+   It stays optional so a row whose score never landed still renders.
+2. **The word was never at risk, but nothing pinned it.** Both this dialog and the popup read
+   `entry.word` / the resolved row text; both are now covered by tests so a future edit cannot blank
+   the column silently.
+
+Verified by `SessionSummaryContentTest` (5 tests): all three kinds carry a non-empty word, only
+tajweed carries rule+score, `(wordIndex, rule)` grouping yields one row per rule, the title routes on
+`isEmpty`, and a score survives the persistence round-trip while a genuinely absent score stays
+`null` rather than becoming `0`.
+
+### 4.30 The verification decodes starve the walk — a GLOBAL budget
+
+Found while re-verifying §4.28 (`fix30_verify_1`, Al-Fatihah 1–7, 46.5 s injection). The §4.28 fix
+itself behaved correctly — **0 confirmations, 0 false popups, 1 unmaturable `strike 1/2`** — but the
+run exposed a separate, real problem:
+
+```
+verify idx=9  launched attempt=0 span=21s ownTiming=false anchorAge=8s   t=+24s
+verify idx=13 launched attempt=0 span=21s ownTiming=false anchorAge=2s   t=+31s
+verify idx=14 launched attempt=0 span=21s ownTiming=false anchorAge=8s   t=+37s
+verify idx=15 launched attempt=0 span=21s ownTiming=false anchorAge=2s   t=+44s
+```
+
+Four verification decodes, each `~3.7–3.9 s`, launched on a **fresh candidate every ~6.5 s**. That
+is ~60 % of wall time spent inside `verifyTailWords()`. The recognizer is single-slot (`decodeBusy`),
+and the live window only ever covers the **trailing** samples — so recognizer time spent verifying is
+audio the walk can never go back and decode. On a 46.5 s clip the walk fell behind the injection and
+words 16–29 were never decoded cleanly.
+
+**Why the existing caps did not stop it.** `MAX_MISTAKE_VERIFY_ATTEMPTS = 3` bounds ONE candidate.
+A long range presents a *fresh* candidate every few seconds, and each one spent its own three
+decodes — the budget was per-word, never global. `TAJWEED_MIN_INTERVAL_MS` gates the *tajweed*
+pass, not this one.
+
+**The fix — a rolling-window global budget.** `verifyBudgetAfterRequest(windowStart, spent, now,
+request, window, max)` is a pure function; the live values are `VERIFY_BUDGET_WINDOW_MS = 20_000`
+and `VERIFY_BUDGET_MAX_MS = 10_000`, i.e. **at most half of any 20-second window may be spent inside
+verification, across all candidates**, leaving the live decode loop the other half.
+
+- The launch gate calls the read-only probe `verifyBudgetAllowsMs(...)`, which reserves
+  `ASSUMED_VERIFY_COST_MS = 4000`; the reservation keeps back-to-back launches from over-committing
+  before any decode has reported.
+- On launch the reservation is **debited**; when the decode returns, the job **settles** it to the
+  real measured cost, clamped to the reservation so a long decode or a clock jump cannot retroactively
+  blow the budget. The settle logs
+  `verify budget spent=<n>ms/10000ms per 20000ms (last decode <n>ms, reserved 4000ms)`.
+- The window **self-heals**: once it is ≥ 20 s old the spend resets, so no explicit timer is needed.
+  It is also reset explicitly on a new range/surah and on a fresh surface (both sites that already
+  clear `lastMistakeVerifyMs`).
+
+**Why this direction is safe.** A declined request only ever *withholds* a verification. The
+candidate stays UNPROVEN, and the existing stall-watchdog / auto-finalize forgiveness paths handle it
+(`stallWatchdog(): ... -> forgiving so the cursor can advance`). The budget can never move a verdict
+toward condemnation — consistent with the standing invariant that a false "no mistake" costs nothing
+while a false mistake popup accuses the user.
+
+**Note on the harness FAIL.** The run's "only 4 of 29 matched" verdict is the harness metric, not a
+verdict error: `collector(): ev.endpoint=true words=[]` wipes the transcript at auto-stop, and the
+tail had never been decoded. No mistake was ever confirmed in that run. When judging such a run,
+check `confirmed (auto-pause + popup)` and the `SKIPPED/WRONG CONFIRMED` count *before* calling it a
+regression.
+
+Verified by `VerifyBudgetTest` (9 tests): a fresh budget allows the first request; spends accumulate;
+a third decode in-window is declined without spending or moving the window; an expired window rolls
+and resets; the window does NOT roll one millisecond early; a request exactly at the cap is allowed
+(`<=`); a negative request is clamped and never refunds; the probe reserves the nominal cost; and the
+probe rolls a stale window rather than blocking forever.
+
+**Device evidence.** Measured on Al-Fatihah 1–7 (same injection as the §4.30 diagnosis):
+
+| run | clip | verification decodes | max `matched` | false confirmations |
+|---|---|---|---|---|
+| `fix30_verify_1` (before) | 46.5 s | **4** | 15 | 0 |
+| `fix31_budget_1` (after) | 46.5 s | **2** | 17 | 0 |
+| `fix31_budget_2` (after) | 61.5 s padded | **1** | **27** (final `hasError=false`) | 0 |
+
+The settle log confirms the budget arithmetic in the field:
+`verify budget spent=3930ms/10000ms per 20000ms (last decode 3930ms, reserved 4000ms)`.
+
+> **Harness note (not an app defect).** `fix31_budget_1` still reported FAIL at 21/29 words, but the
+> live window had decoded **24 words** (`emitted=24w`, reaching `وَلَا الضَّالّ`). The session was cut
+> short by the harness's own `runInjectLoop(): auto-stop on 4000ms silence`, which fires the moment the
+> injected file EOFs — so the walk never got the ~20 s it needs for the stall-forgiveness path to
+> advance the cursor through the tail. Appending **15 s of silence** to the WAV
+> (`fatihah_pad.wav`, 61.5 s) removed the artifact: `matched` rose to **27/29**. When reading an
+> injection FAIL, always check the live `emitted=` count and the `auto-stop on …ms silence` line
+> before concluding the app fell behind. On a real microphone the user simply keeps reading.
+
+### 4.31 "Perfect recitation" for a recitation the app never heard
+
+Reported by the user after watching a live run:
+
+> "there was many words not displayed and yet there is a summury popup indicating that you have
+> finished without any errors"
+
+Both halves are real, and the second is the more serious: the app told the user their recitation was
+perfect when it had never verified the tail. **Two independent defects, one chain.**
+
+**Defect A — the budget fix lengthened the freeze (a regression from §4.30).** The §4.30 budget
+correctly declines a second verification once 10 s of a 20 s window are spent. But the walk freezes
+on a flagged candidate until it is RESOLVED, and the only resolver left was the stall watchdog at
+**20 s**. Before the budget, the second strike resolved the candidate in a few seconds; after it, the
+cursor sat on the word for the full 20 s and **every later word stayed unrendered** — the user's
+"many words not displayed". Measured `fix31_budget_1`: the walk held on ٱهْدِنَا (17) while words
+18–29 never displayed.
+
+*Fix.* The stall watchdog now forgives **promptly (3 s)** when the budget cannot fund another decode
+and at least one decode was already spent — the two-strike verdict is unreachable, so the hold
+achieves nothing but a frozen display. Requiring `attempts > 0` keeps a candidate whose verification
+simply has not started from being cut off. Direction is the safe one: forgiving can only ever produce
+a false "no mistake", never a false accusation.
+
+**Defect B — the summary was raised by the AUTO path at all.** My first attempt at this defect was
+WRONG and the user corrected it in one line:
+
+> "if it stoppd then it should be a skipped/wrong word popup or tajweed popup else it should be
+> displayed. not getting a summury popup (unless i click pause)"
+
+That is the whole contract. The auto path must **never** raise the summary. It was raising one
+because the walk stalled mid-range, `finalizeCorrect()` forged the tail CORRECT, `pendingRemain`
+read false, and a "finished" dialog appeared for a recitation the app had not finished hearing.
+Measured `fix32_coverage_1`: `endOfRange(): sessionFinalized=true pendingRemain=false newCompleted=6
+wrong=0 skipped=0 tajweed=0` → dialog, no mistake, mid-range.
+
+*Fix.* The summary is now gated on `userInitiatedStop`:
+
+```kotlin
+if (sessionFinalized && !pendingRemain &&
+    viewModel.sessionSummaryToShow == null && !mistakeMustWin &&
+    userInitiatedStop                       // <- only the pause button
+) { … raise summary … }
+```
+
+`runStopAndFinalize(true)` is the pause button; the auto path calls `runStopAndFinalize(false)`. So
+the summary can only ever come from the user tapping pause, and the auto path either shows a mistake
+popup (when one is genuinely flagged) or shows nothing and leaves the words on screen.
+
+**My first fix for this was rejected, and correctly so.** I had added `unheardWordCount` /
+`totalWordCount` to `SessionSummary` and printed *"N of M words were not heard clearly"* inside the
+dialog. The user's instruction was explicit: the summary shows **the mistake words + rules + the
+tajweed score**, not a coverage note. That line is removed; `perfect` is back to
+`entries.isEmpty()` (safe now, because the dialog only appears when the user asks for it). The two
+coverage fields are kept **for logging only** — the raise site logs
+`endOfRange(): user pause -> summary raised (entries=N unheard=N/N)`, which is how a stalled walk
+becomes visible without polluting the UI.
+
+`List<WordAnalysis>.unheardWordCount()` (pure) survives as the diagnostic: PENDING words, plus
+CORRECT-with-null-`spokenText` words (the `finalizeCorrect()` rubber-stamp), distinct by word index.
+Verified by `SummaryCoverageTest` (7 tests): a fully heard recitation reports 0; PENDING counts; a
+CORRECT word with no `spokenText` counts; the measured `fix31_budget_2` shape reports 2 of 29; a word
+with two rule rows counts **once**; a real WRONG/SKIPPED is NOT counted as unheard; empty reports 0.
+
+### 4.32 The pause-only summary gate was too strict — a genuine finish must still show it
+
+§4.31's fix gated the summary on `userInitiatedStop` alone. That satisfied *"not getting a summary
+popup (unless i click pause)"* but broke the other half of the contract: a recitation that runs
+cleanly from the first word to the last and then **ends on its own** raised nothing, and the user
+reported it — *"no summary shown when finished in this test ! fix it"*.
+
+The two requirements are not in conflict once "finished" is defined precisely. A walk that stopped
+is one of three things:
+
+| What stopped the walk | `unheardWordCount()` | Correct behaviour |
+|---|---|---|
+| The user tapped pause | any value | **summary** (the user asked for it) |
+| The walk decided every target word | **0** | **summary** (the recitation is over) |
+| A mid-range stall / budget-blocked verify | **> 0** | **no summary** — leave the words displayed |
+
+So the gate is `(userInitiatedStop || genuinelyFinished)` where
+`genuinelyFinished = detailedAnalysis.unheardWordCount() == 0`. This reuses the §4.31 helper rather
+than inventing a second notion of "done", and it cannot fire on a stall: a stall is by construction a
+walk that has NOT reached the tail, so it always has PENDING or rubber-stamped rows and
+`unheardWordCount() > 0`.
+
+`RecitationApp.kt` (~line 9336):
+
+```kotlin
+val genuinelyFinished = detailedAnalysis.unheardWordCount() == 0
+if (sessionFinalized && !pendingRemain && viewModel.sessionSummaryToShow == null &&
+    !mistakeMustWin && (userInitiatedStop || genuinelyFinished)) {
+    sessionRangeCompleted = true
+    viewModel.sessionSummaryToShow = MainViewModel.SessionSummary(
+        surahNumber = chargeSurah, rangeStart = chargeRangeStart, rangeEnd = chargeRangeEnd,
+        entries = mistakeEntries, recitedAyahCount = newCompletedCount,
+        totalAyahCount = (chargeRangeEnd - chargeRangeStart + 1).coerceAtLeast(1),
+        unheardWordCount = detailedAnalysis.unheardWordCount(),   // logging only
+        totalWordCount = detailedAnalysis.distinctWordCount())    // logging only
+    Log.i("ItqanSherpa", "endOfRange(): summary raised (userPause=$userInitiatedStop " +
+        "finished=$genuinelyFinished entries=${mistakeEntries.size} " +
+        "unheard=${detailedAnalysis.unheardWordCount()}/${detailedAnalysis.distinctWordCount()})")
+} else if (sessionFinalized && !pendingRemain && !mistakeMustWin &&
+           !userInitiatedStop && !genuinelyFinished) {
+    Log.i("ItqanSherpa", "endOfRange(): auto stop but NOT genuinely finished -> " +
+        "no summary; words stay displayed")
+}
+```
+
+Both branches log, so the UI behaviour is auditable from the log alone — which is how the two
+divergent failure modes (§4.31's stall-summary and this section's missing-finish-summary) can be told
+apart without a screen capture.
+
+**Device-verified** on `fix34_fatihah_1` (Al-Fatihah 1–7, padded WAV): the walk reached
+`matched=29 hasError=false`, then
+
+```
+endOfRange(): sessionFinalized=true pendingRemain=false newCompleted=7 wrong=0 skipped=0 tajweed=0 alreadyShowing=false
+endOfRange(): summary raised (userPause=false finished=true entries=0 unheard=0/29)
+```
+
+i.e. the summary appeared on a **genuine finish** with every word heard, with no user pause — the
+exact case that was broken. `build/tools/check_run.sh fix34_fatihah_1` → `CLEAN (all 29 words
+matched, no confirmed mistake)`.
+
+### 4.33 The stale injection cursor: a session that ends before EOF poisons the NEXT run
+
+`clean_fatihah_2` aborted before it produced a single decode:
+
+```
+runInjectLoop(): INJECT MODE file=inject.pcm bytes=2127928 startPos=1592000
+ABORT: injection did not start at position 0 -- stale inject cursor
+```
+
+The inject read cursor (`injectPos`) is a `@Volatile var` on the pipeline — deliberately **not**
+persisted, so a pause→resume continues mid-file. The old rewind guard was
+
+```kotlin
+if (injectPos >= f.length() && f.length() > 0L) { injectPos = 0L }   // only if EXHAUSTED
+```
+
+which assumes every run ends by playing the file to the end. It does not. `fix34_fatihah_1` finished
+because the walk **decided all 29 target words**, and the session was finalized there — at 49.75 s of
+the 66.5 s file. `injectPos` was therefore 1 592 000, not 2 127 928, the `>=` guard did not fire, and
+the next run started 50 s in: it fed ~17 s of audio, hit EOF, and then fed pure silence for the whole
+session. `inject_run.sh` catches exactly this shape (`startPos=0` assertion, exit 3) so it failed
+loudly instead of silently reporting a dead run — but the underlying cursor was still wrong.
+
+**Fix (app).** Reset the cursor in `startReadLoop()` instead of guessing from the file length:
+
+```kotlin
+private fun startReadLoop() {
+    injectPos = 0L   // fresh session => replay the injection file from the top
+    readJob = scope.launch { runReadLoop() }
+    decodeJob = scope.launch { decodeLoop() }
+}
+```
+
+`startReadLoop()` is the **only** fresh-utterance entry point (`start()` and the prewarm
+continuation). `resume()` deliberately re-spawns the two workers itself (line ~1701) and never calls
+`startReadLoop()`, so pause→resume continuity is untouched — which is the property the old heuristic
+was trying to protect. The exhausted-file guard in `runInjectLoop` is kept as a second line of
+defence for the residual case (a session that reaches EOF and is then *resumed* rather than freshly
+started); its comment now says so.
+
+**Fix (harness).** `inject_run.sh` step 0 now `am force-stop`s the package before `am start`. A warm
+process carries in-memory session state across runs — the inject cursor, a leftover live session, a
+Compose popup that makes the navigation taps land on the wrong surface. A cold start removes the
+whole class of stale-state artifacts, not just the cursor, and the script already re-navigates to
+Memorize + Tajweed and re-selects the surah/range, so nothing is lost. The home-screen wait was
+widened from 6 to 8 retries (30 s → 40 s) to cover the cold-start recognizer load.
+
+**Lesson.** A test harness that assumes "the run ends at EOF" silently couples two runs together the
+moment the app can finish early. Every "start from a known state" step has to be explicit, not
+inferred from the artifact.
+
+### 4.34 The clipped tail word was counted as reached but never displayed
+
+Reported on device: *"last word not displayed and there is no popup"*. Reproduced on the very next
+run, `clean_fatihah_2` (Al-Fatihah 1–7, padded WAV):
+
+```
+02:37:06.558 runInjectLoop(): auto-stop on 4000ms silence
+02:37:15.036 collector(): ev.endpoint=true words=[الضَّالِّينَ] partialStr='الضَّالِّينَ'
+02:37:15.072 autoFinalize?(): rows=31 decided=29/29 unheardPending=1 alreadyShowing=false done=false
+02:37:15.073 autoFinalize(): holding 0ms/20000 (decided=29/29 unheard=1 mistake=false)
+02:37:15.177 analyze(tajweed): done 103ms scored=17 tajweedErrors=0 changed=2
+02:37:15.201 autoFinalize?(): rows=32 decided=29/29 unheardPending=0 alreadyShowing=false done=false
+02:37:15.202 autoFinalize(): grace expired with 29/29 words decided (unheard=0 mistake=false)
+02:37:15.212 endOfRange(): sessionFinalized=true pendingRemain=false newCompleted=6 wrong=0 skipped=0 tajweed=0
+02:37:15.213 endOfRange(): auto stop but NOT genuinely finished (unheard=1/29) -> no summary; words stay displayed
+```
+
+and the harness's own verdict: `FAIL — only 28 of 29 target words matched`, while `analyze(fast)`
+reported `matched=29 hasError=false targetWords=29`.
+
+**Two counts disagreed, and the wrong one won.** `unheardPending` counted only PENDING rows with a
+**blank** `spokenText`. The last word `ٱلضَّآلِّينَ` was PENDING **carrying a fragment** — the shape
+`clippedWord()` emits:
+
+```kotlin
+// clippedWord(): target 28 'ٱلضَّآلِّينَ' spoken prefix 'ٱلضَّآ' -> PENDING (clipped decode, not a skip)
+```
+
+The CTC decoder returned only the opening letters of the word; the token is a strict prefix of the
+target, so the analyzer **consumes** the word and moves on (`matchedWordCount` counts it as reached,
+and `endOfRange()`'s `pendingRemain` already treats it as forgiven — see the §4.17 note at
+`RecitationApp.kt:9244`). But the row's **status** stayed PENDING, and the transcript colours by
+status, so the word rendered at the 25 %-opacity fallback. The cursor said "reached", the screen said
+"nothing" — and `cleanFinish` (which tested `decidedWords.size >= total && unheard == 0` with the
+blank-token definition) went true, finalizing the session with no popup and no summary.
+
+Three fixes:
+
+**1. A clipped decode is a heard word — show it.** New pure helper
+`WordAnalysis.promoteClippedPending()` (plus the row-wise `promoteClippedPendingRows()`), applied in
+the analysis merge right where the code already counts the row as reached:
+
+```kotlin
+if (w2.status == RecitationStatus.PENDING && !w2.spokenText.isNullOrEmpty()) {
+    w2 = w2.promoteClippedPending()          // PENDING -> CORRECT, fragment KEPT
+}
+```
+
+The fragment is deliberately **kept**, not nulled: `unheardWordCount()` skips rows that carry a
+token, so the word still counts as heard and a genuine finish can still raise its summary. Only the
+COLOUR changes. A PENDING row with **no** token is a word never heard and is left alone — promoting
+it would colour a word the user never said.
+
+**2. `cleanFinish` must not call an unresolved candidate "decided".**
+
+```kotlin
+val decidedWords = detailedAnalysis.filter { it.status != RecitationStatus.PENDING }
+    .map { it.wordIndex }.toHashSet()                 // a PENDING row is not a decision
+val unheard = detailedAnalysis.filter { it.status == RecitationStatus.PENDING }
+    .map { it.wordIndex }.toHashSet().size            // candidate or not, it is unheard
+```
+
+The old `unheard` was `count { PENDING && spokenText.isNullOrEmpty() }`, so a row holding a candidate
+token read as **heard** and the range was declared complete while a word was still undecided.
+
+**3. On grace expiry, unresolved rows are promoted so they DISPLAY.** A PENDING row that survived the
+whole grace is a judgement the verifier never returned a verdict for. There is no evidence the word
+was wrong (a confirmed mistake takes the branch above), and a false accusation is worse than a missed
+skip — so we do not accuse. But we must not leave the word invisible either. The new branch promotes
+every surviving PENDING row via `promoteClippedPendingRows()`; rows that carry a fragment stay
+"heard", rows with no fragment keep counting in `unheardWordCount()` and therefore still block a
+summary they did not earn (§4.31).
+
+**Diagnostics.** `autoFinalize?()` now prints `unheardPending` AND `unheardWords`, and dumps every
+undecided row as `w<idx>/<text>:<status>:spoken='<token>'`. The two shapes — PENDING+token and
+CORRECT+no-token — are indistinguishable from the counts alone and need opposite handling, so the run
+now says which one it is instead of leaving it to be inferred.
+
+**Lesson.** "Reached" and "displayed" were two different predicates maintained in two different
+places, and nothing tied them together. When the cursor advances past a word, that word must be
+VISIBLE — the invariant is one-directional and has to be asserted at the point the cursor advances,
+not re-derived later from a status field that a different code path owns.
+
+### 4.35 The confirm loop is emission-driven, so a frozen walk can never finish a verdict
+
+`clean_fatihah_3` (the first run on the §4.34 build) came back **`NOT CLEAN`, `maxMatched=17/29`** —
+much worse than the 28/29 it replaced. The tail word was now displayed correctly (§4.34 works), but
+the walk had fallen 12 words behind. The trace explains why:
+
+```
+03:06:47.993 mistakeStop(): verify idx=15 launched attempt=0 span=23s ownTiming=false anchorAge=3s
+03:06:50.500 stallWatchdog(): candidate idx=15 unresolved for 4003ms (attempts=1 strikes=0) -> forgiving
+03:06:51.721 mistakeStop(): verify budget spent=7555ms/10000ms per 20000ms
+03:06:51.726 mistakeStop(): verify idx=15 SKIPPED word='وَإِيَّاكَ' verified=13w found=true    <- acquitted, too late
+…
+03:07:01.026 mistakeStop(): verify idx=14 launched attempt=0 span=25s
+03:07:04.744 mistakeStop(): verify idx=14 WRONG word='نَعْبُدُ' verified=16w found=false
+03:07:04.761 mistakeStop(): verify idx=14 ABSENT strike 1/2 — needs one more decode before condemning
+03:07:05.770 mistakeStop(): candidate row=14 word=14 sightings=2 … sinceVerify=1009ms
+03:07:07.586 mistakeStop(): candidate row=17 word=14 sightings=2 … sinceVerify=2825ms   <- 175 ms short
+   … nothing for nine seconds …
+03:07:16.533 stallWatchdog(): candidate idx=14 unresolved for 20025ms (attempts=1 strikes=1) -> forgiving
+```
+
+**Two defects, both in the stall watchdog.**
+
+**(a) The second decode is never launched.** The confirm loop is a `LaunchedEffect` keyed on
+emissions. A candidate freezes the walk, the user stops speaking, no emission arrives — so the loop
+never re-runs, and after `ABSENT strike 1/2` the decode that would decide condemnation (or acquit the
+word) is never spent. The loop's last re-run missed the 3 s cooldown by **175 ms** and nothing ever
+tried again. The candidate sat WRONG for the full 20 s and was forgiven UNPROVEN, with the cursor
+frozen behind it the entire time.
+
+The watchdog already polls every 2 s, so it is the natural driver. New pure helper:
+
+```kotlin
+fun stallShouldNudge(isListening, pipelineRunning, jobIdle, cooldownOver, budgetOk,
+                     attempts, nudges, maxAttempts): Boolean =
+    isListening && pipelineRunning && jobIdle && cooldownOver && budgetOk &&
+        attempts < maxAttempts && nudges <= maxAttempts
+```
+
+On a nudge the watchdog only re-opens the confirm loop's 800 ms dwell gate (it rewrites
+`lastWrongStopFirstSeenMs`, which the loop observes, so the loop re-runs). **Every** other guard still
+applies — attempt budget, 3 s cooldown, global budget, job-active, and the §4.28 bracket+straddle
+coverage test on the RESULT — so a nudge can never move a verdict toward condemnation on its own; it
+can only make the pipeline finish a judgement it already started. `stallNudges` is bounded by
+`maxAttempts` so a nudge the loop never honours cannot hold a candidate forever (the §4.18
+infinite-freeze class). It **replaces** the old "last-chance verification" block, which did the same
+thing for the `attempts == 0` case but reset the forgiveness clock with no bound — and it subsumes
+that case, because `cooldownOver` is defined as `lastMistakeVerifyMs == 0L || now - it >= 3000`.
+
+**(b) The budget short-circuit forgave a candidate while its own decode was in flight.** idx=15 was
+forgiven at 4003 ms; the in-flight decode returned `found=true` 1,2 s later. The cause: the nominal
+cost of an ACTIVE verification is already debited, so `budgetOk` is false for the whole duration of
+that decode, and §4.31's short-circuit read that as "the budget is exhausted, the verdict is
+unreachable". New pure helper:
+
+```kotlin
+fun stallForgiveMsFor(budgetOk, attempts, jobIdle,
+                      normalMs = 20_000L, blockedMs = 3_000L): Long =
+    if (!budgetOk && attempts > 0 && jobIdle) blockedMs else normalMs
+```
+
+`jobIdle` is the new condition. `attempts > 0` was already there (a candidate whose verification has
+not started must not be cut off early).
+
+**Device status.** `clean_fatihah_3` = pass attempt 1 on the §4.34 build → **NOT CLEAN**
+(`maxMatched=17/29`, 3 stall-forgives, 1 tajweed error at word 22). It did stop on a valid
+**tajweed popup** (`Tajweed Mistake — Izhar (Clarity)`, score 9) — i.e. the §4.32 stop contract held,
+and the §4.34 tail fix worked (word 28 was decided, not left greyed). The failure was the freeze, not
+the display. `StallNudgeTest` (14 tests) pins both helpers.
+
+**Lesson.** A state machine driven by *emissions* silently dies when the thing it is waiting for
+freezes the emission source. Any watchdog whose whole purpose is to break a freeze must also be able
+to *restart* the machinery it depends on — not just observe it.
+
+### 4.36 My own §4.34 grace-expiry promotion was an infinite loop
+
+`p1_fatihah` (attempt 1 on the §4.35 build) reached `maxMatched=27/29` — the §4.35 nudge works — and
+then never settled. The screen looped:
+
+```
+autoFinalize(): grace expired with 7 unresolved word(s) [22, 23, 24, 25, 26, 27, 28] and NO
+  evidenced mistake -> promoted to CORRECT so they DISPLAY (0 of them carry a spoken fragment, so
+  they still count as heard; the rest stay 'unheard' and block a summary)     <- every 2 s, forever
+```
+
+**Cause.** §4.34's grace-expiry branch called `promoteClippedPendingRows()`. That helper
+*deliberately* leaves a token-less PENDING row alone — a word never heard must not be coloured as if
+the user said it. But the rows the branch exists for are exactly those: the log's own parenthetical,
+*"0 of them carry a spoken fragment"*, was the branch telling us it had promoted nothing. So
+`unresolvedIdx` was non-empty on every pass, the branch logged and `return@LaunchedEffect`'d without
+changing a single row, and the effect re-fired 2 s later. The session never finalized.
+
+**Fix.** A separate, correctly-scoped helper:
+
+```kotlin
+fun List<WordAnalysis>.promoteUnresolvedPendingRows(): List<WordAnalysis> =
+    map { if (it.status == RecitationStatus.PENDING) it.copy(status = RecitationStatus.CORRECT) else it }
+```
+
+`spokenText` is left exactly as it was, which keeps the two cases apart downstream: a row carrying a
+fragment stays inside `unheardWordCount()`'s "heard" set (a genuine finish can still raise its
+summary), while a token-less row keeps counting as unheard and therefore can never earn a summary the
+app did not earn (§4.31). Either way the word is now **VISIBLE**, which is what the contract asks for
+once the session has stopped.
+
+Plus `gracePromoteCount`, because "promote then return" is only safe if the promotion actually lands:
+the FIRST promotion returns (the UI repaints), and if a later analysis rebuild resurrects the rows it
+promotes again but this time **falls through to the finalize** — so a rebuild loop can never hold the
+session open (§4.18: "nothing ever happens" is the worst outcome). Reset to 0 wherever
+`graceExpiredOnce` is reset.
+
+`ClippedPendingDisplayTest` is now 15 tests; **57 tests, 0 failures** across the six suites.
+
+**Lesson.** A helper that deliberately skips a case is the wrong tool for a branch whose entire input
+IS that case — and the loop was the tell. A branch that logs the same line every 2 s is not making
+progress, and `return@LaunchedEffect` with no state change is an infinite loop, not a retry. When a
+"promote/forgive" branch is added, assert that it CHANGED the list, or the next reader has no way to
+tell a no-op from a fix.
+
+### 4.37 The transcript cursor went BACKWARDS after the summary — a seen word was un-rendered
+
+**Symptom (user, attempt 2 on the §4.36 build).** *"the last word isnt displayed and yet we have a
+summary popup indicating no mistakes."* The summary said **"Perfect recitation! 🌟 — Masha'Allah, no
+mistakes in this recitation"** while the final word of Al-Fatihah (`ٱلضَّآلِّينَ`) sat at the
+25 %-opacity grey fallback. Attempt 1 on the same build was clean (`p1_fatihah`, 29/29).
+
+**The renderer's predicate is the CURSOR, not the status.** `RecitationApp.kt` colours a word iff
+`globalWordIndex < matchedWordCount`, and falls through to `onSurface.copy(alpha = 0.25f)` otherwise:
+
+```kotlin
+if (globalWordIndex < matchedWordCount) { /* primary / hinted / tajweed */ }
+else if (globalWordIndex == matchedWordCount && hintActive) { … }
+else if (!hintActive && globalWordIndex == errorIndex && …) { /* error colour */ }
+else { withStyle(SpanStyle(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f))) { … } }
+```
+
+`matchedWordCount = alignment.first`, and `alignment` is recomputed **from scratch, unconditionally**
+on every analysis pass (`alignment = Pair(newMatchedWordCount, newHasError)`). There is **no monotonic
+guard**, so any later pass that scores fewer words moves the cursor BACKWARDS and un-renders the tail.
+
+**Device evidence (`p2_fatihah`).** Every line below is the same frozen 29-token transcript:
+
+| time | line |
+|---|---|
+| 22:01:35.180 | `finalDecodeAndEmit(): done 8320ms new=-3 w emitted=25w` |
+| 22:01:35.185 | `collector(): ev.endpoint=true words=[ٱلضَّآلِّينَ] partialStr='ٱلضَّآلِّينَ'` |
+| 22:01:35.200 | `collector(): rejected repair still contributed 1 word(s) … -> transcript now 29w` |
+| 22:01:35.201 | `collector(): final-decode repair REJECTED (repair 25w/prefix24 vs live 28w/prefix26)` |
+| 22:01:35.249 | `autoFinalize(): undecided rows = w28/ٱلضَّآلِّينَ:PENDING:spoken='-'` |
+| 22:01:35.384 | `autoFinalize?(): rows=33 decided=29/29 unheardPending=0 unheardWords=0` |
+| 22:01:35.396 | `endOfRange(): summary raised (userPause=false finished=true entries=0 unheard=0/29)` |
+| 22:01:35.680 | `analyze(fast): done 429ms matched=29 hasError=false targetWords=29` |
+| 22:01:35.828 | `analyze(tajweed): done 184ms scored=19 tajweedErrors=0 changed=5` |
+| 22:01:35.899 | `analyze(fast): done 218ms matched=28 hasError=false targetWords=29` ← **backwards** |
+
+The two fast passes see the SAME transcript and differ only in the request they carry. The aligner is
+not a pure function of the text: when `fullAudio` is attached (`hasRealAudio = fullAudio != null &&
+fullAudio.size >= 256`) it re-decodes each candidate word's audio slice, and that slice decode is
+flaky — the same flakiness that makes a long full-context pass hallucinate (§4.25/§4.30). So a word
+the aligner decided a moment ago can come back PENDING, `newMatchedWordCount` drops, and the tail goes
+grey. `finalReport` is **not** the cause: it is an unused parameter in `analyzeRecitationDetails`.
+
+**Why this is a contract violation and not just a cosmetic glitch.** The project invariant is
+**REACHED ⇒ DISPLAYED (one-directional)**: once the cursor has advanced past a word the user must be
+able to see it. On a FINALIZED session the transcript is frozen — no further audio can arrive — so a
+lower cursor cannot be a correction. It is only decoder noise, and rendering it takes away a word the
+user already earned.
+
+**Fix — two pure helpers (both unit-tested).**
+
+```kotlin
+fun resolveTranscriptCursor(newMatchedWordCount: Int, previousCursor: Int,
+                            hasError: Boolean, finalized: Boolean): Int =
+    if (finalized && !hasError) maxOf(newMatchedWordCount, previousCursor)
+    else newMatchedWordCount
+```
+
+applied as
+
+```kotlin
+val resolvedCursor = resolveTranscriptCursor(newMatchedWordCount, alignment.first,
+                                             newHasError, sessionFinalized)
+alignment = Pair(resolvedCursor, newHasError)
+```
+
+and it logs `analyze(fast): cursor held at 29 (walk wanted 28)` so the hold is visible in a run.
+
+Two deliberate escapes, both necessary:
+
+- **`!finalized`.** A live cursor must stay free. It has to follow the user backwards when they
+  re-read from a flagged word, and a resume must not inherit a stale high-water mark.
+- **`hasError`.** A WRONG/SKIPPED is a deliberate verdict that must render in its error colour, and
+  the renderer's error branch only runs for `globalWordIndex >= matchedWordCount`. Clamping there
+  would hide the very mistake the app is stopping for.
+
+```kotlin
+fun keepFinalizedDecision(fresh: WordAnalysis, previous: WordAnalysis?, finalized: Boolean): WordAnalysis {
+    if (!finalized || previous == null) return fresh
+    if (fresh.status == RecitationStatus.PENDING && previous.status != RecitationStatus.PENDING)
+        return previous.copy(tajweedScore = fresh.tajweedScore ?: previous.tajweedScore)
+    return fresh
+}
+```
+
+plus `List<WordAnalysis>.keepFinalizedDecisions(previous, finalized)`, keyed by `(word, rule)`.
+
+This is the same defect one layer down: the analysis list is rebuilt wholesale on every pass, so a
+word the finalized list had already decided can come back PENDING. That matters because
+`unheardWordCount()` is what `endOfRange()` uses for `genuinelyFinished` — a row that flips back to
+PENDING makes a recitation the app just called "perfect" read as one word unheard, which is exactly
+the two-sources-of-truth disagreement that produced this bug family. Only PENDING is blocked (the
+caller already refuses to downgrade WRONG/SKIPPED), and the fresh `tajweedScore` is carried over so
+the acoustic result is not lost. Applied in **both** merge sites — the fast merge and the deferred
+tajweed merge (whose `changed=5` was the pass immediately before the 29 → 28 drop) — and the §4.34
+`promoteClippedPendingRows()` now runs **last**, after the guard, so a freshly PENDING row is first
+allowed to be overridden by the row it is replacing.
+
+`FinalizedCursorMonotonicTest` adds 25 tests pinning the measured `p2` sequence, both escapes, the
+multi-rule keying, idempotence, and that the guard **cannot forge a decision** (a word the previous
+pass never decided stays unheard, so a recitation the app could not judge still cannot earn a
+"perfect" summary — §4.31). **82 tests, 0 failures** across the seven suites.
+
+**Lesson.** A cursor derived from a fresh recomputation is not monotonic, and a renderer that keys on
+a cursor inherits every wobble of the engine behind it. When a value both *drives a verdict* and
+*drives a display*, the display must be pinned to the strongest thing already proven — here: "the
+session ended and no mistake was found, therefore every word stays on screen." The same trap produced
+§4.34 (status flapped, cursor did not) and this section (cursor flapped, status did not); the honest
+form of the rule is the one-directional invariant, asserted at the point where the value is written.
+
+### 4.38 A false "Skipped Word" popup — the endpoint decode was never allowed to acquit
+
+**Symptom (first run on the §4.37 build, `p3_fatihah`).** The app auto-paused on a **"Skipped Word"**
+popup for word 17 of Al-Fatihah (`ٱهْدِنَا`) — a word the recitation contained. The user's standing
+complaint class: a false mistake popup accuses them of a recitation error, which project policy ranks
+as the worst outcome.
+
+**Device evidence.** The run stopped at word 17 and never rendered words 18–28 live
+(`VERDICT: FAIL — only 17 of 29 target words matched`). But the app's own evidence contradicts the
+verdict:
+
+| time | line |
+|---|---|
+| 22:51:39.683 | `mistakeStop(): idx=17 pool=16w positions=[-1, 12, 13, 14, 13, 16, -1, 16, -1, 18, 19, -1, 20, 12, 22, 23] straddles=true candTarget='اهدنا'` |
+| 22:51:39.683 | `verify idx=17 ABSENT strike 1/2 — needs one more decode before condemning` |
+| 22:51:47.895 | `verify idx=17 ABSENT strike 2/2 — CONDEMNING` |
+| 22:51:48.487 | `runInjectLoop(): auto-stop on 4001ms silence` |
+| 22:51:48.863 | `finalDecodeAndEmit(): begin endpoint=true window=45,0s` |
+| 22:51:49.764 | `verdictTicker(): absent verdict held 1868ms for wordIndex=17 -> auto-pause + popup` |
+| 22:51:49.764 | `mistakeStop(): SKIPPED CONFIRMED wordIndex=17 word='ٱهْدِنَا' (sightings=2)` |
+| 22:51:57.174 | `log='… اياك نعبد واياك نستعين الصرط المستقيم …'` ← **live log: `اهدنا` missing** |
+| 22:51:57.174 | `dec='… اياك نعبد واياك نستعين اهدنا الصرط المستقيم …'` ← **endpoint decode: `اهدنا` PRESENT** |
+| 22:51:57.178 | `finalDecodeAndEmit(): done 8316ms new=6 w emitted=28w` |
+| 22:51:57.179 | `collector(): mistake-freeze dropping endpoint=true 28w (resume latch armed @ word 17)` |
+
+**Cause — two failures stacked.**
+
+1. **A 4 s-slice decode that DROPS a word is indistinguishable, to the aligner, from a skip.** The
+   live window rendered `…نَسْتَعِينُ` and then `ٱلصِّرَٰطَ` with no `ٱهْدِنَا` between them; the walk can
+   only represent that as a SKIPPED. The verification decodes are the SAME model over the SAME kind
+   of short slice, so they dropped it again — and because the neighbours appeared (`positions`
+   contains 16, 18, 19, 20, 22, 23), §4.28's `poolSpansCandidate` straddle test read the coverage as
+   proven. Two strikes, condemn.
+2. **The one decode that heard the word was never allowed to speak.** The whole-session endpoint
+   decode is strictly better evidence and it was **already running** — it began 0.9 s before the
+   confirm and landed 8 s after it, with `اهدنا` in its transcript. The confirmed-mistake freeze
+   (§4.28) then discarded that emission on purpose, because it exists so a re-decode cannot
+   resurrect a mistake and auto-dismiss the popup.
+
+So the popup could not be taken back — popups are never auto-dismissed. **The confirm itself had to
+be withheld.**
+
+**Fix — `mistakeMayBeConfirmed(pipelineRunning, endpointDecodeLanded, sessionStoppedForMs, holdMs)`.**
+
+```kotlin
+fun mistakeMayBeConfirmed(pipelineRunning: Boolean, endpointDecodeLanded: Boolean,
+                          sessionStoppedForMs: Long, holdMs: Long = 15_000L): Boolean =
+    pipelineRunning || endpointDecodeLanded || sessionStoppedForMs >= holdMs
+```
+
+Two wall clocks feed it, both recorded in the collector **above** the mistake-freeze (that freeze
+`return@collect`s and would otherwise swallow the very evidence this section exists for):
+
+- `pipelineStoppedAtMs` — first emission seen while `tajweedPipelineHolder.running == false`.
+- `endpointDecodeLandedAtMs` — the first post-stop emission carrying words. That is the endpoint
+  decode's result; it is the acquittal.
+
+Both are reset at every session boundary (range/surah change, fresh `startTajweedSession`, the
+collector's `ev.freshSession`, and an explicit Restart) so a previous run's evidence cannot gate the
+next one.
+
+Holding the confirm is safe in both directions, and that is the point:
+
+- **False positive.** With no latch armed the endpoint decode is committed like any other emission,
+  the transcript gains the missing word, the walk re-aligns it CORRECT, and there is no candidate
+  left to condemn. The popup never fires.
+- **Real skip.** The word is absent from that decode too, so the confirm still happens — once the
+  decode lands. The hold only delays it.
+
+**The same hold was added to the watchdog's FORGIVE path.** Without it the budget-blocked
+short-circuit (§4.31) forgives at 3 s, the endpoint decode needs ~8 s, and forgiving first turns a
+real skip into a silent "no mistake" — the row becomes CORRECT, so the ticker has no candidate left
+to condemn, and injection tests exist precisely to catch wrong/skipped words. Holding *both*
+verdicts until the decode lands keeps the two directions symmetric: whatever the endpoint decode
+heard decides it. The hold is bounded by the same clock, so **forgiveness is delayed, never blocked**
+— the §4.31 asymmetry (a false "no mistake" is cheap, a false accusation is not) is preserved.
+
+`EndpointAcquittalTest` adds 12 tests: the measured p3 cell must not confirm, a running pipeline is
+untouched, a landed decode releases the hold, a real skip still confirms, the bound holds and
+expires, and the default bound provably covers the measured 8.3 s endpoint latency.
+
+**Lesson.** "Absent from a short decode" is only evidence of a skip when the decode is the BEST
+decode available for that word. Here the app had a strictly better decode already in flight and
+raced it with a 1.9 s hold against an 8.3 s decode — and the freeze that protects a shown popup made
+the loss permanent. When a verdict is irreversible (no auto-dismiss), the wait must be sized against
+the strongest pending evidence, not the cheapest available. The general shape: **before an
+irreversible accusation, check whether the best evidence is still arriving.**
+
+### 4.39 One surface per verdict: mistakes are POPUPS, never messages
+
+**Symptom.** The user saw a wrong word as an inline MESSAGE rather than a popup:
+
+> "i saw a msg of a wrong word. why it is on a msg not popup? why do you keep insisting on changing
+> things as you like not as i request? just see how the look of the popups used to be in very eralier
+> commits and get the popups look and showing the popups instead of your msg."
+
+and then, flatly:
+
+> "i dont want messages neither for wrong/skipped/tajweed mistakes nor for good recitations. only
+> popups indicatin the type of mistake and the word and if for tajweed indicating the rule and the %.
+> and when we pause or finish we have the summury."
+
+**Cause — two surfaces for one verdict, armed by different predicates.** The inline banner
+(`bannerIdx` → "Wrong Word"/"Skipped Word"/"Tajweed Feedback") was armed by the verified-absent
+display gate on its own:
+
+```kotlin
+val episodeAbsent = mistakeVerifyAbsentIdx >= 0 && abs(mistakeWord - mistakeVerifyAbsentIdx) <= 3
+if (episodeAbsent) confirmedMistakeUiIdx = mistakeWord     // ← banner armed here
+```
+
+…while the DIALOG additionally required `sightings >= 2`, `isListening` and `pipeline.running`. So a
+bare message could appear in the window where the popup had not yet qualified. A second inline card
+("Recitation Mistakes Detected") was not tied to any stop at all — it rendered whenever the analysis
+happened to hold a WRONG row, which is almost certainly the message the user photographed.
+
+**Fix.**
+1. **One arming point.** `confirmedMistakeUiIdx` is now set ONLY inside `stopForMistake(wordIdx,
+   skipped)`, next to `latestPopupKind` / `latestTajweedPopup`. The banner and the dialog can no
+   longer disagree because nothing else can arm either.
+2. **The inline surfaces are deleted**, per the instruction above:
+   - the "Show Error Banner" Card (the `bannerIdx` mistake banner) — **gone**;
+   - the "Excellent recitation so far! Keep going with perfect accuracy." Card — **gone** (it is a
+     *good recitation* message, which the user also rejected);
+   - the "Recitation Mistakes Detected" Card appended to the transcript — **gone**.
+   Each is replaced by a comment block naming this section, so the next reader knows the absence is
+   deliberate.
+
+**The two remaining surfaces, and only two:**
+
+| when | surface | content |
+|---|---|---|
+| the app stops on a mistake | the mistake DIALOG (`latestTajweedPopup`) | **type** (Wrong Word / Skipped Word / Tajweed Mistake — *rule*), the **word**, and for tajweed the **rule + score %** |
+| a user PAUSE, or a genuine finish | the SUMMARY dialog (`sessionSummaryToShow`) | Wrong Words (N) / Skipped Words (N) / Tajweed Mistakes (N) — word + rule + score |
+
+The dialog's look is unchanged from the earliest commits (`46de7d4`): `Icons.Default.Warning` tinted
+`Color(0xFFF57F17)`, title = type, body = word (+ rule + score), a single `OK`. Popups are never
+auto-dismissed; the summary's coverage fields (`unheardWordCount` / `totalWordCount`) remain
+diagnostics only and are not rendered.
+
+**Lesson.** Two surfaces for one verdict is a correctness bug, not a styling choice: the moment the
+arming predicates differ, the app can show one without the other. One verdict, one surface, one
+arming point.
+
+### 4.40 The finalize decided 29 words and displayed 4
+
+**Symptom (first run on the §4.39 build, `p4_fatihah`).** The session ended with no mistake, no popup
+and no summary — and only 4 of 29 words on screen. `check_run.sh p4_fatihah` →
+`target=29 maxMatched=17 lastMatched=4 => NOT CLEAN`.
+
+**Device evidence.**
+
+| time | line |
+|---|---|
+| 23:14:43.300 | `autoFinalize(): undecided rows = w15/وَإِيَّاكَ:PENDING … w28/ٱلضَّآلِّينَ:PENDING` |
+| 23:14:43.521 | `analyze(fast): done 219ms matched=4 hasError=true` |
+| 23:15:03.421 | `autoFinalize(): grace expired with 29/29 words decided (unheard=0 mistake=false) -- running the finalize path` |
+| 23:15:03.432 | `endOfRange(): auto stop but NOT genuinely finished (unheard=20/29) -> no summary; words stay displayed cursor=4/29` |
+| 23:15:03.688 | `analyze(fast): done 213ms matched=4 hasError=false` |
+
+**Cause — the promotion decides rows; the renderer colours by the CURSOR.** The transcript colours a
+word iff `globalWordIndex < matchedWordCount` (`alignment.first`) and drops it to the 25 %-opacity
+grey otherwise. It does **not** colour by `status`.
+
+`promoteUnresolvedPendingRows()` (and `finalizeCorrect()`) set `status = CORRECT` while deliberately
+leaving `spokenText == null` — correctly, because a rubber-stamped row is not evidence the user spoke
+the word. But the cursor's counter does not count a CORRECT row with a null token either. So the
+promotion makes a row **DECIDED but not VISIBLE**, and the app's own log line —
+*"promoted to CORRECT so they DISPLAY"* — was simply false.
+
+Note `hasError=true` on the collapsing pass: §4.37's `resolveTranscriptCursor` deliberately lets the
+cursor move under `hasError` so a real mistake can render its error colour, so that guard could not
+help here. And it must not: the escape exists so a genuine accusation is visible, not so a *false*
+error flag can un-display a decided word.
+
+**Fix — `displayedCursorFor(analysis, cursor)`.**
+
+```kotlin
+fun displayedCursorFor(analysis: List<WordAnalysis>, cursor: Int): Int {
+    val lastDecided = analysis.filter { it.status != RecitationStatus.PENDING }
+        .maxOfOrNull { it.wordIndex } ?: return cursor
+    return maxOf(cursor, lastDecided + 1)
+}
+```
+
+Applied at three sites, always gated on `sessionFinalized` (or inside the finalize itself):
+
+- the fast merge, immediately after `keepFinalizedDecisions(…).promoteClippedPendingRows()`;
+- the deferred tajweed merge, at the same point;
+- `autoFinalize()`'s grace-expiry promotion, in the same breath as
+  `promoteUnresolvedPendingRows()` — otherwise the very next `endOfRange()` reports
+  `cursor=4/29` (measured).
+
+The invariant is one-directional: it can only ADVANCE. It never runs during a live walk, where the
+cursor must stay free to follow the user backwards after a flagged word. And it cannot hide a real
+mistake: a genuine WRONG/SKIPPED row is itself **decided**, so it falls inside the covered prefix and
+keeps its error colour (the renderer's error branch runs for `globalWordIndex >= cursor`).
+
+`DisplayedCursorTest` adds 9 tests: the measured p4 list advances 4 → 29, a rubber-stamped tail is
+invisible to the walk but covered by the helper, the helper never retreats, an all-PENDING list is
+untouched, the cursor stops at the last decided word rather than the end of the range, an empty
+analysis is a no-op, and a genuine WRONG / trailing SKIPPED stays inside the prefix.
+
+**Lesson.** A status field and a render predicate are two sources of truth for one fact, and they
+will drift. `REACHED ⇒ DISPLAYED` has to be asserted at the place the cursor is *written*, not
+re-derived later from `status` — and a log line that claims words "DISPLAY" is worth nothing unless
+the number the renderer actually reads is the one it prints.
+
+### 4.41 The superset repair adopted a decode that had rotated the head
+
+**Symptom.** `check_run.sh` on four consecutive Al-Fatihah runs of the SAME injected audio:
+
+| run | superset repair | maxMatched | verdict |
+|---|---|---|---|
+| `p1_fatihah` | fired 0× | 29 | CLEAN |
+| `p2_fatihah` | fired 0× | 29 | CLEAN |
+| `p3_fatihah` | fired 1× | 17 | NOT CLEAN |
+| `p4_fatihah` | fired 1× | 17 | NOT CLEAN |
+
+The correlation is exact: **the repair firing is the whole difference.**
+
+**Device evidence.** Both failing decodes rotate the HEAD the same way — الْحَمْدُ emitted *before*
+الرَّحْمَٰنِ الرَّحِيمِ:
+
+```
+target  بسم الله الرحمن الرحيم الحمد لله رب العالمين ...
+p3 log  بسم الله الرحمن الرحيم الحمد رب العلمين غير الرحيم الرحمن ملك يوم ...
+p3 dec  بسم الله الحمد رب العلمين الرحمن الرحيم يوم الدين اياك نعبد ...
+p4 log  بسم الله الرحمن الرحيم الحمد لله رب العلمين الرحيم يوم الدين ملك ...
+p4 dec  م الله الحمد رب العلمين الرحمن الرحيم يوم الدين اياك نعبد ...
+```
+
+The live LOG keeps the correct head in both runs; the DECODE does not. And `p4` then collapsed the
+walk `matched=17 → 14 → 4` on the repaired transcript.
+
+**Cause — the repair's premise was never checked.** `monotonicMergeWords`'s superset branch adopts
+the DECODE's reading order on the stated premise that "the decode heard everything the log heard and
+more, in the right order". When the decode rotates words instead, adopting its order hands the
+aligner a scrambled transcript. The branch does check *coverage* (bag-of-words, `headCovered`,
+`logCoveredByDecode`) but nothing checks ORDER.
+
+**Fix — `projectOntoTargetOrder(heard, targetOrder)`.** Reorder the union of the two sources into the
+TARGET's order. Neither source is trustworthy on order; the target always is.
+
+```kotlin
+internal fun projectOntoTargetOrder(heard: List<String>, targetOrder: List<String>): List<String> {
+    if (heard.isEmpty() || targetOrder.isEmpty()) return heard
+    val available = HashMap<String, Int>(); val spelling = HashMap<String, String>()
+    for (w in heard) {
+        val k = normalizeArabicPub(w); if (k.isEmpty()) continue
+        available[k] = (available[k] ?: 0) + 1
+        if (!spelling.containsKey(k)) spelling[k] = w
+    }
+    val out = ArrayList<String>(targetOrder.size)
+    for (t in targetOrder) {
+        val left = available[t] ?: 0; if (left <= 0) continue
+        available[t] = left - 1; out.add(spelling[t] ?: t)
+    }
+    return out
+}
+```
+
+`targetOrder` is the pipeline's `vocabMultiset` — the NORMALIZED active-range target, already
+available in the merge. The projection is **reorder-only**:
+
+- a word absent from BOTH sources is not in `heard`, so it stays absent and a genuine skip is still
+  flagged (`p3`'s union lacks `لله` — the decode rendered it as the one-letter fragment `لِ` — so the
+  projection returns **28**, not 29);
+- a word the user never said cannot appear out of nowhere;
+- occurrences are capped by the target's own multiplicity, so a log bloated by duplicated
+  window-edge re-appends (elsewhere: Falaq's شَرِّ committed ten times) is trimmed instead of
+  shifting every later word by one slot.
+
+The LOG's spelling wins for display (it is the already-committed rendering), so the log is passed
+first. The projection is wired as the FIRST branch inside the superset repair and falls through to
+the historic orphan-re-injection path whenever `vocabMultiset` is unavailable or the projection comes
+back empty. The other repair branches (§4.28's head-anchored and prefix-trim paths) are untouched —
+neither fired in p3 or p4.
+
+`TargetOrderProjectionTest` adds 11 tests: both measured unions project into target order, `p3`
+yields 28 and never invents `لله`, a reversed heard list is reordered, an OOV fragment is dropped,
+repeats survive up to the target's multiplicity and no further, the log's spelling wins, every
+emitted word is in the target, and the degenerate inputs are returned unchanged.
+
+**Lesson.** "The decode covers the log" is a statement about a BAG of words, and the merge was using
+it to justify adopting an ORDER. Coverage and order are different claims; a branch that swaps one for
+the other needs both guards. And when two sources each carry part of the truth, neither one's order
+should win by default — there is a third, authoritative order available, and it is the one the app is
+scoring against.
+
 ## 5. Why the previous pipeline is gone
 
 The old acoustic path (`MaddAnalyzer`/`GhunnahAnalyzer`/`QalqalahAnalyzer`/`SimilarityEngine.kt`)

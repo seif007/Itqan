@@ -1853,8 +1853,22 @@ class SingleAudioPipeline(
      * Launches the AudioRecord worker + the sliding-window decode worker.
      * The read worker captures and updates the speech tracking; the decode
      * worker periodically decodes the trailing window.
+     *
+     * FRESH SESSION => REPLAY THE INJECTION FILE FROM THE TOP. This is the ONLY
+     * path that starts a new utterance ([start] and the prewarm continuation);
+     * [resume] deliberately does NOT come through here — it re-spawns the
+     * workers directly (line ~1701) so a pause→resume still continues mid-file.
+     * Without this reset a session that ended BEFORE EOF left [injectPos] at a
+     * partial offset: a run auto-finalized once every target word was decided
+     * (measured fix34_fatihah_1) stopped the walk at 49.75 s of the 66.5 s file,
+     * so the NEXT run reported `bytes=2127928 startPos=1592000` — it started
+     * 50 s in, fed ~17 s of audio and then pure silence, and the harness aborted
+     * it as a stale cursor. Resetting here (instead of the old
+     * `injectPos >= f.length()` heuristic in [runInjectLoop]) makes consecutive
+     * runs independent while keeping pause/resume continuity intact.
      */
     private fun startReadLoop() {
+        injectPos = 0L
         readJob = scope.launch { runReadLoop() }
         decodeJob = scope.launch { decodeLoop() }
     }
@@ -2107,16 +2121,17 @@ class SingleAudioPipeline(
     @Volatile private var injectPos: Long = 0L
 
     private fun runInjectLoop(f: java.io.File, myEpoch: Int) {
-        // REPLAY ON A NEW SESSION. The pipeline — and therefore [injectPos] —
-        // survives pause/resume BY DESIGN (stopTajweedSession() only pauses; it
-        // never releases the 296 MB recognizer), so a SECOND injection run in
-        // the same process resumed at the previous run's offset and, being
-        // already past EOF, fed pure silence for the whole session: every
-        // window decoded nothing and the run looked like a dead app (measured
-        // fatihah_v2: bytes=1487928 but startPos=1495856 — matched stayed 0
-        // for 200 s). Rewinding once the file is exhausted keeps pause/resume
-        // continuity intact (a mid-file resume still continues where it left
-        // off) while letting consecutive runs replay from the top.
+        // BELT-AND-BRACES REWIND. The authoritative reset now lives in
+        // [startReadLoop] (every FRESH session replays from 0; [resume] bypasses
+        // it so pause/resume continuity is preserved). This guard is kept as a
+        // second line of defence for the one case startReadLoop() cannot see:
+        // the pipeline — and therefore [injectPos] — survives pause/resume BY
+        // DESIGN (stopTajweedSession() only pauses; it never releases the 296 MB
+        // recognizer), so if a session somehow reaches EOF and is then resumed
+        // (rather than freshly started), the cursor would sit past the end and
+        // feed pure silence — every window decodes nothing and the run looks
+        // like a dead app (measured fatihah_v2: bytes=1487928 but
+        // startPos=1495856, matched stayed 0 for 200 s).
         if (injectPos >= f.length() && f.length() > 0L) {
             Log.i(TAG, "runInjectLoop(): rewinding $injectPos -> 0 (previous run exhausted the file)")
             injectPos = 0L
@@ -2547,6 +2562,72 @@ class SingleAudioPipeline(
 }
 
 /**
+ * §4.41 — ORDER THE HEARD WORDS BY THE TARGET.
+ *
+ * `monotonicMergeWords`'s superset repair has one unchecked premise: that the
+ * session-covering decode heard the log's words "in the right order". When the
+ * decode instead ROTATES them, adopting its order hands the aligner a
+ * scrambled transcript and the walk collapses.
+ *
+ * Measured on Al-Fatihah 1–7 — four consecutive runs of the SAME injected
+ * audio — correlated against whether the superset repair fired:
+ *
+ *   p1_fatihah   repair fired 0x  -> maxMatched=29  CLEAN
+ *   p2_fatihah   repair fired 0x  -> maxMatched=29  CLEAN
+ *   p3_fatihah   repair fired 1x  -> maxMatched=17  NOT CLEAN
+ *   p4_fatihah   repair fired 1x  -> maxMatched=17  NOT CLEAN
+ *
+ * Both failing decodes rotate the HEAD the same way — الْحَمْدُ emitted before
+ * الرَّحْمَٰنِ الرَّحِيمِ:
+ *
+ *   target  بسم الله الرحمن الرحيم الحمد لله رب العالمين ...
+ *   p3 dec  بسم الله الحمد رب العلمين الرحمن الرحيم ...
+ *   p4 dec  م الله الحمد رب العلمين الرحمن الرحيم ...
+ *
+ * The live LOG keeps the correct head in both runs; the DECODE does not. Neither
+ * source is trustworthy on ORDER, but the TARGET always is.
+ *
+ * So: reorder the union of the heard words into the TARGET's order. This can
+ * only REORDER — never INVENT:
+ *  - a word absent from both the log and the decode is not in [heard], so it
+ *    stays absent and a genuine skip is still flagged;
+ *  - a word the user never said cannot appear out of nowhere;
+ *  - occurrences are capped by the target's own multiplicity, so a log bloated
+ *    with duplicated window-edge re-appends (p4's second الرَّحِيمِ) is trimmed
+ *    instead of shifting every later word by one slot.
+ *
+ * [targetOrder] is the NORMALIZED active-range target (SherpaPipeline's
+ * `vocabMultiset`). Pass the LOG first in [heard]: its spelling is the
+ * already-committed rendering and wins for display.
+ *
+ * Returns the heard words that are in the target, in target order. An empty
+ * result means nothing heard matched the target — the caller must fall back to
+ * its historic path rather than emit an empty transcript.
+ */
+internal fun projectOntoTargetOrder(
+    heard: List<String>,
+    targetOrder: List<String>,
+): List<String> {
+    if (heard.isEmpty() || targetOrder.isEmpty()) return heard
+    val available = HashMap<String, Int>()
+    val spelling = HashMap<String, String>()
+    for (w in heard) {
+        val k = normalizeArabicPub(w)
+        if (k.isEmpty()) continue
+        available[k] = (available[k] ?: 0) + 1
+        if (!spelling.containsKey(k)) spelling[k] = w
+    }
+    val out = ArrayList<String>(targetOrder.size)
+    for (t in targetOrder) {
+        val left = available[t] ?: 0
+        if (left <= 0) continue
+        available[t] = left - 1
+        out.add(spelling[t] ?: t)
+    }
+    return out
+}
+
+/**
  * Append-only monotonic union of the session's already-emitted word log
  * [last] and a fresh window decode [n]. Returns the list to EMIT next.
  *
@@ -2909,6 +2990,30 @@ internal fun monotonicMergeWords(
             }
         }
         val orphans = (0 until L).filter { logPartner[it] < 0 && last[it].isNotBlank() }
+        // ── §4.41 ORDER BY THE TARGET, NOT BY THE DECODE ─────────────────
+        // Every branch below adopts the DECODE's reading order. That premise
+        // ("the decode heard everything the log heard and more, in the right
+        // order") is unchecked, and when the decode rotates its head it is
+        // false — see [projectOntoTargetOrder] for the measured p1..p4 evidence
+        // (repair fires => maxMatched 29 -> 17). The target's order is the only
+        // order that is always right, so project the union of the two sources
+        // onto it. Reorders only: it can never invent a word, so a genuine skip
+        // is still flagged. Falls through to the historic branches below when
+        // the target order is unavailable or nothing heard matches it.
+        if (vocabMultiset != null && vocabMultiset.isNotEmpty()) {
+            val projected = projectOntoTargetOrder(last + n, vocabMultiset)
+            if (projected.isNotEmpty()) {
+                Log.i(
+                    TAG,
+                    "monotonicMergeWords(): superset repair — session decode ${n.size}w covers the " +
+                        "${L}w live log; projecting the ${last.size + n.size}w union onto the TARGET's " +
+                        "order (§4.41) -> ${projected.size}w instead of adopting the decode's " +
+                        "(head-rotating) order"
+                )
+                onRepair?.invoke()
+                return projected
+            }
+        }
         if (orphans.isEmpty()) {
             Log.i(
                 TAG,
