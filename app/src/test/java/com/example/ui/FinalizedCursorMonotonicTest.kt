@@ -138,6 +138,69 @@ class FinalizedCursorMonotonicTest {
         )
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // SMOOTH REVEAL — a TENTATIVE flag must not freeze the live highlight
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * The "frozen at ayah 2 then everything to ayah 5 appeared at once" report.
+     * During a LIVE session with a tentative WRONG/SKIPPED (hasError=true) but NO
+     * confirmed mistake armed, the walk's `newMatchedWordCount` breaks at the
+     * candidate and would freeze the highlight for the whole ~15-25 s confirm
+     * window. The reveal must instead ride forward with the heard words.
+     */
+    @Test
+    fun `live tentative flag with no confirmed mistake rides the reveal forward`() {
+        // The walk stalled at word 2 (tentative SKIPPED), but the reveal floor
+        // (last heard word + 1) has already reached 18.
+        assertEquals(
+            18,
+            resolveTranscriptCursor(newMatchedWordCount = 2, previousCursor = 18,
+                hasError = true, finalized = false, confirmedMistakeArmed = false)
+        )
+    }
+
+    /**
+     * The ride-over is one-directional: even when the walk's count is BELOW the
+     * current reveal (the aligner re-judged a heard word PENDING), the cursor may
+     * not retreat and un-display a word the user already saw light up.
+     */
+    @Test
+    fun `live tentative flag never un-displays a heard word`() {
+        assertEquals(
+            25,
+            resolveTranscriptCursor(newMatchedWordCount = 20, previousCursor = 25,
+                hasError = true, finalized = false, confirmedMistakeArmed = false)
+        )
+    }
+
+    /**
+     * Once the confirm loop CONFIRMS the mistake it arms the resume latch, and the
+     * cursor MUST snap back to the mistake index so the error colour renders and
+     * the transcript follows the user's re-read — the ride-over switches off.
+     */
+    @Test
+    fun `live session with a CONFIRMED mistake armed is NOT ridden over`() {
+        assertEquals(
+            2,
+            resolveTranscriptCursor(newMatchedWordCount = 2, previousCursor = 18,
+                hasError = true, finalized = false, confirmedMistakeArmed = true)
+        )
+    }
+
+    /**
+     * Backward compatibility: existing live callers omit the new argument and get
+     * the legacy behaviour (default confirmedMistakeArmed=true → no ride-over).
+     */
+    @Test
+    fun `live mistake without the new argument keeps legacy behaviour`() {
+        assertEquals(
+            2,
+            resolveTranscriptCursor(newMatchedWordCount = 2, previousCursor = 9,
+                hasError = true, finalized = false)
+        )
+    }
+
     @Test
     fun `finalized session without a mistake IS clamped`() {
         assertEquals(

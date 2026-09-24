@@ -1700,8 +1700,31 @@ fun resolveTranscriptCursor(
     previousCursor: Int,
     hasError: Boolean,
     finalized: Boolean,
+    /**
+     * A CONFIRMED WRONG/SKIPPED is armed (the mic is paused for the user to
+     * re-read). In that state the cursor MUST stay parked at the mistake so the
+     * error colour renders and the transcript follows the user backwards. Left
+     * true by default so existing/live callers are unchanged; the live FAST loop
+     * passes the real latch.
+     */
+    confirmedMistakeArmed: Boolean = true,
 ): Int =
     if (finalized && !hasError) maxOf(newMatchedWordCount, previousCursor)
+    else if (!finalized && hasError && !confirmedMistakeArmed)
+        // SMOOTH REVEAL (live session, no CONFIRMED mistake armed). `hasError`
+        // here is a TENTATIVE verdict: the aligner broke at a word it cannot yet
+        // confirm and the confirm loop is re-decoding it for the next ~15-25 s.
+        // `newMatchedWordCount` therefore froze at that word (it `break`s on the
+        // first WRONG/SKIPPED) even though the user kept reciting and the
+        // transcript kept growing. Holding the cursor at the LAST word with
+        // heard evidence keeps the highlight moving with the user's voice instead
+        // of freezing-then-leaping (the "frozen at ayah 2 then everything to ayah
+        // 5 appeared at once" report). One-directional: it can only advance, so a
+        // tentative flag can never un-display a word. If the confirm loop later
+        // CONFIRMS a real mistake, `stopForMistake` arms the latch and the cursor
+        // snaps back to the mistake index via the `else` branch below — verdict
+        // behaviour is unchanged; only the PRE-confirmation reveal rides ahead.
+        maxOf(newMatchedWordCount, previousCursor)
     else newMatchedWordCount
 
 /**
@@ -4721,7 +4744,14 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             // stale audio against words the user never reached.
             if (latest.epoch != analysisEpoch) continue
             val analyzeT0 = System.currentTimeMillis()
-            kotlinx.coroutines.delay(200) // Debounce rapid speech recognition partial updates to avoid UI thread ANRs
+            // Debounce only coalesces a same-frame burst of partials into ONE
+            // pass; it does NOT gate any emission. This loop is the FAST
+            // text-only path (scoreTajweed=false) and its work runs on
+            // Dispatchers.Default, so it can neither ANR the UI thread nor move
+            // the acoustic tajweed segment cut (that lives in the separate
+            // TAJWEED loop below, which has its own 2 s settle). 60 ms is
+            // deliberately not 0 so a burst still collapses into a single pass.
+            kotlinx.coroutines.delay(60)
             try {
                 val analysis = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
                     val spoken = latest.spokenText.split(Regex("\\s+"))
@@ -4789,6 +4819,10 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 var newMatchedWordCount = 0
                 var newHasError = false
                 val seenIdx = HashSet<Int>()
+                // A CONFIRMED mistake (resume latch armed) freezes the reveal — the
+                // session is paused for a re-read. Anything else is still TENTATIVE.
+                val armedMistake = mistakeResumeIndex >= 0
+                var rodeOverTentativeSkip = false
 
                 // TAJWEED-only errors (rule-acoustic failed but the WORD was spoken correctly)
                 // no longer pause the recitation. The user explicitly asked the app to "continue
@@ -4796,9 +4830,41 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // and skipped words still pause as before -- they are detection failures that
                 // would otherwise silently let the user babble ahead.
                 for (word in effective) {
-                    if (word.status == RecitationStatus.WRONG || word.status == RecitationStatus.SKIPPED) {
+                    if (word.status == RecitationStatus.WRONG) {
+                        // A WRONG word means the recognizer emitted a CONFLICTING token
+                        // for this exact slot — the strongest mistake signal there is.
+                        // It still freezes the reveal (and the confirm loop judges it).
                         newHasError = true
                         break
+                    }
+                    if (word.status == RecitationStatus.SKIPPED) {
+                        if (!sessionFinalized && !armedMistake) {
+                            // SMOOTH REVEAL over a TENTATIVE skip. The walk marks this
+                            // word SKIPPED only because the recognizer's frontier already
+                            // moved PAST it (the word's own decode was clipped/ambiguous —
+                            // e.g. Baqarah's ذَٰلِكَ opening on a fragment). But the walk's
+                            // own contract calls a mid-session SKIPPED "only a CANDIDATE":
+                            // the recognizer usually re-hears the word one window later.
+                            // A tentative skip is NOT proof the user skipped the word, so
+                            // it must not freeze the highlight while the confirm loop
+                            // verifies it in the background. Ride over it and keep counting
+                            // the words the recognizer HAS matched — the highlight tracks
+                            // the voice instead of stalling-then-leaping. If the confirm
+                            // loop CONFIRMS the skip (2 sightings / 2 absent strikes) it
+                            // arms `mistakeResumeIndex`, `armedMistakeNow` flips true, and
+                            // the reveal returns to the mistake index on the next pass —
+                            // the pause + error colour render exactly as before. Only the
+                            // PRE-confirmation reveal stops freezing. The verdict list is
+                            // untouched: `detailedAnalysis` still carries the SKIPPED row.
+                            newHasError = true
+                            rodeOverTentativeSkip = true
+                            if (seenIdx.add(word.wordIndex)) newMatchedWordCount++
+                        } else {
+                            // Finalized, or a confirmed skip is armed: freeze for the verdict.
+                            newHasError = true
+                            break
+                        }
+                        continue
                     }
                     if (word.status == RecitationStatus.CORRECT || word.status == RecitationStatus.TAJWEED_ERROR || word.status == RecitationStatus.HINTED) {
                         // TAJWEED_ERROR and HINTED both continue advancing -- TAJWEED_ERROR only
@@ -4834,18 +4900,44 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // transcript, leaving the last word of Al-Fatihah greyed while the
                 // "Perfect recitation!" summary was on screen. A word the user has
                 // seen may never be taken away (REACHED ⇒ DISPLAYED).
+                // SMOOTH-REVEAL floor. When the walk froze on a TENTATIVE
+                // WRONG/SKIPPED (hasError, no confirmed mistake armed yet), the
+                // user has usually recited further than the stalled word — the
+                // transcript grew but `newMatchedWordCount` broke at the candidate.
+                // Advance the reveal to the LAST word that carries heard evidence
+                // (a spoken token), never past it, so the highlight tracks the
+                // voice instead of freezing for the whole ~15-25 s confirm window.
+                // One-directional (max with the current cursor). This is display
+                // only: the mistake CONFIRM loop (`stopForMistake` below) is
+                // unchanged, and the instant it arms `mistakeResumeIndex` the
+                // ride-over switches off and the cursor returns to the mistake.
+                val lastHeardWord = effective
+                    .filter { !it.spokenText.isNullOrEmpty() }
+                    .maxOfOrNull { it.wordIndex }
+                    ?.plus(1)
+                val revealFloor = if (!sessionFinalized && newHasError && !armedMistake)
+                    maxOf(alignment.first, lastHeardWord ?: 0)
+                else
+                    alignment.first
                 val resolvedCursor = resolveTranscriptCursor(
                     newMatchedWordCount = newMatchedWordCount,
-                    previousCursor = alignment.first,
+                    previousCursor = revealFloor,
                     hasError = newHasError,
-                    finalized = sessionFinalized
+                    finalized = sessionFinalized,
+                    confirmedMistakeArmed = armedMistake
                 )
                 alignment = Pair(resolvedCursor, newHasError)
                 if (resolvedCursor != newMatchedWordCount) {
                     android.util.Log.i(
                         "ItqanSherpa",
                         "analyze(fast): cursor held at $resolvedCursor (walk wanted " +
-                            "$newMatchedWordCount) — finalized session may not un-display a word"
+                            "$newMatchedWordCount, heardThrough=${lastHeardWord ?: -1}, armed=$armedMistake) — tentative flag must not freeze the reveal"
+                    )
+                }
+                if (rodeOverTentativeSkip) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "analyze(fast): SMOOTH-REVEAL rode over tentative SKIPPED -> reveal cursor=$resolvedCursor (walk kept verifying in background)"
                     )
                 }
                 // Carry over any tajweed verdict the deferred acoustic loop already
@@ -5607,6 +5699,60 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             // loop flips its verdict to CORRECT and the cursor
                             // advances past it) and continue without interruption.
                             verifiedSpokenIndices.add(idxToVerify)
+                            // ── §4.43 AN ACQUITTAL MUST LEAVE EVIDENCE ──────────
+                            // `verifiedSpokenIndices` alone is NOT enough. The
+                            // VERIFIED-SPOKEN OVERRIDE only flips a row that is still
+                            // WRONG/SKIPPED — but by acquittal time the row here has
+                            // usually ALREADY been promoted to CORRECT with
+                            // `spokenText = null`, so the override is a NO-OP on the
+                            // very row it is meant to vindicate. `unheardWordCount()`
+                            // counts exactly that shape (CORRECT with no token) as
+                            // UNHEARD, so `genuinelyFinished` stays false and the
+                            // summary is WITHHELD forever on a recitation the app
+                            // itself judged perfect. Measured `s1_baqarah` (Al-Baqarah
+                            // 1–5): `matched=36/36 wrong=0 skipped=0`, yet
+                            // `endOfRange(): auto stop but NOT genuinely finished
+                            // (unheard=1/36) -> no summary` because word 1 (ذَٰلِكَ)
+                            // had been acquitted here while its row sat
+                            // CORRECT+spoken='-'. Same signature as the original
+                            // `d1_fatihah` finding (`matched=29 wrong=0 skipped=0`,
+                            // no summary). The user read the whole range and got no
+                            // summary at the end.
+                            //
+                            // Restore the evidence: stamp the vindicated row with the
+                            // decoded token that actually matched it. This is the
+                            // "a row that carries a token is a word the user DID say"
+                            // case §4.31 carves out, so the §4.31 guarantee is
+                            // untouched — a word NO decode ever found still gets
+                            // `found=false`, no token, and still blocks the summary.
+                            // Pick the token with the SAME normalization ladder the
+                            // `found` test used, so an unrelated token is never
+                            // stamped onto the row.
+                            val evidenceToken = verifiedWords.firstOrNull { vw ->
+                                val vn = normalizeForComparison(vw, viewModel.riwayah)
+                                if (isWordMatch(vn, normText)) true
+                                else articleForms(vn).any { f ->
+                                    targetForms.any { t -> isWordMatch(f, t) }
+                                }
+                            }
+                            if (evidenceToken != null) {
+                                detailedAnalysis = detailedAnalysis.map { w ->
+                                    if (w.wordIndex == idxToVerify &&
+                                        w.status == RecitationStatus.CORRECT &&
+                                        w.spokenText.isNullOrEmpty()
+                                    ) {
+                                        w.copy(spokenText = evidenceToken)
+                                    } else {
+                                        w
+                                    }
+                                }
+                                android.util.Log.i(
+                                    "ItqanSherpa",
+                                    "mistakeStop(): acquittal idx=$idxToVerify word='$wordText' " +
+                                        "restored spoken='$evidenceToken' on its CORRECT row so it " +
+                                        "stops counting as unheard (§4.43)"
+                                )
+                            }
                             mistakeVerifyAbsentIdx = -1
                             mistakeEpisodeAnchor = -1
                             mistakeCleanStreak = 0

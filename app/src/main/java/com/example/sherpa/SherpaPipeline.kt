@@ -2291,7 +2291,16 @@ class SingleAudioPipeline(
         val myEpoch = captureEpoch
         var lastHeartMs = 0L
         while (running && myEpoch == captureEpoch) {
-            delay(150)
+            // Poll interval ONLY decides how promptly an already-eligible window
+            // is picked up; the decode cadence itself is gated below by
+            // [decodeIntervalMs], which is unchanged. So tightening this poll
+            // (150 -> 50 ms) removes dead wait before a fresh word's first
+            // decode WITHOUT moving any emission timestamp — the wall-clock
+            // `spokenTimings` the tajweed scorer cuts its segment from are
+            // written in the collector from STT emissions, whose cadence is set
+            // by decodeIntervalMs + decode cost, not by this poll. A latency
+            // knob that does NOT move emission timing is not a tajweed knob.
+            delay(50)
             val nowMs = System.currentTimeMillis()
             // 2 s heartbeat: proves the decode worker is alive and reveals
             // whether a decode is stuck (busy=true for ages) or starved.
