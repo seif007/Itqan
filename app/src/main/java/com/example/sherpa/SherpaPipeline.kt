@@ -862,7 +862,27 @@ data class SherpaPartialEvent(
      * committed transcript, not append to it (the live log it supersedes
      * was scrambled by window-edge losses).
      */
-    val repaired: Boolean = false
+    val repaired: Boolean = false,
+    /**
+     * §4.45 — "the session's FINAL decode has finished, no more audio is
+     * coming", carried SEPARATELY from [partial].
+     *
+     * The end-of-session summary used to hang off "the endpoint carried
+     * words", but [finalDecodeAndEmit] legitimately emits NOTHING when the
+     * decode comes back blank (logged `finalDecodeAndEmit(): EMPTY`) or
+     * when the whole-session re-render adds no new word (`hold — no new
+     * words`). Both are the NORMAL outcome at the end of a real-mic
+     * recitation — the last 4 s are silence, so the final render is a
+     * subset of what the sliding windows already merged. The app then never
+     * learned the session was over: `sessionFinalized` stayed false, the
+     * end-of-range auto-finalize never armed, and the user finished
+     * Al-Fatihah with no popup at all (while an injected run, whose tail
+     * decode usually DOES produce a repair, showed one).
+     *
+     * So the final decode now ALWAYS emits this marker, and the collector
+     * finalizes the session on it regardless of whether words came with it.
+     */
+    val finalCommit: Boolean = false
 )
 
 class SingleAudioPipeline(
@@ -1674,6 +1694,21 @@ class SingleAudioPipeline(
         _state.value = State.Running
         sessionSpeechStart = -1
         lastSpeechFrame = -1L
+        // ── AUTO-STOP SILENCE CLOCK MUST RESTART WITH THE SESSION ──────────
+        // [lastSpeechWallMs] is a WALL-CLOCK field that survives a pause: it
+        // still holds the moment of the LAST SPEECH FRAME OF THE PREVIOUS
+        // SESSION. The very first silence chunk after a resume therefore
+        // measured the ENTIRE pause gap as "silence" and tripped the 4 s
+        // auto-stop immediately, killing the resumed session ~300 ms in and
+        // leaving the app looking dead after every pause/mistake
+        // (measured real-mic 2026-09-24:
+        //   .395 runReadLoop(): recording started
+        //   .701 runReadLoop(): auto-stop on 28957ms silence   <- the pause gap)
+        // start() already resets this pair; resume() did not. -1L disables the
+        // check (the guard is `lastSpeechWallMs > 0L`) until real speech lands
+        // again in THIS session, which is exactly start()'s semantics.
+        lastSpeechWallMs = -1L
+        autoStopFired = false
         // The utterance restarts: the previous emission log and the matcher's
         // monotonic state belong to the OLD utterance. Without this reset the
         // FIRST re-recitation merges against the old cumulative log and the
@@ -1774,6 +1809,21 @@ class SingleAudioPipeline(
         }
         val oldRead = readJob
         val oldDecode = decodeJob
+        // §4.47 — CAPTURE THE UTTERANCE GENERATION **SYNCHRONOUSLY**, HERE.
+        //
+        // The teardown below is ASYNC, so reading the generation inside it
+        // captured whatever the value had become by the time the coroutine ran
+        // — which meant `invalidateInFlightCommit()` (the app's "I abandoned
+        // this session" signal, called right after a Restart / Repeat Ayah /
+        // range change) could never suppress the emit. The abandoned session's
+        // endpoint therefore landed 2-5 s later and re-armed `sessionFinalized`
+        // on a wiped transcript, which is the ~20 s end-of-range freeze followed
+        // by the tail being decided and displayed in one step.
+        //
+        // Capturing it HERE, before the launch, is what makes the existing
+        // generation guard work for the stop path exactly as it already does for
+        // pause() (which passes `expectedGen`).
+        val gen = utteranceGen
         // Schedule teardown AFTER the workers have actually exited, so the
         // native recognizer handle can't be freed mid-decode; run the final
         // whisper decode on the SESSION PCM `out` (the accumulator is already
@@ -1785,7 +1835,7 @@ class SingleAudioPipeline(
                 kotlinx.coroutines.withTimeoutOrNull(3000L) { oldDecode?.join() }
             } catch (_: Throwable) {}
             writeDebugWav(out, "stop")
-            finalDecodeAndEmit(endpoint = true, sessionAudio = out)
+            finalDecodeAndEmit(endpoint = true, sessionAudio = out, expectedGen = gen)
             teardown()
             // ONLY now — after teardown() has actually freed the native
             // recognizer handle — clear the gate so a follow-up [start] can
@@ -1837,12 +1887,16 @@ class SingleAudioPipeline(
         }
         val oldRead = readJob
         val oldDecode = decodeJob
+        // §4.47 — same synchronous generation capture as [stop]: a release() is
+        // a lifecycle teardown, and an endpoint from the session being torn down
+        // must not be able to finalize a session the app has already replaced.
+        val gen = utteranceGen
         scope.launch {
             try { oldRead?.join() } catch (_: Throwable) {}
             try {
                 kotlinx.coroutines.withTimeoutOrNull(3000L) { oldDecode?.join() }
             } catch (_: Throwable) {}
-            finalDecodeAndEmit(endpoint = true, sessionAudio = out)
+            finalDecodeAndEmit(endpoint = true, sessionAudio = out, expectedGen = gen)
             teardown()
             isStopping = false
             _state.value = State.Idle
@@ -2454,6 +2508,11 @@ class SingleAudioPipeline(
             Log.i(TAG, "finalDecodeAndEmit(): skip — utterance restarted (gen $expectedGen -> $utteranceGen)")
             return
         }
+        // The utterance this commit belongs to. Used by the final-commit marker
+        // below so a decode that raced a resume() cannot finalize the NEW
+        // session. pause() passes its captured generation; stop()/release() are
+        // synchronous with the session they close, so they take the live one.
+        val gen = if (expectedGen >= 0) expectedGen else utteranceGen
         val src = sessionAudio ?: return
         if (src.size <= 0) return
         // WHOLE-SESSION REPAIR. This used to decode only the last 10 s, which
@@ -2543,6 +2602,34 @@ class SingleAudioPipeline(
             Log.w(TAG, "finalDecodeAndEmit(): error after ${System.currentTimeMillis() - t0}ms", t)
         } finally {
             decodeBusy.set(false)
+            // ── §4.45 THE SESSION-END SIGNAL, WHATEVER THE DECODE PRODUCED ──
+            // Three of the four exits above (blank decode, "hold — no new
+            // words", a thrown error) emit NO endpoint at all, and the two
+            // synthetic endpoints emitted by stop()/pause() are wordless by
+            // design. The collector could therefore not tell "the session
+            // ended" from "the user is still reading", and the end-of-range
+            // summary never armed on a real microphone (the final render of a
+            // recitation whose last seconds are silence is normally a subset
+            // of the sliding windows' merge — i.e. the "hold" case).
+            //
+            // This marker is the ONLY reliable end-of-session signal, so it is
+            // emitted on every path that actually RAN the decoder. It is
+            // generation-guarded: a decode that belongs to a previous
+            // utterance must not finalize the session the user has already
+            // resumed into.
+            if (utteranceGen == gen) {
+                Log.i(
+                    TAG,
+                    "finalDecodeAndEmit(): final-commit marker (gen=$gen endpoint=$endpoint " +
+                        "lastClean=${lastEmitClean.size}w)"
+                )
+                _partials.tryEmit(SherpaPartialEvent(
+                    partial = emptyList(),
+                    rawPartial = "",
+                    endpoint = true,
+                    finalCommit = true
+                ))
+            }
         }
     }
 

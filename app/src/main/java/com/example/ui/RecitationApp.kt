@@ -1728,6 +1728,79 @@ fun resolveTranscriptCursor(
     else newMatchedWordCount
 
 /**
+ * §4.45 — how many words may be missing before "the user finished the range" is
+ * a lie. The recognizer routinely never renders the very last word of a
+ * recitation (the closing seconds are silence, the RMS gate drops them and the
+ * whole-session re-render comes back a subset of the sliding windows' merge), so
+ * one or two unaccounted words is a decoder blind spot, not an unfinished
+ * recitation. Used both by [isGenuineFinish] and by the "did the range really get
+ * recited" test behind `sessionRangeCompleted`.
+ */
+const val GENUINE_FINISH_MAX_UNHEARD = 2
+
+/**
+ * §4.47 — how far past the last word the user was HEARD to say, the end-of-session
+ * forgiveness may reach.
+ *
+ * `finalizeCorrect()` and the grace-expiry promotion both exist so the words the
+ * decoder clipped at the end of a recitation stay visible (§4.34 / §4.40). The
+ * window is a small constant tail, not the rest of the range: a session that
+ * stopped early must NOT have its whole remaining range decided and displayed in
+ * one step, which is indistinguishable on screen from a fully recited surah
+ * ("it froze, and then all the words appeared at once until the end of the range").
+ */
+const val FINALIZE_FORGIVE_TAIL_WINDOW = 8
+
+/**
+ * §4.45 — DID THE USER ACTUALLY FINISH THE RANGE?
+ *
+ * The end-of-range summary was gated on `unheardWordCount() == 0`, i.e. on
+ * EVERY target word carrying spoken evidence. That is stricter than the
+ * user's contract ("if the user pauses or finished the session he gets a
+ * summary") and it is stricter than the decoder can deliver: the trailing
+ * word of a recitation is routinely the one the recognizer never renders -
+ * the final 4 s of a real-mic session are silence, the RMS gate drops them,
+ * and the whole-session re-render is then a SUBSET of what the sliding
+ * windows already merged (`finalDecodeAndEmit(): hold - no new words`). That
+ * row ends up CORRECT with no token, so it counts as "unheard" and the
+ * summary was withheld for a recitation the user had plainly finished:
+ *
+ *   endOfRange(): auto stop but NOT genuinely finished (unheard=1/29)
+ *   -> no summary; words stay displayed
+ *
+ * while an INJECTED run of the same range decoded that word and did show the
+ * summary - the exact "works with injection, nothing when I test myself"
+ * report.
+ *
+ * The test is therefore COVERAGE, not perfection:
+ *  - the user clearly read (almost) the whole range - at least
+ *    [minHeardFraction] of it carries evidence;
+ *  - what is missing is a decoder blind spot, not a recitation - at most
+ *    [maxUnheard] words;
+ *  - and the DISPLAY reached the end of the range ([displayedCursor] >=
+ *    [totalWords]), which is what "I read the whole thing" actually looks
+ *    like on screen. A mid-range stall (the user stopped early, the app
+ *    auto-stopped on 4 s of silence) leaves the cursor far short of the end
+ *    and is still correctly NOT a finish.
+ */
+fun isGenuineFinish(
+    totalWords: Int,
+    unheardWordCount: Int,
+    displayedCursor: Int,
+    minHeardFraction: Double = 0.9,
+    maxUnheard: Int = GENUINE_FINISH_MAX_UNHEARD,
+): Boolean {
+    if (totalWords <= 0) return false
+    // Every word carries evidence - the ideal case, and the only one that
+    // needs no tolerance.
+    if (unheardWordCount <= 0) return true
+    if (unheardWordCount > maxUnheard) return false
+    val heardFraction = (totalWords - unheardWordCount).toDouble() / totalWords.toDouble()
+    if (heardFraction < minHeardFraction) return false
+    return displayedCursor >= totalWords
+}
+
+/**
  * §4.40 — REACHED ⇒ DISPLAYED, enforced at the FINALIZE.
  *
  * The transcript colours a word by the CURSOR (`globalWordIndex <
@@ -2132,6 +2205,36 @@ data class WordAnalysis(
  * two rules. Always resolve rows by their WORD INDEX.
  */
 fun List<WordAnalysis>.forWordIndex(idx: Int): WordAnalysis? = firstOrNull { it.wordIndex == idx }
+
+/**
+ * §4.46 - THE SAME LOOKUP, WITHOUT THE SCAN.
+ *
+ * `forWordIndex` is a LINEAR scan, and the transcript renderer calls it up to
+ * three times for EVERY word it draws, on EVERY recomposition:
+ *
+ *   isHintedWord       detailedAnalysis.forWordIndex(globalWordIndex)
+ *   error-colour gate  detailedAnalysis.forWordIndex(globalWordIndex)
+ *   currentAnalysis    detailedAnalysis.forWordIndex(globalWordIndex)
+ *
+ * `detailedAnalysis` holds ONE ROW PER (WORD, RULE) for the WHOLE selected
+ * range, so the scan length is the size of the RANGE, not of the screen. On
+ * Al-Fatihah 1-7 that is ~36 rows and nobody notices; reciting a long range
+ * (Al-Baqarah, 6116 words - 7000 rows) turns a repaint of the ~20 visible words
+ * into ~420 000 row comparisons - on the A05s that is the difference between a
+ * word lighting up as it is said and the highlight trailing a beat behind,
+ * which is the "the word display is not smooth on an old phone" complaint.
+ *
+ * One map per analysis list, built once per analysis (it is snapshot state, so
+ * it only changes when a verdict does), then O(1) per word. The map keeps the
+ * FIRST row for a word index - exactly what [forWordIndex]'s `firstOrNull`
+ * returned.
+ */
+fun List<WordAnalysis>.byWordIndex(): Map<Int, WordAnalysis> {
+    if (isEmpty()) return emptyMap()
+    val out = HashMap<Int, WordAnalysis>(size * 2)
+    for (w in this) if (!out.containsKey(w.wordIndex)) out[w.wordIndex] = w
+    return out
+}
 
 data class TajweedExample(
     val arabic: String,
@@ -2917,6 +3020,16 @@ suspend fun analyzeRecitationDetails(
     finalReport: Boolean = false,
     verdictCache: java.util.concurrent.ConcurrentHashMap<String, Float>? = null,
     /**
+     * §4.46 - FAILED verdicts, cached against the search window they were
+     * measured on: key -> (maxStart, best prob). A fail is re-used only while
+     * `maxStart` is unchanged, which makes the re-use provably identical to
+     * re-running the sweep; once the buffer has grown enough to expose new
+     * candidate positions the word is re-scored, so a fuller decode can still
+     * acquit it. Without this, every failing word re-ran its whole -6 s sweep
+     * (up to 80 ONNX evaluations) on EVERY acoustic pass.
+     */
+    failCache: java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Float>>? = null,
+    /**
      * When false, the acoustic (TajweedNet) scoring step is skipped entirely:
      * words get text-only verdicts (CORRECT / WRONG / SKIPPED). This is the
      * FAST path (~ms) used for the near-real-time display + wrong/skipped
@@ -3436,31 +3549,78 @@ suspend fun analyzeRecitationDetails(
                                 var best = prob
                                 val maxStart = (capturedMs - spanLen).coerceAtLeast(0L)
                                     .coerceAtMost((recordingDurationMs - spanLen).coerceAtLeast(0L))
+                                // §4.46 - a fail is only re-usable for the SAME
+                                // search window. See [tajweedFailCache]: identical
+                                // maxStart means byte-identical candidates, so the
+                                // sweep would return the identical number. When
+                                // the buffer has grown the window is re-scored, so
+                                // a later, fuller decode can still acquit the word.
+                                val cachedFail = failCache?.get(cacheKey)
+                                if (cachedFail != null && cachedFail.first == maxStart) {
+                                    best = maxOf(best, cachedFail.second)
+                                } else {
                                 val visited = HashSet<Long>()
-                                var off = 150L
                                 var found = false
-                                while (!found && off <= 6000L) {
-                                    for (st0 in longArrayOf(segStartMs - off, segStartMs + off)) {
-                                        val st = st0.coerceIn(0L, maxStart)
-                                        if (!visited.add(st)) continue
-                                        val a = (st * 16000 / 1000).toInt().coerceIn(0, fullAudio.size)
-                                        val b = ((st + spanLen) * 16000 / 1000).toInt()
-                                            .coerceIn(a, fullAudio.size)
-                                        if (b - a >= 256) {
-                                            val cand = trimSilence(fullAudio.sliceArray(a until b))
-                                            if (cand.size >= 256) {
-                                                val p = analyzer.analyze(cand, listOf(head), thr)
-                                                    .firstOrNull()?.prob ?: 0f
-                                                if (p > best) best = p
-                                                if (best >= thr) { found = true; break }
+                                // - STAGED SEARCH (§4.45) -
+                                // The nominal cut lands a beat LATE: a word is
+                                // emitted only after the recognizer has decoded it,
+                                // so `spokenTimings` place it after the audio that
+                                // produced it, and the -6 s sweep exists to forgive
+                                // that skew (and the window-edge cuts behind it).
+                                //
+                                // Sweeping 40 offsets at 150 ms is 80 ONNX
+                                // evaluations per failing head - 1-3 s of CPU on the
+                                // A05s, which is most of a live pass, and it is what
+                                // makes a mistake popup arrive seconds after the
+                                // mistake ("it takes too long to show the popup").
+                                // But adjacent offsets overlap by ~93 % (the window
+                                // is 0.4-2 s wide), so the score surface is smooth
+                                // and a COARSE probe finds a passing position in
+                                // almost every case where one exists nearby.
+                                //
+                                // So: probe coarsely first (600 ms steps, 10
+                                // positions). If one passes, the verdict is settled
+                                // in ~10 evaluations instead of ~80. If none does,
+                                // fall through to the ORIGINAL 150 ms sweep UNCHANGED
+                                // - the same candidates in the same order - so a word
+                                // is still only forgiven by a real passing position:
+                                // forgiveness is never reduced, and a genuine mistake
+                                // costs 90 evaluations instead of 80.
+                                fun sweep(stepMs: Long, limitMs: Long): Float {
+                                    var off = stepMs
+                                    while (!found && off <= limitMs) {
+                                        for (st0 in longArrayOf(segStartMs - off, segStartMs + off)) {
+                                            val st = st0.coerceIn(0L, maxStart)
+                                            if (!visited.add(st)) continue
+                                            val a = (st * 16000 / 1000).toInt().coerceIn(0, fullAudio.size)
+                                            val b = ((st + spanLen) * 16000 / 1000).toInt()
+                                                .coerceIn(a, fullAudio.size)
+                                            if (b - a >= 256) {
+                                                val cand = trimSilence(fullAudio.sliceArray(a until b))
+                                                if (cand.size >= 256) {
+                                                    val p = analyzer.analyze(cand, listOf(head), thr)
+                                                        .firstOrNull()?.prob ?: 0f
+                                                    if (p > best) best = p
+                                                    if (best >= thr) { found = true; break }
+                                                }
                                             }
                                         }
+                                        off += stepMs
                                     }
-                                    off += 150L
+                                    return best
                                 }
+                                best = sweep(600L, 6000L)
+                                if (!found) best = sweep(150L, 6000L)
                                 prob = best
+                                // Remember the fail WITH the window it was measured
+                                // on. Only a grown `maxStart` invalidates it.
+                                if (prob < thr) failCache?.put(cacheKey, maxStart to prob)
+                                }
+                                prob = maxOf(prob, best)
                             }
-                            // Cache PASSING verdicts only (fails are re-scored — see history).
+                            // Passing verdicts are cached unconditionally; a FAIL is
+                            // cached per search window above (§4.46), so neither is
+                            // re-derived on every pass.
                             if (prob >= thr) verdictCache?.put(cacheKey, prob)
                             } // end verdict-cache miss branch
                             val tScoreL = (prob * 100).toInt().coerceIn(0, 100)
@@ -3867,10 +4027,11 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         AlertDialog(
             onDismissRequest = { viewModel.dismissSessionSummary() },
             title = {
-                // The summary only ever appears on a USER PAUSE (§4.32), so it is
-                // safe to praise an empty mistake list here: the user asked for
-                // the breakdown and there is genuinely nothing to report.
-                val perfect = sessionSummary.entries.isEmpty()
+                // The summary appears on a user pause OR on a finish (§4.45), so
+                // it must never claim a perfect recitation the screen contradicts:
+                // words the recognizer never rendered are still grey.
+                val perfect = sessionSummary.entries.isEmpty() &&
+                    sessionSummary.unheardWordCount == 0
                 Text(
                     text = if (perfect)
                         getAppString(isArabic, "Perfect recitation! 🌟")
@@ -3971,20 +4132,41 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     }
 
                     if (wrongs.isEmpty() && skippeds.isEmpty() && tajweedPairs.isEmpty()) {
-                        // No mistakes to report — the user paused and asked for the
-                        // breakdown. Say so plainly. (No coverage note here: the
-                        // summary is the MISTAKE breakdown, and it is only ever
-                        // raised on a user pause — §4.32.)
+                        // No mistakes to report - the user paused or finished and
+                        // asked for the breakdown. Say so plainly. (No coverage
+                        // line unless something is actually missing: §4.45 allows a
+                        // couple of words the DECODER never rendered to coexist with
+                        // a finish, and "Perfect recitation!" would then be a lie
+                        // the user can see on screen - those words are still grey.)
+                        val unheardShown = sessionSummary.unheardWordCount
+                        val perfect = unheardShown == 0
                         Text(
-                            text = if (isArabic)
-                                "ما شاء الله! لا أخطاء في هذه التلاوة."
-                            else
-                                "Masha'Allah — no mistakes in this recitation.",
+                            text = if (isArabic) {
+                                if (perfect) "ما شاء الله! لا أخطاء في هذه التلاوة."
+                                else "ما شاء الله! لم يُكتشف أي خطأ في هذه التلاوة."
+                            } else {
+                                if (perfect) "Masha'Allah — no mistakes in this recitation."
+                                else "Masha'Allah — no mistakes detected in this recitation."
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.primary,
                             textAlign = TextAlign.Center,
                             modifier = Modifier.fillMaxWidth()
                         )
+                        if (!perfect) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = if (isArabic) {
+                                    "${unheardShown} كلمة لم يلتقطها التعرف على الصوت"
+                                } else {
+                                    "$unheardShown word(s) were not picked up by the recognizer"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
                     }
                 }
             },
@@ -4050,20 +4232,76 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     val tajweedVerdictCache = remember { java.util.concurrent.ConcurrentHashMap<String, Float>() }
 
     /**
+     * §4.46 - HOW FAR THE DISPLAY CURSOR HAS EVER REACHED IN THIS SESSION.
+     *
+     * The transcript colours a word iff `globalWordIndex < matchedWordCount`, so
+     * a cursor that goes backwards takes colour OFF words the user has already
+     * read. That is the "after the pause some words that were displayed went
+     * blank, then came back" report.
+     *
+     * The walk legitimately reports a SHORTER cursor for a moment after a
+     * resume (the transcript is re-seated at the re-read point, so the early
+     * passes see a shorter list), and a re-decode can momentarily misalign one
+     * word. None of that is a reason to un-display a word.
+     *
+     * Reset ONLY by an explicit fresh start - the Restart button, a surah/range
+     * change, or the transcript wipe a finished run performs. Never by a pause,
+     * a resume, a mistake popup, or the end of the range. A CONFIRMED mistake is
+     * the single exception, and it does not use this floor at all: the cursor has
+     * to return to the mistake word so the error colour is painted there.
+     */
+    var displayCursorFloor by remember { mutableIntStateOf(0) }
+
+    /**
+     * §4.46 - FAILED VERDICTS, CACHED AGAINST THE SEARCH WINDOW THEY USED.
+     *
+     * Only PASSING verdicts were cached, so a word that FAILED was re-scored -
+     * including the whole -6 s confirmation sweep, up to 80 ONNX evaluations -
+     * on every single acoustic pass, for as long as it stayed in the transcript.
+     * That is the dominant cost of the acoustic loop (a 2-4.5 s pass), it burns
+     * CPU the STT decode loop needs, and it is why a mistake popup could take
+     * many seconds to come out on a slow phone.
+     *
+     * Re-running it is provably pointless while the search window is UNCHANGED:
+     * the candidate windows are cut from the session's audio buffer, whose
+     * content never changes once written, and the sweep's reach
+     * (`maxStart = min(captured - span, duration - span)`) is what decides which
+     * candidates exist. Same `maxStart` - byte-identical candidates - identical
+     * result. So the fail is cached together with the `maxStart` it was computed
+     * on, and re-run only when the buffer has grown enough to expose new
+     * candidates - which is precisely when a LATER decode could acquit it.
+     *
+     * Keyed per (word, rule) like [tajweedVerdictCache], and cleared with it.
+     */
+    val tajweedFailCache = remember {
+        java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Float>>()
+    }
+
+    /**
      * Minimum wall-clock gap between two LIVE tajweed acoustic passes (the FINAL,
      * post-stop pass ignores it and always runs immediately).
      *
-     * WHY: a pass costs 2.0–4.5 s of CPU on this phone — measured on-device
+     * WHY: a pass used to cost 2.0-4.5 s of CPU on this phone - measured on-device
      * `analyze(tajweed): done 2009…4550ms` — because a word about to be flagged
-     * sweeps ±6 s in 150 ms steps (up to 80 model evaluations, §1 step 5). Running
+     * swept -6 s in 150 ms steps (up to 80 model evaluations, -1 step 5). Running
      * one pass per emission saturates a core and starves the recognizer's decode
      * loop (`decodeLoop(): alive busy=true lastDecodeAge=5052ms`), which is exactly
      * the reported lag: "when I paused some words weren't displayed yet, then when
      * I opened the mic again they got displayed". The fast text loop (~210 ms)
      * already keeps the transcript current, so the acoustic pass can run at a
      * lower cadence without any user-visible loss of verdicts.
+     *
+     * §4.45 - 3 s - 1.8 s. The staged confirmation sweep (a word that merely
+     * needs re-alignment is now settled in ~10 evaluations instead of ~80) made a
+     * pass cheap enough that the old cadence was pure latency: the user waited
+     * 3 s for the pass to even START, on top of the settle, on top of the pass
+     * itself, before a mistake popup appeared. 1.8 s still leaves the recognizer
+     * roughly half the wall time (the budget below is unchanged otherwise) and
+     * halves the worst-case popup delay.
      */
-    val TAJWEED_MIN_INTERVAL_MS = 3000L
+    val TAJWEED_MIN_INTERVAL_MS = 1800L
+    /** How long a LIVE pass waits for a word's audio to settle before scoring. */
+    val TAJWEED_LIVE_SETTLE_MS = 1500L
     /** Last time a tajweed pass STARTED (epoch ms); 0 = never. */
     val lastTajweedPassMs = remember { java.util.concurrent.atomic.AtomicLong(0L) }
 
@@ -4300,6 +4538,35 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // charges goals and raises the summary, so it must run AT MOST ONCE per
     // session even though its trigger (a Compose snapshot state) re-fires.
     var autoFinalizeDone by remember { mutableStateOf(false) }
+    // - IS A RECITATION SESSION IN PROGRESS? (§4.45) -
+    // `isListening` only answers "is the mic hot right now", and BOTH stop
+    // paths clear it BEFORE anything gets to decide the summary: a pause
+    // (`stopTajweedSession()`), a confirmed wrong/skipped (`stopForMistake()`)
+    // and a tajweed popup. The end-of-range decision used to be guarded by
+    // `if (isListening)`, so the pause path skipped its own summary body and
+    // the user got nothing at all ("in the pause there is no summury at all"),
+    // while a post-mistake tap fell into the "start a session" branch and
+    // never resumed the re-read.
+    //
+    // This flag is the session-level truth: it is set when a session starts
+    // and cleared only when the session has actually been DECIDED (summary
+    // raised / dismissed), by a range or surah change, or by leaving the tab.
+    // A pause or a mistake popup leaves it TRUE, because the session is
+    // paused mid-way, not finished.
+    var recitationSessionActive by remember { mutableStateOf(false) }
+    // - DEFERRED USER-PAUSE FINALIZE -
+    // The user tapped pause in a Tajweed (pipeline) session, but the FINAL
+    // whole-session decode has not landed yet. `stopTajweedSession()` only
+    // calls `pause()`, and the endpoint decode arrives ~5 s later (measured
+    // real-mic 2026-09-24: stop at 20:23:57.174, `endpoint decode LANDED with
+    // 30w` at 20:24:02.196). `sessionFinalized` is set by THAT endpoint, so
+    // running the finalize at tap time reads sessionFinalized=false, skips
+    // every summary branch and the user gets NO SUMMARY on a pause - their
+    // report: "in the pause there is no summury at all". The mic is stopped
+    // immediately (responsiveness); this flag defers only the DECISION until
+    // the endpoint lands, then runs the real (userInitiatedStop=true)
+    // finalize exactly once.
+    var userPauseFinalizePending by remember { mutableStateOf(false) }
     // How long the end-of-range summary waits for the mistake pipeline to
     // surface an outstanding WRONG/SKIPPED as its own popup before finalizing
     // anyway. See the "mistake hold" comment on the auto-finalize effect.
@@ -4495,6 +4762,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         mistakeCleanStreak = 0
         latestTajweedPopup = null
         sessionFinalized = false
+        // A new range/surah ends whatever session was in progress (§4.45): there
+        // is nothing left to resume or summarize for the old target.
+        recitationSessionActive = false
         // A new range/surah is a fresh target: the previous run's range-completed
         // flag must not make the next mic tap wipe a brand-new recitation.
         sessionRangeCompleted = false
@@ -4521,6 +4791,11 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         // fresh session re-scores from scratch (stale verdicts from the previous
         // range's words must never leak into the new one).
         tajweedVerdictCache.clear()
+            tajweedFailCache.clear()
+        // A new range is a new session, so the display floor (§4.46) starts from
+        // scratch - otherwise the first words of the new range would be blocked by
+        // how far the previous one had got.
+        displayCursorFloor = 0
         // ── EPOCH BUMP + STALE-WORK DRAIN ── Everything queued for the OLD
         // range dies here: pending analysis requests are drained unread, both
         // loops drop anything carrying an older epoch, and pause()'s async
@@ -4742,7 +5017,21 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             // EPOCH GUARD: a request queued before the last range/surah/tab
             // change belongs to the OLD target — drop it instead of scoring
             // stale audio against words the user never reached.
-            if (latest.epoch != analysisEpoch) continue
+            //
+            // §4.47 AND THE SAME GUARD BEFORE THE **WRITE**. The check above only
+            // protects the QUEUE: a pass that was already running when the user
+            // tapped Restart / Repeat Ayah / changed the range had read the old
+            // `alignment` and the old `analysisEpoch` BEFORE the bump, and it
+            // wrote its result 60-400 ms LATER — resurrecting the cursor the reset
+            // had just cleared. Measured on device (`b2_buttons`): after Restart
+            // the transcript was empty (`walk wanted 0, heardThrough=-1`) and yet
+            // `cursor held at 13 (... floor=13)`, because this pass put the old
+            // cursor back and re-raised the floor. With a longer range that reads
+            // as "it froze, then all the words suddenly appeared to the end of the
+            // range". The reset must be able to land AFTER a pass has started, so
+            // the pass re-checks the epoch immediately before it writes.
+            val passEpoch = analysisEpoch
+            if (latest.epoch != passEpoch) continue
             val analyzeT0 = System.currentTimeMillis()
             // Debounce only coalesces a same-frame burst of partials into ONE
             // pass; it does NOT gate any emission. This loop is the FAST
@@ -4774,10 +5063,31 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         isTajweedMode = latest.mode == "Tajweed",
                         finalReport = latest.finalized,
                         verdictCache = tajweedVerdictCache,
+                        failCache = tajweedFailCache,
                         scoreTajweed = false
                     )
                 }
 
+                // §4.47 — THE WRITE-SIDE EPOCH GUARD. The pass above took 60-400 ms
+                // (a slow phone: up to seconds). If the user reset the session while
+                // it ran — Restart, Repeat Ayah, a surah/range change — everything
+                // this pass is about to write describes the session that no longer
+                // exists, and it would land on top of the reset. Measured
+                // `b2_buttons`: Restart cleared the transcript, and 300 ms later
+                // this pass put the old cursor back and re-raised the display floor
+                // (`cursor held at 13 (... floor=13)` on an empty transcript), which
+                // is the "it froze, then all the words appeared at once" report.
+                // Dropping the result is always safe: the reset already discarded
+                // everything this pass would have replaced, and the next emission
+                // re-requests the analysis.
+                if (passEpoch != analysisEpoch) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "analyze(fast): DROPPED a stale result (epoch $passEpoch -> $analysisEpoch) " +
+                            "— the session was reset while this pass was running"
+                    )
+                    continue
+                }
                 // CONFIRMED-MISTAKE PRESERVATION. Once mistakeStop confirms a
                 // WRONG/SKIPPED it pauses the mic and arms mistakeResumeIndex --
                 // the user must re-read FROM that word on resume. A stale
@@ -4926,12 +5236,35 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     finalized = sessionFinalized,
                     confirmedMistakeArmed = armedMistake
                 )
-                alignment = Pair(resolvedCursor, newHasError)
-                if (resolvedCursor != newMatchedWordCount) {
+                // - §4.46 THE SESSION FLOOR: A WORD ONCE SHOWN STAYS SHOWN -
+                // The cursor drives the RENDER, and a lower cursor literally
+                // un-colours everything above it. The report was exact: after a
+                // pause the user watched words they had just recited go grey and
+                // then come back. The walk is not stable across a resume - the
+                // transcript is re-seated at the prefix, so the first passes walk
+                // a SHORTER list and `newMatchedWordCount` is legitimately lower
+                // for a moment.
+                //
+                // So within one session the cursor may only ever move forward,
+                // EXCEPT when a mistake is CONFIRMED and armed: there the cursor
+                // MUST return to the mistake word, because the error colour is only
+                // painted at/after the cursor and the user has to SEE which word
+                // stopped them. That is the one exception, and it is exactly the
+                // exception `resolveTranscriptCursor` already documents.
+                //
+                // The floor is reset only by an EXPLICIT fresh start (Restart
+                // button, surah/range change) - never by a pause, a resume, a
+                // mistake or the end of the range.
+                val floorNow = if (armedMistake) 0 else displayCursorFloor
+                val cursorNow = maxOf(resolvedCursor, floorNow)
+                if (!armedMistake && cursorNow > displayCursorFloor) displayCursorFloor = cursorNow
+                alignment = Pair(cursorNow, newHasError)
+                if (cursorNow != newMatchedWordCount) {
                     android.util.Log.i(
                         "ItqanSherpa",
-                        "analyze(fast): cursor held at $resolvedCursor (walk wanted " +
-                            "$newMatchedWordCount, heardThrough=${lastHeardWord ?: -1}, armed=$armedMistake) — tentative flag must not freeze the reveal"
+                        "analyze(fast): cursor held at $cursorNow (walk wanted " +
+                            "$newMatchedWordCount, heardThrough=${lastHeardWord ?: -1}, armed=$armedMistake, " +
+                            "floor=$floorNow) - a displayed word may not go grey again"
                     )
                 }
                 if (rodeOverTentativeSkip) {
@@ -5009,17 +5342,34 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             var latest = req
             while (true) {
                 val newer = tajweedRequests.tryReceive().getOrNull() ?: break
+                // - A FINALIZED (ENDPOINT) REQUEST MUST NOT BE SKIPPED -
+                // It carries the whole-session audio and skips the 2 s settle
+                // below; a newer LIVE request used to overwrite it, so the last
+                // words' acoustic verdict was never computed on the ending
+                // audio - the popup for a mistake in the closing words only
+                // appeared much later, when a following emission re-triggered
+                // the pass (measured real-mic 2026-09-24: a Madd error was
+                // pushed 35 s after the pause, after the user had already
+                // resumed - "it takes too long to show the popup"). Keep the
+                // finalized pass and drop the newer live ones; the next
+                // emission re-triggers a live pass anyway.
+                if (latest.finalized) continue
                 latest = newer
             }
             if (latest.mode != "Tajweed" || latest.audio == null) continue
             // EPOCH GUARD (same as the fast loop): stale-range requests die here —
             // their verdicts must never update detailedAnalysis after the switch.
-            if (latest.epoch != analysisEpoch) continue
+            // The passEpoch is re-checked before the WRITE too (§4.47): this loop
+            // settles ~1.5 s and then spends 1.5-4.5 s scoring, so a Restart / Repeat
+            // Ayah / range change during the scoring must not be overwritten by the
+            // verdicts of the session it abandoned.
+            val passEpoch = analysisEpoch
+            if (latest.epoch != passEpoch) continue
             val tjT0 = System.currentTimeMillis()
             if (latest.finalized) {
                 // FINAL PASS — the user has stopped, no more audio is coming, and
                 // this is the pass that fills in the last words of the report. The
-                // ~2 s settle delay below is pure dead time here (it exists only to
+                // live settle below is pure dead time here (it exists only to
                 // let live audio settle), so skip it: it is a direct 2 s off the
                 // stop-to-report latency the user reported.
             } else {
@@ -5028,9 +5378,13 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // current, the next emission re-triggers, and the final pass above
                 // always scores everything.
                 if (System.currentTimeMillis() - lastTajweedPassMs.get() < TAJWEED_MIN_INTERVAL_MS) continue
-                // Wait ~2 s so the word's audio span has settled before scoring, and
-                // so a burst of emissions collapses into one acoustic pass.
-                kotlinx.coroutines.delay(2000)
+                // Wait so the word's audio span has settled before scoring, and
+                // so a burst of emissions collapses into one acoustic pass. The
+                // settle must stay long enough to hold the word's own tail AND
+                // (for the forward-leaning rules) the following word, which is
+                // what the model was trained on - so this is a trim, not a cut:
+                // 2.0 s - 1.5 s, still above the worst-case emit-to-audio lead.
+                kotlinx.coroutines.delay(TAJWEED_LIVE_SETTLE_MS)
             }
             lastTajweedPassMs.set(System.currentTimeMillis())
             try {
@@ -5053,8 +5407,22 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         isTajweedMode = true,
                         finalReport = latest.finalized,
                         verdictCache = tajweedVerdictCache,
+                        failCache = tajweedFailCache,
                         scoreTajweed = true
                     )
+                }
+                // §4.47 — WRITE-SIDE EPOCH GUARD, same reasoning as the fast loop.
+                // This pass settles 1.5 s and scores for 1.5-4.5 s, so a Restart /
+                // Repeat Ayah / range change during the scoring would otherwise be
+                // overwritten by the acoustic verdicts of the abandoned session —
+                // and (measured `b2_buttons`) by the cursor advance it carries.
+                if (passEpoch != analysisEpoch) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "analyze(tajweed): DROPPED a stale acoustic result (epoch $passEpoch -> " +
+                            "$analysisEpoch) — the session was reset while this pass was scoring"
+                    )
+                    continue
                 }
                 // Merge acoustic verdicts into the current display analysis. Never
                 // downgrade a text-detected WRONG/SKIPPED to a tajweed verdict.
@@ -5134,19 +5502,29 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // `lastTajweedPopupIndex` guard prevents re-firing for the same error on every recomposition,
     // so the user sees each mistake once per word. `lastTajweedPopupIndex` is declared above
     // (next to the recognizer) so the range/surah reset can clear it too.
-    LaunchedEffect(detailedAnalysis, currentTab, recitationMode) {
+    LaunchedEffect(detailedAnalysis, currentTab, recitationMode, latestTajweedPopup) {
         if (currentTab == "Memorize" && recitationMode == "Tajweed") {
             // Find the LATEST tajweed mistake (last in word order -- the most recent error).
             val tajweedError = detailedAnalysis.lastOrNull {
                 it.status == RecitationStatus.TAJWEED_ERROR && it.tajweedRule != null
             }
             if (tajweedError != null) {
-                // Score-aware guard: fire for a NEW word index, or for the SAME
-                // word when its score CHANGED — a re-read after the popup gets
-                // freshly scored (~2 s deferred loop), so repeating the mistake
-                // re-fires even though the index matches the previous popup.
-                if (tajweedError.wordIndex != lastTajweedPopupIndex ||
-                    tajweedError.tajweedScore != lastTajweedPopupScore
+                // - ONE POPUP PER WORD, AND ONLY AFTER THE USER ACTS (§4.45) -
+                // The old guard fired again for the SAME word whenever its SCORE
+                // changed, and only PASSING verdicts are cached - so every
+                // acoustic pass re-scored the failing word against a longer
+                // buffer, got a marginally different percentage, and re-fired the
+                // dialog the instant the user tapped OK. The user read that as
+                // "it didnt wait for me to dismiss it" (in reality an endless
+                // popup on one word, with the recitation dead behind it).
+                //
+                // The fix is the CONTRACT, not a longer timer: a popup stays up
+                // until it is dismissed, and the same word can only raise a new
+                // one after the user has DONE something about it - dismissed the
+                // popup and re-read the word (the mic resume re-arms the latch
+                // through the fresh-session event) - or after moving on to a
+                // different word. Dismissal alone must never re-open it.
+                if (latestTajweedPopup == null && tajweedError.wordIndex != lastTajweedPopupIndex
                 ) {
                     android.util.Log.i("ItqanSherpa", "tajweedPop(): TAJWEED_ERROR wordIndex=${tajweedError.wordIndex} rule=${tajweedError.tajweedRule} score=${tajweedError.tajweedScore} -> pushing popup")
                     lastTajweedPopupIndex = tajweedError.wordIndex
@@ -5191,13 +5569,27 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         // filter, get displayed, get re-scored with a fresh
                         // timing key, and re-popup if still wrong.
                         mistakeResumeLiveText = (finalSpokenText + " " + partialSpokenText).trim()
-                        // TAJWEED resume continues from the CURRENT display
-                        // frontier (the next ayah): the mistake word's tajweed
-                        // verdict is already recorded, and the display has
-                        // usually advanced past it by popup time (deferred
-                        // scoring latency). Re-seating to the frontier keeps
-                        // every displayed word and continues seamlessly.
-                        mistakeResumeIndex = alignment.first
+                        // - RESUME AT THE MISTAKEN WORD, NOT AT THE FRONTIER -
+                        // The popup tells the user to re-read THIS word, so the
+                        // resume must re-seat the committed transcript just
+                        // BEFORE it. It used to seat at `alignment.first` (the
+                        // current display frontier, usually several words AHEAD
+                        // of the mistake because the acoustic verdict is
+                        // deferred): the re-read then failed the
+                        // count-filter's "already committed" rule, nothing was
+                        // displayed or re-scored, and the session looked dead -
+                        // the user: "when there is a mistake the user should
+                        // re read the mistaken word then complete, not just
+                        // stop displaying after many words and then the app
+                        // become never functioning". Seating at the mistake
+                        // word makes the re-read pass the filter, get
+                        // displayed, and get re-scored with a fresh timing key
+                        // (so a second failure re-popups), exactly like the
+                        // WRONG/SKIPPED flow.
+                        mistakeResumeIndex = tajweedError.wordIndex
+                        // Same as stopForMistake: a mistake PAUSES the session,
+                        // it does not end it (§4.45).
+                        recitationSessionActive = true
                         // Post-pause pipeline emissions are dead audio from
                         // BEFORE the stop; freeze them exactly like the
                         // WRONG/SKIPPED stop does (the gate above reads
@@ -5216,6 +5608,13 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         } else if (currentTab != "Memorize") {
             // User left Memorize -- clear any stale popup state so re-entering is clean.
             lastTajweedPopupIndex = -1
+            // §4.45 - a session that is only PAUSED (a mistake popup, or a pause
+            // waiting for its final decode) has no mic to stop, so the tab-change
+            // effect below never sees it. Leaving the tab still ends it: keep it
+            // "active" across the switch and the next mic tap on this tab would
+            // resume a session whose words belong to a surface the user left, and
+            // a plain tap would summarize a stale analysis instead of starting.
+            recitationSessionActive = false
             lastWrongStopIndex = -1
             lastWrongStopSightings = 0
             lastWrongStopFirstSeenMs = 0L
@@ -5303,6 +5702,10 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         // the committed prefix of the next session.
         mistakeResumeLiveText = (finalSpokenText + " " + partialSpokenText).trim()
         mistakeResumeIndex = wordIdx
+        // The session is PAUSED, not finished: the user re-reads from this word
+        // and carries on. Keeping the session active is what makes the mic FAB
+        // offer the re-read instead of a dead "start" (§4.45).
+        recitationSessionActive = true
         try { tajweedPipelineHolder.pipeline?.pause() } catch (_: Throwable) {}
         try { speechRecognizer?.stopListening() } catch (_: Throwable) {}
         isListening = false
@@ -5601,13 +6004,29 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         verifyBudgetSpentMs = sp
                     }
                     verifyJobRef.set(coroutineScope.launch {
-                        val verifiedWords = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                            try {
-                                tajweedPipelineHolder.pipeline?.verifyTailWords(spanSec) ?: emptyList()
-                            } catch (t: Throwable) {
-                                android.util.Log.w("ItqanSherpa", "mistakeStop(): verifyTailWords threw", t)
-                                emptyList<String>()
+                        // §4.45 - THE IN-FLIGHT MARKER MUST BE RELEASED ON EVERY
+                        // EXIT, INCLUDING CANCELLATION. It used to be cleared
+                        // inline after the budget bookkeeping, so a cancellation
+                        // in between (composition teardown, a range change draining
+                        // the effect) left the index latched and the launch gate
+                        // `mistakeWord != verifyInFlightIdx.get()` refused EVERY
+                        // future verification for that one word: the candidate
+                        // could never be proven, so no mistake popup ever fired
+                        // for it again and the cursor sat on it.
+                        var verifiedWords: List<String> = emptyList()
+                        try {
+                            verifiedWords = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                try {
+                                    tajweedPipelineHolder.pipeline?.verifyTailWords(spanSec) ?: emptyList()
+                                } catch (t: Throwable) {
+                                    android.util.Log.w("ItqanSherpa", "mistakeStop(): verifyTailWords threw", t)
+                                    emptyList<String>()
+                                }
                             }
+                        } catch (t: Throwable) {
+                            android.util.Log.w("ItqanSherpa", "mistakeStop(): verification cancelled", t)
+                        } finally {
+                            verifyInFlightIdx.set(-1)
                         }
                         // ── SETTLE THE BUDGET WITH THE REAL COST ─────────────
                         // Replace the nominal reservation with what the decode
@@ -5627,7 +6046,6 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                                     "(last decode ${realCost}ms, reserved ${ASSUMED_VERIFY_COST_MS}ms)"
                             )
                         }
-                        verifyInFlightIdx.set(-1)
                         // MATCH ON NORMALIZED FORMS. matcher.clean() returns the
                         // vocab's canonical DISPLAY words (fully diacritized), while
                         // detailedAnalysis.normalizedText is normalizeForComparison
@@ -6466,6 +6884,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             }
             try { speechRecognizer?.stopListening() } catch (e: Throwable) {}
             isListening = false
+            // A pause is NOT the end of the session: it stays resumable, and a
+            // resume must re-seat the transcript rather than wipe it (§4.45).
+            recitationSessionActive = true
             return
         }
         // First-launch gate: if the Sherpa model files aren't on disk yet,
@@ -6514,6 +6935,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             alignment = Pair(0, false)
             detailedAnalysis = emptyList()
             tajweedVerdictCache.clear()
+            tajweedFailCache.clear()
+            // A fresh recitation starts its display from scratch (§4.46).
+            displayCursorFloor = 0
             verifiedSpokenIndices.clear()
             hintedIndices.clear()
             mistakeResumeIndex = -1
@@ -6525,6 +6949,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             // fall through to the fresh-session path below (do NOT resume)
         } else if (pipelineNow != null && pipelineNow.paused) {
             isListening = true
+            recitationSessionActive = true
             // Restart the minimum-listen clock for the tajweed-popup auto-stop
             // guard (item 5c): the resume path must not inherit the ORIGINAL
             // session's start time, or the 2.5 s grace window would already be
@@ -6546,6 +6971,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         // Fresh session: drop cached tajweed verdicts (the capture buffer and
         // the timing clock both restart, so no cached verdict applies).
         tajweedVerdictCache.clear()
+            tajweedFailCache.clear()
         // Fresh session: reset the WRONG/SKIPPED auto-stop confirmation latch
         // (the resume fast-path above deliberately keeps it so a re-read
         // mistake re-stops quickly).
@@ -6594,10 +7020,57 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         // write happens after the recognizer is ready, and stop() flips it back
         // false without blocking main).
         isListening = true
+        recitationSessionActive = true
         val started = tajweedPipelineHolder.pipeline?.start() ?: false
         if (!started) {
-            isListening = false
-            errorMessage = "Microphone is unavailable on this device"
+            // - THE "MIC IS DEAD FOREVER" DEADLOCK (§4.45) -
+            // `start()` refuses while a previous teardown is still in flight
+            // (`isStopping`, cleared only at the END of the async stop() job).
+            // The old code turned that refusal straight into an error toast and
+            // gave up - so a single mistimed tap right after a mistake-stop or a
+            // range change wedged the mic for the rest of the process: every
+            // later tap failed the same way, the user could not resume their
+            // re-read, and the app looked permanently dead ("the app becomes
+            // never functioning").
+            //
+            // The teardown takes ~1-3 s, so this is a RACE, not a failure: wait
+            // it out off the main thread and retry. Only a genuinely missing
+            // microphone is reported to the user.
+            val stillStopping = tajweedPipelineHolder.pipeline?.isStoppingLog == true
+            if (stillStopping) {
+                android.util.Log.w(
+                    "ItqanSherpa",
+                    "startTajweedSession(): start() refused - teardown in flight; retrying (was " +
+                        "the 'mic is dead forever' deadlock)"
+                )
+                val holder = tajweedPipelineHolder
+                val scope = coroutineScope
+                val startedAtMs = System.currentTimeMillis()
+                scope.launch {
+                    var ok = false
+                    while (System.currentTimeMillis() - startedAtMs < 8000L) {
+                        kotlinx.coroutines.delay(250L)
+                        if (holder.pipeline?.isStoppingLog != true) {
+                            ok = holder.pipeline?.start() ?: false
+                            if (ok) break
+                        }
+                    }
+                    if (ok) {
+                        android.util.Log.i("ItqanSherpa", "startTajweedSession(): retry succeeded - mic is live again")
+                        isListening = true
+                        recitationSessionActive = true
+                    } else {
+                        android.util.Log.e("ItqanSherpa", "startTajweedSession(): retry gave up after 8s")
+                        isListening = false
+                        recitationSessionActive = false
+                        errorMessage = "Microphone is unavailable on this device"
+                    }
+                }
+            } else {
+                isListening = false
+                recitationSessionActive = false
+                errorMessage = "Microphone is unavailable on this device"
+            }
         }
     }
     // Publish the forward reference so the range-change auto-resume effect
@@ -6666,8 +7139,13 @@ val audio = if (tajweedPipelineHolder.running) {
     }
 
     LaunchedEffect(currentTab) {
-        if (isListening) {
+        if (isListening || recitationSessionActive) {
             isListening = false
+            // Leaving the tab tears the session down without a summary (there is
+            // no user-initiated stop), so the session is over (§4.45). This must
+            // cover the PAUSED case too (a mistake popup, a pause still waiting
+            // for its final decode), which has no mic to stop.
+            recitationSessionActive = false
             try {
                 speechRecognizer?.stopListening()
                 speechRecognizer?.cancel()
@@ -6686,8 +7164,12 @@ val audio = if (tajweedPipelineHolder.running) {
     DisposableEffect(lifecycleOwner, speechRecognizer) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
             if (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE || event == androidx.lifecycle.Lifecycle.Event.ON_STOP) {
-                if (isListening) {
+                if (isListening || recitationSessionActive) {
                     isListening = false
+                    // Backgrounded mid-recitation: the session is abandoned, not
+                    // paused, so it must not linger as resumable (§4.45). Covers
+                    // the paused-at-a-mistake case too, which has no mic to stop.
+                    recitationSessionActive = false
                     try {
                         speechRecognizer?.stopListening()
                         speechRecognizer?.cancel()
@@ -7068,9 +7550,49 @@ val audio = if (tajweedPipelineHolder.running) {
                         val liveWords = mistakeResumeLiveText.split(Regex("\\s+")).filter { it.isNotEmpty() }
                         mistakeResumeLiveText = ""
                         if (liveWords.isNotEmpty()) {
-                            val prefixWords = liveWords.take(resumeIdx.coerceIn(0, liveWords.size))
+                            // - CUT ON SPOKEN WORDS, NOT ON THE TARGET INDEX -
+                            // `resumeIdx` is an index into the TARGET; `liveWords` is
+                            // the list of words the DECODER produced. They are only
+                            // the same list when nothing was skipped or misheard
+                            // earlier in the session - and the re-seat exists
+                            // precisely for a session where something was. A skip at
+                            // target word 3 shifts every later target index one to
+                            // the right of its spoken counterpart, so
+                            // `take(resumeIdx)` cut one word too deep and the user
+                            // re-read from the WRONG place (or from past the word,
+                            // where the count-filter then swallowed the re-read and
+                            // the session looked dead: "the app becomes never
+                            // functioning").
+                            //
+                            // The honest count is how many spoken words the analysis
+                            // already consumed BEFORE the mistake: every row with a
+                            // lower word index that carries a spoken token. Falls
+                            // back to the target index when the rows carry no
+                            // evidence at all (very early stop).
+                            val spokenBefore = detailedAnalysis.count {
+                                it.wordIndex < resumeIdx && !it.spokenText.isNullOrEmpty()
+                            }
+                            val cut = when {
+                                spokenBefore > 0 -> spokenBefore
+                                else -> resumeIdx
+                            }
+                            val prefixWords = liveWords.take(cut.coerceIn(0, liveWords.size))
                             finalSpokenText = prefixWords.joinToString(" ")
                             lastCommittedWords = prefixWords
+                            android.util.Log.i(
+                                "ItqanSherpa",
+                                "collector(): re-seated the transcript for the re-read - " +
+                                    "${prefixWords.size}/${liveWords.size} spoken word(s) kept, " +
+                                    "the user continues at target word $resumeIdx " +
+                                    "(spokenBefore=$spokenBefore cut=$cut)"
+                            )
+                            // Re-arm the tajweed popup latch for the word the user is
+                            // about to re-read: this IS the "user acted on the
+                            // mistake" event, so if the same rule fails again the
+                            // popup must appear again (§4.45) instead of being
+                            // swallowed by the latch the dismissed dialog left.
+                            lastTajweedPopupIndex = -1
+                            lastTajweedPopupScore = -1
                         }
                     }
                 }
@@ -7400,11 +7922,25 @@ val wordsLength = words.size
                 // and only got a summary after tapping pause (pause drives the
                 // `ev.repaired` path above, which does set the flag).
                 // pause()'s synthetic endpoint is still excluded: it is empty.
-                if (ev.endpoint && ev.partial.isNotEmpty()) {
+                //
+                // §4.45 - OR the pipeline's explicit final-commit marker. The
+                // word-bearing test above cannot see the NORMAL end of a real-mic
+                // recitation: the last seconds are silence, so the final
+                // whole-session render comes back a subset of what the sliding
+                // windows already merged and the pipeline emits the marker with NO
+                // words (`finalDecodeAndEmit(): hold - no new words`, or `EMPTY`
+                // when the tail decodes to nothing at all). In that case
+                // `sessionFinalized` stayed false, the end-of-range auto-finalize
+                // never armed and the user finished the surah with nothing on
+                // screen - while an injected run, whose tail usually DOES produce a
+                // repair, showed the summary. The marker is the honest signal: the
+                // decoder is done, whatever it produced.
+                if (ev.finalCommit || (ev.endpoint && ev.partial.isNotEmpty())) {
                     android.util.Log.i(
                         "ItqanSherpa",
-                        "collector(): sessionFinalized <- endpoint " +
-                            "(${ev.partial.size}w raw / ${words.size}w new)"
+                        "collector(): sessionFinalized <- " +
+                            (if (ev.finalCommit) "final-commit marker" else "endpoint") +
+                            " (${ev.partial.size}w raw / ${words.size}w new)"
                     )
                     sessionFinalized = true
                 }
@@ -9280,6 +9816,32 @@ spokenTimings.clear()
                                         .filter { it.wordStartIndex < startIdx }
                                         .flatMap { it.words }
                                     finalSpokenText = prevWords.joinToString(" ")
+                                    // §4.46 - RE-SEAT THE COMMITTED SET AND THE WORD
+                                    // TIMINGS TOO, not just the display text.
+                                    //
+                                    // `filterMemorizeWords` strips one copy of every
+                                    // word it finds in `lastCommittedWords`, so
+                                    // leaving the repeated ayah's words committed
+                                    // made the re-read arrive as "already
+                                    // committed" and be dropped: the user recited
+                                    // the ayah again and NOTHING lit up.
+                                    // And the acoustic scorer cuts each word's audio
+                                    // from `spokenTimings[startIndex]`, which is
+                                    // matched positionally against the transcript -
+                                    // after a rewind the transcript is shorter, so
+                                    // stale indices would point the tajweed windows
+                                    // at the wrong audio and could accuse a word the
+                                    // user had already read correctly. Keep the
+                                    // prefix's timings, re-indexed, and let the
+                                    // re-read words append fresh ones.
+                                    lastCommittedWords = prevWords
+                                    committedWordCount = prevWords.size
+                                    val keepTimings = spokenTimings
+                                        .filter { it.startIndex < prevWords.size }
+                                        .mapIndexed { i, t -> t.copy(startIndex = i) }
+                                    spokenTimings.clear()
+                                    spokenTimings.addAll(keepTimings)
+                                    currentWordCount = prevWords.size
                                     partialSpokenText = ""
                                     // Re-reading the whole ayah is a deliberate
                                     // restart: swallow any pending mistake-resume.
@@ -9308,10 +9870,67 @@ spokenTimings.clear()
                                     val staleHints = hintedIndices.filter { it in hintRange }
                                     hintedIndices.removeAll(staleHints)
                                     hintActive = false
-                                    if (isListening) {
-                                        try { speechRecognizer?.stopListening(); isListening = false } catch (e: Throwable) {}
-                                        errorMessage = null
+                                    // §4.46 - REPEAT AYAH MUST ACTUALLY STOP THE
+                                    // MIC. It used to only call
+                                    // `speechRecognizer.stopListening()`, which
+                                    // is a NO-OP in Memorize+Tajweed: the Sherpa
+                                    // pipeline kept capturing, kept decoding and
+                                    // kept growing `finalSpokenText` while the UI
+                                    // said "stopped" - so the words the user had
+                                    // just decided to repeat were re-appended
+                                    // behind their back, and the next mic tap
+                                    // either paused (showing a summary) or
+                                    // resumed a transcript nobody had seen.
+                                    // The pipeline is PAUSED, not released, so
+                                    // the next tap is the fast resume path and
+                                    // the recitation continues from the rewound
+                                    // ayah exactly as the button promises.
+                                    if (isListening || tajweedPipelineHolder.running) {
+                                        stopTajweedSession()
+                                        // §4.47 — AND INVALIDATE **AFTER** THE PAUSE.
+                                        // `stopTajweedSession()` schedules the pause's
+                                        // whole-session final decode, which emits the
+                                        // "final commit" marker 2-5 s later. That marker
+                                        // is what sets `sessionFinalized` — so on a
+                                        // rewind it re-finalised the session the user had
+                                        // just abandoned: the next mic tap armed the
+                                        // end-of-range hold on a wiped transcript
+                                        // (a ~20 s freeze, then the tail decided and
+                                        // displayed at once). The `invalidateInFlightCommit()`
+                                        // above runs BEFORE the pause, so it bumped the
+                                        // generation the pause then captured and the
+                                        // decode sailed through. Bumping again here
+                                        // invalidates the decode the pause just queued,
+                                        // which is exactly what a rewind wants: no
+                                        // endpoint, no finalization.
+                                        try { tajweedPipelineHolder.pipeline?.invalidateInFlightCommit() } catch (_: Throwable) {}
                                     }
+                                    // The rewound session is still a session: the
+                                    // mic tap must continue it, not summarize it.
+                                    recitationSessionActive = true
+                                    userPauseFinalizePending = false
+                                    // Rewinding invalidates the session's own
+                                    // endpoint evidence: the words the user is
+                                    // about to re-read must earn their verdicts
+                                    // again.
+                                    sessionFinalized = false
+                                    endpointDecodeLandedAtMs = 0L
+                                    pipelineStoppedAtMs = 0L
+                                    autoFinalizeDone = false
+                                    graceExpiredOnce = false
+                                    gracePromoteCount = 0
+                                    mistakeHoldSinceMs = 0L
+                                    // A stale error must not pop over the ayah the
+                                    // user is deliberately re-reading.
+                                    latestTajweedPopup = null
+                                    lastTajweedPopupIndex = -1
+                                    lastTajweedPopupScore = -1
+                                    confirmedMistakeUiIdx = -1
+                                    // The acoustic verdicts were cut against the
+                                    // PREVIOUS attempt's audio and timing.
+                                    tajweedVerdictCache.clear()
+                                        tajweedFailCache.clear()
+                                    errorMessage = null
                                 }
                             }) {
                                 Icon(Icons.Default.RepeatOne, contentDescription = "Repeat Current Ayah", tint = MaterialTheme.colorScheme.secondary)
@@ -9379,10 +9998,65 @@ spokenTimings.clear()
                                 try { tajweedPipelineHolder.pipeline?.invalidateInFlightCommit() } catch (_: Throwable) {}
                                 while (analyzeRequests.tryReceive().isSuccess) { /* drain */ }
                                 while (tajweedRequests.tryReceive().isSuccess) { /* drain */ }
-                                if (isListening) {
-                                    try { speechRecognizer?.stopListening(); isListening = false } catch (e: Throwable) {}
-                                    errorMessage = null
+                                // §4.46 - RESTART MUST REALLY STOP THE MIC, AND
+                                // END THE SESSION. It only called
+                                // `speechRecognizer.stopListening()` (a no-op in
+                                // Tajweed mode), so the pipeline went on capturing
+                                // and appending words to a transcript the user had
+                                // just wiped, and the mic FAB - which tests
+                                // `running` - kept offering "pause" on a session
+                                // that no longer existed. Stop the pipeline (a
+                                // PAUSE, so the next tap is the fast resume) and
+                                // let the next mic tap start a clean run.
+                                if (isListening || tajweedPipelineHolder.running) {
+                                    stopTajweedSession()
+                                    // §4.47 — AND INVALIDATE **AFTER** THE PAUSE.
+                                    // `stopTajweedSession()` schedules the pause's
+                                    // whole-session final decode, and 2-5 s later it
+                                    // emits an endpoint (with words) plus the
+                                    // "final commit" marker. Both set
+                                    // `sessionFinalized`, so on a Restart they
+                                    // re-finalized the session the user had just
+                                    // thrown away: the next mic tap armed the
+                                    // end-of-range hold on an empty transcript — a
+                                    // ~20 s freeze followed by the tail being decided
+                                    // and displayed in one step. Measured `b3_buttons`:
+                                    // `invalidateInFlightCommit(): gen bumped -> 7`
+                                    // then `collector(): sessionFinalized <- endpoint
+                                    // (10w raw / 10w new)`. The invalidation above runs
+                                    // BEFORE the pause, so it bumped the generation the
+                                    // pause then captured; bumping again here kills the
+                                    // decode the pause just queued, which is exactly
+                                    // what a restart wants: no endpoint, no
+                                    // finalization, no freeze.
+                                    try { tajweedPipelineHolder.pipeline?.invalidateInFlightCommit() } catch (_: Throwable) {}
                                 }
+                                recitationSessionActive = false
+                                userPauseFinalizePending = false
+                                autoFinalizeDone = false
+                                graceExpiredOnce = false
+                                gracePromoteCount = 0
+                                mistakeHoldSinceMs = 0L
+                                latestTajweedPopup = null
+                                lastTajweedPopupIndex = -1
+                                lastTajweedPopupScore = -1
+                                confirmedMistakeUiIdx = -1
+                                lastWrongStopIndex = -1
+                                lastWrongStopSpokenText = ""
+                                lastWrongStopSightings = 0
+                                lastWrongStopFirstSeenMs = 0L
+                                spokenTimings.clear()
+                                currentWordCount = 0
+                                tajweedVerdictCache.clear()
+                                tajweedFailCache.clear()
+                                // Restart is the ONE explicit "start over": the
+                                // display floor is dropped with the transcript
+                                // (§4.46), so word 0 can be displayed again.
+                                displayCursorFloor = 0
+                                // Drop the just-finished summary so a fresh
+                                // recitation can raise its own.
+                                viewModel.dismissSessionSummary()
+                                errorMessage = null
                             }) {
                                 Icon(Icons.Default.Refresh, contentDescription = "Restart", tint = MaterialTheme.colorScheme.primary)
                             }
@@ -9421,6 +10095,14 @@ spokenTimings.clear()
                 
                 var lastScrolledAyahIndex by remember { mutableStateOf(-1) }
                 
+                // §4.46 - THE RENDERER'S ROW LOOKUP, O(1). One index built per
+                // analysis instead of a linear scan per drawn word (see
+                // [byWordIndex]). This is the change that makes the word
+                // highlight keep up on an old phone over a long range: the scan
+                // cost used to grow with the SIZE OF THE RANGE, so the longer
+                // the surah, the further behind the text fell.
+                val analysisByWordIndex = remember(detailedAnalysis) { detailedAnalysis.byWordIndex() }
+                
                 LaunchedEffect(viewModel.playingAyahId) {
                     if (viewModel.playingAyahId != null) {
                         val index = viewModel.ayahs.indexOfFirst { it.ayahId == viewModel.playingAyahId }
@@ -9433,12 +10115,26 @@ spokenTimings.clear()
                 
                 LaunchedEffect(matchedWordCount) {
                     hintActive = false
-                    val ayahIndex = viewModel.ayahs.indexOfFirst { ayah -> 
+                    val ayahIndex = viewModel.ayahs.indexOfFirst { ayah ->
                         matchedWordCount >= ayah.wordStartIndex && matchedWordCount < ayah.wordStartIndex + ayah.words.size
                     }
                     if (ayahIndex >= 0 && ayahIndex != lastScrolledAyahIndex) {
                         lastScrolledAyahIndex = ayahIndex
-                        listState.scrollToItem(ayahIndex)
+                        // §4.46 - DO NOT RE-SCROLL FOR A WORD THAT IS ALREADY ON
+                        // SCREEN. This effect fires on EVERY cursor advance (a few
+                        // times a second while reciting), and `scrollToItem` is a
+                        // synchronous jump: on a long ayah it drags the list back
+                        // to the item's top edge each time, so the text the user
+                        // is reading visibly bounces - the "the words are not
+                        // displayed smoothly" report on an old phone. Scrolling is
+                        // only needed when the target ayah has actually left the
+                        // viewport.
+                        val visible = listState.layoutInfo.visibleItemsInfo.any { it.index == ayahIndex }
+                        if (visible) {
+                            // keep the reader where they are; the word lights up in place
+                        } else {
+                            listState.scrollToItem(ayahIndex)
+                        }
                     }
                 }
                 
@@ -9486,7 +10182,7 @@ spokenTimings.clear()
                                             // styling (orange underline) even after we've advanced past
                                             // them -- the user never actually said them, and the mistake
                                             // counter already charged 1 wrong.
-                                            val isHintedWord = detailedAnalysis.forWordIndex(globalWordIndex)?.status == RecitationStatus.HINTED
+                                            val isHintedWord = analysisByWordIndex[globalWordIndex]?.status == RecitationStatus.HINTED
                                             if (isHintedWord) {
                                                 withStyle(style = SpanStyle(color = MaterialTheme.colorScheme.tertiary, fontWeight = FontWeight.Bold, textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline, background = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.3f))) {
                                                     if (wordTajweed != null) {
@@ -9522,9 +10218,9 @@ spokenTimings.clear()
                                             // its instant highlight. Tarteel: unchanged.
                                             (!isTajweed ||
                                                 globalWordIndex == confirmedMistakeUiIdx ||
-                                                detailedAnalysis.forWordIndex(globalWordIndex)?.status == RecitationStatus.TAJWEED_ERROR)
+                                                analysisByWordIndex[globalWordIndex]?.status == RecitationStatus.TAJWEED_ERROR)
                                         ) {
-                                            val currentAnalysis = detailedAnalysis.forWordIndex(globalWordIndex)
+                                            val currentAnalysis = analysisByWordIndex[globalWordIndex]
                                             val isTajweedError = isTajweed && currentAnalysis?.status == RecitationStatus.TAJWEED_ERROR
                                             val errorBg = if (isTajweedError) Color(0xFFFBC02D).copy(alpha = 0.3f) else MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
                                             val errorDecoration = androidx.compose.ui.text.style.TextDecoration.Underline
@@ -9650,13 +10346,36 @@ spokenTimings.clear()
             // range left `autoFinalizeDone` permanently true and the
             // end-of-range path never fired again for the rest of the session.
             val finalizeWithheld = remember { mutableStateOf(false) }
-            val runStopAndFinalize: (Boolean) -> Unit = finalize@ { userInitiatedStop ->
+            /**
+             * [userInitiatedStop] = the user asked to stop (the mic FAB), which
+             * per the contract ALWAYS ends in a summary.
+             * [forceDecision] = the caller has already waited as long as it is
+             * willing to for the final decode, so decide now even if the
+             * endpoint never landed (a user pause must not be able to hang).
+             */
+            val runStopAndFinalize: (Boolean, Boolean) -> Unit = finalize@ { userInitiatedStop, forceDecision ->
                     finalizeWithheld.value = false
                     if (speechRecognizer == null) {
                         errorMessage = "Speech recognition is not available on this device"
                         return@finalize
                     }
-                    if (isListening) {
+                    // - §4.45 THE SESSION, NOT THE MIC, OWNS THIS DECISION -
+                    // The whole body - the goal charge, the mistake entries and
+                    // the end-of-range summary - used to live inside
+                    // `if (isListening)`, and BOTH stop paths clear `isListening`
+                    // BEFORE anything decides anything: `stopTajweedSession()` on
+                    // a pause, `stopForMistake()` and the tajweed popup on a
+                    // mistake. So a pause fell straight through to the else
+                    // branch (the "start a session" path) and NEVER reached its
+                    // own summary - "in the pause there is no summury at all" -
+                    // while a post-mistake tap took that same branch by accident,
+                    // which is the only reason the re-read ever worked at all.
+                    //
+                    // `recitationSessionActive` is the honest question: is there a
+                    // recitation to decide? It survives a pause and a mistake
+                    // popup (both are resumable), and is cleared by the decision
+                    // below, by a range/surah change and by leaving the tab.
+                    if (recitationSessionActive || isListening) {
                         try {
                             // Tajweed mode: hand off the stop to the Sherpa
                             // pipeline-aware helper (which flushes the
@@ -9830,6 +10549,7 @@ spokenTimings.clear()
                                 android.util.Log.i(
                                     "ItqanSherpa",
                                     "endOfRange(): sessionFinalized=$sessionFinalized " +
+                                        "forceDecision=$forceDecision " +
                                         "pendingRemain=$pendingRemain newCompleted=$newCompletedCount " +
                                         "wrong=$currentWrong skipped=$currentSkipped tajweed=$currentTajweed " +
                                         "alreadyShowing=${viewModel.sessionSummaryToShow != null}"
@@ -9878,10 +10598,40 @@ spokenTimings.clear()
                                 // walk stalls, finalizeCorrect() forges the tail
                                 // CORRECT with no spoken evidence, so pendingRemain
                                 // reads false on a run that aligned 27 of 29.
-                                // `unheardWordCount() == 0` is the real test — every
-                                // word carries a spoken match.
-                                val genuinelyFinished = detailedAnalysis.unheardWordCount() == 0
-                                if (sessionFinalized && !pendingRemain &&
+                                //
+                                // §4.45 - and `unheardWordCount() == 0` was TOO
+                                // strict in the other direction: the trailing word
+                                // of a real-mic recitation is routinely the one the
+                                // decoder never renders (the last seconds are
+                                // silence, the RMS gate drops them and the final
+                                // whole-session render comes back a subset of the
+                                // sliding windows' merge), so that row is CORRECT
+                                // with no token, counted as unheard, and the
+                                // summary of a plainly FINISHED recitation was
+                                // withheld:
+                                //   endOfRange(): auto stop but NOT genuinely
+                                //   finished (unheard=1/29) -> no summary
+                                // The injection harness decoded that word and did
+                                // show a summary, which is exactly why the feature
+                                // looked broken only when tested by hand. The test
+                                // is COVERAGE now: nearly the whole range heard,
+                                // at most a couple of decoder blind spots, and the
+                                // DISPLAY already at the end of the range.
+                                val totalWordsNow = detailedAnalysis.distinctWordCount()
+                                val unheardNow = detailedAnalysis.unheardWordCount()
+                                val displayedNow = displayedCursorFor(detailedAnalysis, alignment.first)
+                                val genuinelyFinished = isGenuineFinish(
+                                    totalWords = totalWordsNow,
+                                    unheardWordCount = unheardNow,
+                                    displayedCursor = displayedNow,
+                                )
+                                // `pendingRemain` still vetoes the AUTO path (the
+                                // user may simply still be reading), but it must
+                                // never veto a USER PAUSE: they asked for the
+                                // breakdown, and a decoder gap is not a reason to
+                                // show them nothing.
+                                val pendingVeto = pendingRemain && !userInitiatedStop
+                                if ((sessionFinalized || forceDecision) && !pendingVeto &&
                                     viewModel.sessionSummaryToShow == null && !mistakeMustWin &&
                                     (userInitiatedStop || genuinelyFinished)
                                 ) {
@@ -9889,7 +10639,30 @@ spokenTimings.clear()
                                     // PENDING (un-scored) words left: mark the run as range-completed
                                     // so the next mic tap starts fresh instead of resuming the stale,
                                     // fully-recited transcript.
-                                    sessionRangeCompleted = true
+                                    //
+                                    // §4.45/§4.46 - BUT ONLY WHEN THE USER ACTUALLY RECITED
+                                    // THE RANGE, judged on HEARD evidence and never on the
+                                    // display cursor. The cursor is advanced on purpose over
+                                    // the tail the decoder never rendered (§4.40: those words
+                                    // must still be VISIBLE), so it reaches the end of the
+                                    // range even when the user stopped half-way through it -
+                                    // and `sessionRangeCompleted` is the flag that makes the
+                                    // next mic tap WIPE the transcript and start from word 1.
+                                    // Reading it off the cursor therefore destroyed a
+                                    // half-finished recitation: measured `s3_fatihah`, the
+                                    // session ended at word 16 of 29 (the recording's own
+                                    // silence), the promotions carried the cursor to 29/29,
+                                    // and the user's 16 words would have been thrown away on
+                                    // the next tap.
+                                    //
+                                    // A word the user really said carries a spoken token, so
+                                    // "the whole range was recited" is exactly "at most the
+                                    // decoder's own blind-spot tail is unaccounted for" -
+                                    // the same test [isGenuineFinish] applies.
+                                    val heardNow = totalWordsNow - unheardNow
+                                    val reachedEndOfRange = totalWordsNow > 0 &&
+                                        heardNow >= totalWordsNow - GENUINE_FINISH_MAX_UNHEARD
+                                    if (reachedEndOfRange) sessionRangeCompleted = true
                                     viewModel.sessionSummaryToShow = MainViewModel.SessionSummary(
                                         surahNumber = chargeSurah,
                                         rangeStart = chargeRangeStart,
@@ -9906,22 +10679,20 @@ spokenTimings.clear()
                                         "ItqanSherpa",
                                         "endOfRange(): summary raised " +
                                             "(userPause=$userInitiatedStop finished=$genuinelyFinished " +
-                                            "entries=${mistakeEntries.size} " +
-                                            "unheard=${detailedAnalysis.unheardWordCount()}/" +
-                                            "${detailedAnalysis.distinctWordCount()}) " +
+                                            "force=$forceDecision entries=${mistakeEntries.size} " +
+                                            "unheard=$unheardNow/$totalWordsNow) " +
                                             // §4.37 — THE DISPLAY PROOF. The transcript colours a word
                                             // iff `globalWordIndex < alignment.first`, and the rows are
                                             // complete (AnalyzerRowCompletenessTest), so `cursor >= total`
                                             // is exactly "every word of the range is rendered". A dump
                                             // cannot show colour; this number can, so log it on every
                                             // summary and check it against the harness verdict.
-                                            "cursor=${alignment.first}/" +
-                                            "${detailedAnalysis.distinctWordCount()} " +
-                                            (if (alignment.first >= detailedAnalysis.distinctWordCount())
+                                            "cursor=$displayedNow/$totalWordsNow " +
+                                            (if (displayedNow >= totalWordsNow)
                                                 "-> ALL WORDS DISPLAYED"
-                                            else "-> ${detailedAnalysis.distinctWordCount() - alignment.first} word(s) still grey")
+                                            else "-> ${totalWordsNow - displayedNow} word(s) still grey")
                                     )
-                                } else if (sessionFinalized && !pendingRemain && !mistakeMustWin &&
+                                } else if ((sessionFinalized || forceDecision) && !pendingRemain && !mistakeMustWin &&
                                     !userInitiatedStop && !genuinelyFinished
                                 ) {
                                     // Mid-range stall: the app stopped, no mistake
@@ -9936,7 +10707,7 @@ spokenTimings.clear()
                                             "words stay displayed " +
                                             "cursor=${alignment.first}/${detailedAnalysis.distinctWordCount()}"
                                     )
-                                } else if (sessionFinalized && pendingRemain) {
+                                } else if ((sessionFinalized || forceDecision) && pendingVeto) {
                                     // The range is NOT complete (words the decoder never heard
                                     // remain beyond finalizeCorrect()'s forgiveness window), so no
                                     // summary is raised — the user is most likely still reading.
@@ -9951,19 +10722,60 @@ spokenTimings.clear()
                                 }
                             }
                             
-                            // Safe Pause/Mistake handling: Trims spoken text down to only matched words so they can continue seamlessly.
-                            // GUARD: only trim when the analysis has actually matched
-                            // something. If the user tapped stop while the (slow, on-device)
-                            // analysis was still catching up, matchedWordCount is 0 even
-                            // though words WERE heard — trimming to take(0) would WIPE the
-                            // whole transcript and the final report would show nothing
-                            // (the exact "no words displayed" symptom). Leave the heard
-                            // transcript intact in that case.
+                            // Safe Pause/Mistake handling.
+                            //
+                            // §4.46 — RE-SEAT THE **COMMITTED** SET TO THE MATCHED
+                            // PREFIX, AND LEAVE THE DISPLAY TRANSCRIPT ALONE.
+                            //
+                            // The old code rewrote `finalSpokenText` to
+                            // `targetOrig.take(matchedWordCount)`, i.e. it threw
+                            // away every word the user had ACTUALLY recited past
+                            // the last match. On a pause that is usually a couple
+                            // of words, because the aligner is chasing a tentative
+                            // skip and has not caught up yet. Measured on device
+                            // (pause at 13 matched, 15 words heard, then resume):
+                            // the transcript was cut to 13 target words, the audio
+                            // for words 14-15 lived in the pre-pause segment and
+                            // was gone, and the post-resume audio therefore began
+                            // at target word 16 — so the aligner compared it
+                            // against target word 13, called it WRONG, and the
+                            // walk froze there:
+                            //   analyze(fast): cursor held at 25 (walk wanted 13)
+                            //   mistakeStop(): candidate row=13 ... ABSENT strike
+                            // The user had recited correctly and was accused, and
+                            // the recitation could not advance.
+                            //
+                            // So: the DISPLAY transcript keeps every word that was
+                            // heard (that is the evidence the aligner needs to place
+                            // the join), while the COMMITTED set becomes the matched
+                            // prefix — which is what makes the words recited after
+                            // the resume pass the count-filter instead of being
+                            // dropped as replay copies of themselves.
+                            //
+                            // GUARD: only when the analysis has matched something.
+                            // Tapping stop while the (slow, on-device) analysis is
+                            // still catching up leaves matchedWordCount at 0 even
+                            // though words WERE heard; re-seating to an empty
+                            // prefix there would let the whole recited prefix
+                            // through the filter a second time.
                             if (matchedWordCount > 0) {
                                 val matchedWordsList = targetOrig.take(matchedWordCount)
-                                finalSpokenText = matchedWordsList.joinToString(" ")
+                                lastCommittedWords = matchedWordsList
+                                committedWordCount = matchedWordsList.size
+                                android.util.Log.i(
+                                    "ItqanSherpa",
+                                    "finalizeTrim(): committed set re-seated to the " +
+                                        "${matchedWordsList.size} matched word(s); the display " +
+                                        "transcript KEEPS the words already heard so the join " +
+                                        "after a resume stays aligned"
+                                )
                             }
                             partialSpokenText = ""
+                            // §4.45 - THE SESSION HAS BEEN DECIDED. Whatever happened above
+                            // (summary raised, mistake kept for the popup, or nothing to show
+                            // yet), the mic tap must now mean "start", not "pause" - this is
+                            // what un-blocks the FAB after a mistake popup as well.
+                            recitationSessionActive = false
                             // User-initiated stop ends the recitation: the next
                             // session starts from scratch, not from a stale
                             // mistake prefix.
@@ -9984,6 +10796,11 @@ spokenTimings.clear()
                             // means no per-word tajweed verdict but recitation-tracking still works.
                         } catch (e: Throwable) {
                             errorMessage = "Error stopping recognition"
+                            // §4.45 - a failed stop must not leave the session
+                            // "active": the mic FAB would keep offering to pause a
+                            // session that is already over, and the next tap would
+                            // re-enter this same body instead of starting fresh.
+                            recitationSessionActive = false
                         }
                     } else {
                         errorMessage = null
@@ -10055,8 +10872,122 @@ spokenTimings.clear()
                         }
                     }
             }
+            // - DEFERRED USER-PAUSE FINALIZE (see [userPauseFinalizePending]) -
+            // The pause tap stops the mic immediately, but in a Tajweed pipeline
+            // session the FINAL decode lands ~5 s later and it is the endpoint
+            // that sets `sessionFinalized`. Deciding the summary at tap time
+            // therefore read sessionFinalized=false and skipped EVERY branch
+            // (no summary on pause - the user's report). Wait for the endpoint
+            // (bounded, so a dead decode can never wedge the flow) and then run
+            // the real user-initiated finalize exactly once.
+            LaunchedEffect(userPauseFinalizePending) {
+                if (!userPauseFinalizePending) return@LaunchedEffect
+                // §4.45 - A SESSION THAT PRODUCED NOTHING GETS NO WAIT. The
+                // common way to land here with an empty transcript is tapping
+                // stop while the 296 MB recognizer is still loading: there is no
+                // final decode coming, so the 20 s deadline used to expire on
+                // nothing at all and the tap felt dead.
+                val heardNothing = finalSpokenText.isBlank() && partialSpokenText.isBlank() &&
+                    detailedAnalysis.isEmpty()
+                if (heardNothing) {
+                    userPauseFinalizePending = false
+                    recitationSessionActive = false
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "userPauseFinalize(): nothing was heard in this session -> no wait, no summary"
+                    )
+                    return@LaunchedEffect
+                }
+                val deadline = System.currentTimeMillis() + 20000L
+                while (!sessionFinalized && System.currentTimeMillis() < deadline) {
+                    kotlinx.coroutines.delay(200L)
+                }
+                userPauseFinalizePending = false
+                // §4.45 - A PAUSE MUST ALWAYS PRODUCE THE SUMMARY. The user
+                // explicitly asked for it, so the wait for the final decode is
+                // bounded and then we decide ANYWAY: `force = true` lets the
+                // gate pass without `sessionFinalized`. Before this, a pause
+                // whose endpoint never landed sat here for 20 s and then fell
+                // out of the `sessionFinalized` guard with no popup at all -
+                // "in the pause there is no summury at all".
+                val forced = !sessionFinalized
+                android.util.Log.i(
+                    "ItqanSherpa",
+                    "userPauseFinalize(): endpoint landed=$sessionFinalized forced=$forced -> " +
+                        "running the user-initiated finalize now (a pause ALWAYS summarizes)"
+                )
+                runStopAndFinalize(true, forced)
+            }
+            /**
+             * THE MIC FAB (§4.45). Three distinct intents, and conflating them
+             * is what made the post-mistake state unusable:
+             *  1. a live session  -> the user wants to stop: pause the mic NOW
+             *     (instant feedback) and decide the summary once the final
+             *     decode lands;
+             *  2. a mistake popup is up / was just dismissed -> the user wants to
+             *     RE-READ the flagged word: resume the warm pipeline, keeping
+             *     the transcript so the re-read continues from that word;
+             *  3. nothing running -> start (fresh or resume, decided inside
+             *     [startTajweedSession]).
+             *
+             * It used to be `if (running) pause else runStopAndFinalize(true)`,
+             * and `runStopAndFinalize` decided between "stop" and "start" by
+             * reading `isListening` - which a mistake stop has already cleared.
+             * So intent 2 was served by accident, through the "start" branch, and
+             * any change to that branch silently killed the re-read.
+             */
+            fun onMicTap() {
+                // Tarteel (SpeechRecognizer) has no pipeline to pause and no
+                // resume latch, so it keeps the original single synchronous
+                // finalize for both directions of the button.
+                if (recitationMode != "Tajweed") {
+                    runStopAndFinalize(true, false)
+                    return
+                }
+                when {
+                    // 1. LIVE SESSION -> pause the mic NOW (instant feedback) and
+                    //    decide the summary once the final decode lands.
+                    isListening || tajweedPipelineHolder.running -> {
+                        stopTajweedSession()
+                        recitationSessionActive = true
+                        userPauseFinalizePending = true
+                    }
+                    // 2. A SESSION IS PAUSED AND STILL RESUMABLE -> continue it.
+                    //    Three ways to land here, and all of them mean "pick up
+                    //    where the recitation is", never "start over":
+                    //      - a mistake popup was dismissed: re-read that word,
+                    //      - the user tapped Repeat Ayah: the transcript was
+                    //        rewound to the start of the current ayah,
+                    //      - Restart left the pipeline warm.
+                    //    `startTajweedSession` decides between resuming the warm
+                    //    stream and starting fresh, and the collector re-seats
+                    //    the transcript at the mistake when the latch is armed.
+                    recitationSessionActive -> {
+                        android.util.Log.i(
+                            "ItqanSherpa",
+                            "onMicTap(): resuming the paused session (mistake latch=" +
+                                "${if (mistakeResumeIndex >= 0) "armed@$mistakeResumeIndex" else "none"})"
+                        )
+                        // The popup is the app's surface for a mistake; tapping
+                        // the mic is the user acting on it, so clear it here.
+                        latestTajweedPopup = null
+                        // A pending pause-decision must NOT fire into the resumed
+                        // session: the endpoint it waits for belongs to the segment
+                        // just closed, and it would pop a summary on top of a live
+                        // recitation.
+                        userPauseFinalizePending = false
+                        startTajweedSession()
+                        if (isListening) viewModel.preloadTajweedModel()
+                    }
+                    // 3. NOTHING RUNNING -> start a session.
+                    else -> runStopAndFinalize(true, false)
+                }
+            }
             FloatingActionButton(
-                onClick = { runStopAndFinalize(true) },
+                onClick = { onMicTap() },
+                // Keyed on the MIC, not on the session: after a mistake popup (or
+                // a pause) the button must read as "record / re-read", never as a
+                // second "stop" that would promise an end the user did not ask for.
                 containerColor = if (isListening) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                 contentColor = if (isListening) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.background,
                 shape = CircleShape,
@@ -10366,7 +11297,59 @@ spokenTimings.clear()
                         val heard = detailedAnalysis.count {
                             it.status == RecitationStatus.PENDING && !it.spokenText.isNullOrEmpty()
                         }
-                        detailedAnalysis = detailedAnalysis.promoteUnresolvedPendingRows()
+                        // §4.47 - PROMOTE ONLY THE TAIL THE USER PLAUSIBLY REACHED.
+                        //
+                        // This branch exists so the words the decoder never
+                        // rendered, but the user DID read, stay visible (§4.40).
+                        // It promoted EVERY PENDING row, so a session that ended
+                        // early (an auto-stop on the recording's own silence, a
+                        // Restart the user had just tapped) decided and DISPLAYED
+                        // the whole remaining range in one step - the report was
+                        // "it froze, and then all the words appeared at once until
+                        // the end of the ayah range", and on screen a fully recited
+                        // range is indistinguishable from words nobody read.
+                        //
+                        // The bound is the same shape `finalizeCorrect()` uses: the
+                        // last word that carries spoken evidence, plus a small
+                        // window for the clipped tail. Beyond that the user simply
+                        // has not got there yet, so those rows stay PENDING (grey,
+                        // and still counted as unheard, which correctly withholds a
+                        // "you finished" summary).
+                        val heardFrontier = detailedAnalysis
+                            .filter { !it.spokenText.isNullOrEmpty() }
+                            .maxOfOrNull { it.wordIndex + 1 } ?: 0
+                        // NO heard evidence AT ALL => no frontier => no forgiveness.
+                        // A session where nothing was recognised must not display the
+                        // first words of the range just because the window starts at 0.
+                        val promotableIdx = if (heardFrontier <= 0) {
+                            emptySet()
+                        } else {
+                            val promotionLimit = heardFrontier + FINALIZE_FORGIVE_TAIL_WINDOW
+                            unresolvedIdx.filter { it < promotionLimit }.toSet()
+                        }
+                        val beyondReach = unresolvedIdx - promotableIdx
+                        if (beyondReach.isNotEmpty()) {
+                            android.util.Log.i(
+                                "ItqanSherpa",
+                                "autoFinalize(): ${beyondReach.size} unresolved word(s) " +
+                                    "$beyondReach are beyond the heard frontier ($heardFrontier " +
+                                    "words) + $FINALIZE_FORGIVE_TAIL_WINDOW -> NOT promoted, they " +
+                                    "stay undisplayed (the user has not read them)"
+                            )
+                        }
+                        // Stamp CORRECT and leave `spokenText` alone — exactly what
+                        // finalizeCorrect() does: a row that carries a fragment was
+                        // clipped, not unheard; a row without one is a decided word
+                        // that is deliberately NOT evidence, and `unheardWordCount()`
+                        // keeps counting it, so a recitation we could not judge can
+                        // never produce a "you finished" summary.
+                        detailedAnalysis = detailedAnalysis.map { row ->
+                            if (row.status == RecitationStatus.PENDING &&
+                                row.wordIndex in promotableIdx
+                            ) {
+                                row.copy(status = RecitationStatus.CORRECT)
+                            } else row
+                        }
                         // §4.40 — the promotion decides the rows, but the
                         // renderer colours by the CURSOR, so the words this
                         // branch exists to DISPLAY would stay grey. Advance the
@@ -10379,20 +11362,32 @@ spokenTimings.clear()
                             android.util.Log.i(
                                 "ItqanSherpa",
                                 "autoFinalize(): cursor advanced ${alignment.first} -> " +
-                                    "$coveredAfterPromote so the ${unresolvedIdx.size} promoted " +
+                                    "$coveredAfterPromote so the ${promotableIdx.size} promoted " +
                                     "word(s) actually DISPLAY (§4.40 REACHED => DISPLAYED)"
                             )
                             alignment = Pair(coveredAfterPromote, alignment.second)
                         }
-                        gracePromoteCount++
-                        android.util.Log.i(
-                            "ItqanSherpa",
-                            "autoFinalize(): grace expired with ${unresolvedIdx.size} unresolved " +
-                                "word(s) $unresolvedIdx and NO evidenced mistake -> promoted to " +
-                                "CORRECT so they DISPLAY ($heard of them carry a spoken fragment, so " +
-                                "they still count as heard; the rest stay 'unheard' and block a " +
-                                "summary) [promotion #$gracePromoteCount]"
-                        )
+                        if (promotableIdx.isEmpty()) {
+                            android.util.Log.i(
+                                "ItqanSherpa",
+                                "autoFinalize(): grace expired with ${unresolvedIdx.size} unresolved " +
+                                    "word(s) $unresolvedIdx and NO evidenced mistake -> NOTHING was " +
+                                    "within reach of the heard frontier ($heardFrontier words), so " +
+                                    "no word was promoted and the recitation simply stops where the " +
+                                    "user left it [promotion #$gracePromoteCount]"
+                            )
+                        } else {
+                            gracePromoteCount++
+                            android.util.Log.i(
+                                "ItqanSherpa",
+                                "autoFinalize(): grace expired with ${unresolvedIdx.size} unresolved " +
+                                    "word(s) $unresolvedIdx and NO evidenced mistake -> promoted the " +
+                                    "${promotableIdx.size} within reach of the heard frontier to " +
+                                    "CORRECT so they DISPLAY ($heard of them carry a spoken fragment, " +
+                                    "so they still count as heard; the rest stay 'unheard' and block " +
+                                    "a summary) [promotion #$gracePromoteCount]"
+                            )
+                        }
                         // ONE promotion pass is enough for the UI to repaint, so return
                         // and let the next evaluation see a clean list and finalize. If a
                         // later analysis rebuild RESURRECTS the rows, promote again — but
@@ -10409,8 +11404,10 @@ spokenTimings.clear()
                         "(unheard=$unheard mistake=$mistakeOutstanding) -- running the finalize path"
                 )
                 // false = NOT a user pause: the range ended by itself, so an
-                // unresolved mistake must win over the summary.
-                runStopAndFinalize(false)
+                // unresolved mistake must win over the summary. false = do NOT
+                // force: this path only runs once the endpoint landed, and
+                // forcing would let a mid-range stall summarize itself.
+                runStopAndFinalize(false, false)
                 // RE-ARM WHEN NOTHING WAS SHOWN. If the range turned out to be
                 // incomplete (unheard words beyond the forgiveness window), no
                 // summary was raised and no mistake popup fired — the app
