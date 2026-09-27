@@ -74,6 +74,17 @@ private const val TAG = "ItqanSherpa"
 /** Asset subfolder + model files (sizes = exact bytes of the exported files). */
 private const val ASSET_SUBDIR = "quran_stt"
 
+/**
+ * §4.49 — How many session WAV dumps `filesDir/sherpa_debug/` may keep.
+ *
+ * The dumps are pure debug tooling (the PC harness decodes them offline), and
+ * they were written on every stop() and pause() with nothing ever deleting them:
+ * 227 files / 277 MB measured on the user's device, growing ~1.4 MB per
+ * recitation. Six is plenty to debug the last few runs and caps the directory at
+ * ~10 MB instead of unbounded.
+ */
+private const val SHERPA_DEBUG_KEEP = 6
+
 private data class ModelFile(val name: String, val size: Long)
 
 private val MODEL_FILES = listOf(
@@ -1320,12 +1331,50 @@ class SingleAudioPipeline(
     }
 
     /**
-     * Writes the given PCM as a 16-bit mono 16 kHz WAV under filesDir/sherpa_debug/ for offline analysis (debug tooling — lets the PC-side sherpa/whisper decode EXACTLY what the device heard). */
+     * Writes the given PCM as a 16-bit mono 16 kHz WAV under filesDir/sherpa_debug/ for offline analysis (debug tooling — lets the PC-side sherpa/whisper decode EXACTLY what the device heard).
+     *
+     * §4.49 — AND THE DIRECTORY IS NOW BOUNDED. Measured on the user's device
+     * after a few days of real use: `files/sherpa_debug` held **227 wav files,
+     * 277 MB** — already larger than the 170 MB STT model — because every
+     * stop() and pause() dumps the whole session and nothing ever deleted them.
+     * A daily reader would fill the device and start failing writes with
+     * ENOSPC (which is what a "storage problem" looks like from inside the app:
+     * the tajweed buffer stops being written and the scoring silently goes
+     * quiet). Only the newest [SHERPA_DEBUG_KEEP] dumps are of any use to the
+     * PC-side tooling, so the rest are pruned on every write. The write itself
+     * is also skipped entirely once the directory is already over budget, so a
+     * failing disk cannot cost 1.4 MB of I/O on the stop path (which is the
+     * path the user is waiting on).
+     */
     private fun writeDebugWav(samples: FloatArray, prefix: String) {
         try {
             val dir = File(context.filesDir, "sherpa_debug")
             if (!dir.exists()) dir.mkdirs()
             val file = File(dir, "${prefix}_${System.currentTimeMillis()}.wav")
+            // Prune BEFORE writing: with the newest KEEP-1 already in place the
+            // directory is guaranteed to stay under budget.
+            val existing: List<java.io.File> =
+                (dir.listFiles()?.filter { it.isFile } ?: emptyList<java.io.File>())
+                    .sortedBy { it.lastModified() }
+            val keep = SHERPA_DEBUG_KEEP - 1
+            // `coerceAtLeast(0)` is load-bearing: on the very first dump the
+            // directory is EMPTY, so `existing.size - keep` is negative and
+            // `take(-n)` throws IllegalArgumentException — which the catch below
+            // would swallow, silently never writing the dump at all (the PC
+            // harness decodes these files). Caught by the retention unit test.
+            val doomed = existing.take((existing.size - keep).coerceAtLeast(0))
+            var freed = 0L
+            for (d in doomed) {
+                val len = d.length()
+                if (d.delete()) freed += len
+            }
+            if (doomed.isNotEmpty()) {
+                Log.i(
+                    TAG,
+                    "wav dump prune: removed ${doomed.size} old file(s), freed ${freed / 1024} KB " +
+                        "(keeping the newest $keep)"
+                )
+            }
             val data = ByteArray(samples.size * 2)
             for (i in samples.indices) {
                 val v = (samples[i] * 32767f).toInt().coerceIn(-32768, 32767)
