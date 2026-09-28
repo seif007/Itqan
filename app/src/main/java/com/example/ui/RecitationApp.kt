@@ -3972,21 +3972,39 @@ suspend fun analyzeRecitationDetails(
                 // wrong word — never mixed with a score-less tajweed tag.
                 tajweedRule = null
             ))
-            // A confirmed WRONG word ends the verification walk: the user
-            // asked that the app STOP at the mistake instead of counting the
-            // remaining words as right and moving on. Everything after the
-            // wrong word stays PENDING -- neither marked correct nor flagged.
-            for (k in targetIndex + 1 until limit) {
-                result.add(WordAnalysis(
-                    wordIndex = k,
-                    text = targetWordsOriginal[k],
-                    normalizedText = targetWordsNormalized[k],
-                    status = RecitationStatus.PENDING,
-                    spokenText = null,
-                    tajweedRule = null
-                ))
-            }
-            return result
+            // §4.51 — AND THE WALK CONTINUES. IT USED TO END HERE, filling every
+            // remaining word of the range with a fragment-less PENDING row and
+            // returning.
+            //
+            // That is what froze the user's real-mic Al-Baqarah session on its
+            // SECOND word. One conflicting token at word 1 — a CANDIDATE the
+            // confirm loop never verified, which the app itself conceded at the
+            // end (`finalize(): forgiving 1 UNPROVEN mistake(s) [1] — no tail
+            // decode ever came back without them (absentAnchor=-1 strikes=0)`) —
+            // deleted the evidence for the whole recitation:
+            //   decodeWindow(): done ... new=3 w emitted=31w    (still hearing him)
+            //   analyze(fast): cursor held at 2 (walk wanted 1, heardThrough=2,
+            //   armed=false, floor=2)                          ...to the end
+            //   endOfRange(): summary raised (... cursor=2/6116 -> 6114 word(s)
+            //   still grey)
+            // With no CORRECT row past word 1 there was nothing for the display
+            // cursor to advance over, so the reveal was pinned there for the
+            // whole session no matter what the walk did: "it got stuck in
+            // baqarah".
+            //
+            // The SKIPPED branch has always continued, and it is right: a
+            // candidate is judged by `mistakeStop`, which needs TWO emissions
+            // plus a whole-session tail decode that came back without the word
+            // before it pauses and pops up. Until then the display must track the
+            // voice. Marking the word and stepping over keeps the word DECIDED
+            // (it keeps its red styling and its place in the summary), keeps the
+            // following words aligned, and leaves the stop entirely to the
+            // confirm loop — which is the contract the user asked for ("if we get
+            // a mistake we re-read from the mistake").
+            consumedNorms.add(targetWordNorm)
+            spokenIndex++
+            targetIndex++
+            continue
         }
         spokenIndex++
         targetIndex++
@@ -5414,11 +5432,44 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // would otherwise silently let the user babble ahead.
                 for (word in effective) {
                     if (word.status == RecitationStatus.WRONG) {
-                        // A WRONG word means the recognizer emitted a CONFLICTING token
-                        // for this exact slot — the strongest mistake signal there is.
-                        // It still freezes the reveal (and the confirm loop judges it).
-                        newHasError = true
-                        break
+                        // §4.51 — A TENTATIVE WRONG RIDES OVER, EXACTLY LIKE A
+                        // TENTATIVE SKIPPED. It USED TO FREEZE THE REVEAL
+                        // UNCONDITIONALLY, and that froze the user's real-mic
+                        // Al-Baqarah session on its SECOND word:
+                        //   decodeWindow(): done ... new=3 w emitted=31w   (the user
+                        //   is reading on; the recognizer hears 31, 35, 47 words)
+                        //   analyze(fast): cursor held at 2 (walk wanted 1,
+                        //   heardThrough=2, armed=false, floor=2)      …repeats to
+                        //   the end of the session…
+                        //   endOfRange(): summary raised (... cursor=2/6116 ->
+                        //   6114 word(s) still grey)
+                        // i.e. the display sat on 2 of 6116 words for the whole
+                        // recitation — "it got stuck in baqarah". The candidate was
+                        // never even verified: `finalize(): forgiving 1 UNPROVEN
+                        // mistake(s) [1] — no tail decode ever came back without
+                        // them (absentAnchor=-1 strikes=0)`, so the app itself
+                        // concluded at the end that it had NO evidence. A freeze
+                        // that the confirm loop never owns is a dead end: the row
+                        // flickers, `mistakeStop` keeps restarting the episode, and
+                        // nothing can ever clear it.
+                        //
+                        // The contract is unchanged for a REAL mistake: this is the
+                        // same pre-confirmation ride-over the SKIPPED branch below
+                        // has always used. The confirm loop still judges the word
+                        // in the background; if a whole-session tail decode comes
+                        // back without it, `stopForMistake` arms
+                        // `mistakeResumeIndex`, `armedMistake` flips true and the
+                        // NEXT pass freezes and returns to the mistake word with the
+                        // popup. Only the UNPROVEN freeze is gone.
+                        if (!sessionFinalized && !armedMistake) {
+                            newHasError = true
+                            rodeOverTentativeSkip = true
+                            if (seenIdx.add(word.wordIndex)) newMatchedWordCount++
+                        } else {
+                            newHasError = true
+                            break
+                        }
+                        continue
                     }
                     if (word.status == RecitationStatus.SKIPPED) {
                         if (!sessionFinalized && !armedMistake) {
@@ -5541,9 +5592,15 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     )
                 }
                 if (rodeOverTentativeSkip) {
+                    // §4.51 — the same ride-over now covers a tentative WRONG, so
+                    // the line names both: a reader comparing it with the row list
+                    // must not conclude that a SKIPPED was involved when it was a
+                    // conflicting token (the Al-Baqarah freeze was a WRONG).
                     android.util.Log.i(
                         "ItqanSherpa",
-                        "analyze(fast): SMOOTH-REVEAL rode over tentative SKIPPED -> reveal cursor=$resolvedCursor (walk kept verifying in background)"
+                        "analyze(fast): SMOOTH-REVEAL rode over a tentative WRONG/SKIPPED -> " +
+                            "reveal cursor=$resolvedCursor (the confirm loop still judges it in the " +
+                            "background; a CONFIRMED mistake freezes and returns here)"
                     )
                 }
                 // Carry over any tajweed verdict the deferred acoustic loop already
