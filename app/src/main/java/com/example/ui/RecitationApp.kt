@@ -1751,8 +1751,26 @@ fun resolveTranscriptCursor(
      * passes the real latch.
      */
     confirmedMistakeArmed: Boolean = true,
+    /**
+     * §4.52 — WHICH word the cursor parks on while the latch is armed.
+     *
+     * This used to be implicit: the walk `break`s on the first WRONG/SKIPPED, so
+     * `newMatchedWordCount` happened to BE the mistake index whenever the latch
+     * was armed. §4.51 gave the walk a ride-over for a *tentative* error, so it
+     * no longer stops there — and the return to the mistake silently stopped
+     * happening. The user's report: the popup named the word and the mic stopped,
+     * but the display stayed where it was until the mic came back on ("i want the
+     * display of words to get back to the mistaken word when the popup is showed
+     * to the user and the mic is stopped, so he could know from where to recite
+     * again").
+     *
+     * So the position is stated explicitly instead of being inferred from where
+     * the walk happened to stop.
+     */
+    mistakeIndex: Int = -1,
 ): Int =
-    if (finalized && !hasError) maxOf(newMatchedWordCount, previousCursor)
+    if (confirmedMistakeArmed && mistakeIndex >= 0) mistakeIndex
+    else if (finalized && !hasError) maxOf(newMatchedWordCount, previousCursor)
     else if (!finalized && hasError && !confirmedMistakeArmed)
         // SMOOTH REVEAL (live session, no CONFIRMED mistake armed). `hasError`
         // here is a TENTATIVE verdict: the aligner broke at a word it cannot yet
@@ -1810,6 +1828,80 @@ const val FINALIZE_FORGIVE_TAIL_WINDOW = 8
  * progress (a newly decided word, or one word ceasing to be unheard).
  */
 const val STALL_SUMMARY_AFTER_MS = 20000L
+
+/**
+ * §4.54 — how far the walk may fall behind the display floor before the floor
+ * gives way.
+ *
+ * The floor exists so a word does not blink grey while a verdict settles
+ * (§4.46). It was implemented as "never go backwards", which also made every
+ * LARGE re-alignment permanent: after a pause the aligner re-runs and can come
+ * back with a completely different position, and the display would then stay tens
+ * of words ahead of the reader for the rest of the session ("display of words is
+ * far away from what i am reading").
+ *
+ * Three words is comfortably more than the aligner's own jitter between two
+ * consecutive passes on the same transcript (measured 1-2 words), and small
+ * enough that a genuine re-alignment is followed immediately.
+ */
+const val DISPLAY_FLOOR_SLACK = 3
+
+/**
+ * §4.55 — how close another failing word must be for a verdict to count as part
+ * of a RUN rather than an isolated mistake.
+ *
+ * A tajweed mistake is a property of ONE word. When a neighbour fails too, the
+ * likeliest explanation is not the reader but the scorer: Ikhfa, Idgham and Meem
+ * Sakinah are CROSS-WORD rules whose cue lives at the boundary between two words,
+ * so a boundary that is off by a few hundred milliseconds fails every word it
+ * touches, all of them, at once.
+ *
+ * Measured on the user's real-mic Al-Baqarah run: nine accusations, and **all
+ * nine** had another failing word within two positions (100%), all in a 31-point
+ * band just under the threshold. He was reciting correctly and was told nine times
+ * that he was not. Two words of slack is wider than any real pair of consecutive
+ * mispronunciations of the same kind, and narrow enough to catch a boundary that
+ * has drifted.
+ */
+const val TAJWEED_ISOLATION_SLACK = 2
+
+/**
+ * §4.56 — how many words ONE acoustic pass may score.
+ *
+ * The pass is a model evaluation per word per rule, and it runs on the deferred
+ * loop, so its cost is linear in the backlog it is handed. Unbounded, a long
+ * session produced `analyze(tajweed): done 133417ms scored=37` on the user's
+ * Galaxy A04s — two minutes twenty during which the app did nothing else,
+ * followed by every accumulated verdict landing at once.
+ *
+ * Six words is roughly 11 s on the A04s and 5 s on the A05s — long enough to be
+ * useful work, short enough that the app never feels stopped. The rest of the
+ * backlog is carried to the next pass: every emission re-requests the analysis and
+ * the walk scores in reading order, so the verdicts that arrive first are for what
+ * the reader has just said.
+ */
+const val TAJWEED_WORDS_PER_PASS = 6
+
+/**
+ * §4.67 — how long the display may ride over ONE unproven error before the walk
+ * stops and the mistake is raised.
+ *
+ * The ride-over exists so a single transient candidate cannot freeze a whole
+ * recitation — measured on the user's Al-Baqarah run, one unverified conflict at
+ * word 1 pinned the display on 2 of 6116 words for the entire session. But it must
+ * be a grace period, not a redefinition of the verdict: the user's report was
+ * "for tajweed mode at the end i kept saying random words and instead of getting a
+ * popup of wrong word the app continued displaying words".
+ *
+ * Eight seconds is comfortably longer than the confirm loop needs on a healthy word
+ * (it launches its verification on the second sighting and the tail decode lands in
+ * 1.5-4 s), and short enough that a real mistake surfaces while the reader is still
+ * on that word — which is the whole point: he has to be told BEFORE he reads on.
+ */
+const val RIDE_OVER_BUDGET_MS = 8000L
+
+
+
 
 /**
  * §4.45 — DID THE USER ACTUALLY FINISH THE RANGE?
@@ -3177,8 +3269,32 @@ suspend fun analyzeRecitationDetails(
      * detection. The expensive acoustic pass runs separately, deferred ~2 s,
      * on the slow analysis loop (user-accepted latency for tajweed verdicts).
      */
-    scoreTajweed: Boolean = true
+    scoreTajweed: Boolean = true,
+    /**
+     * §4.56 — HOW MANY WORDS ONE ACOUSTIC PASS MAY SCORE.
+     *
+     * The pass used to score EVERY rule-bearing word it was handed, in one go. On
+     * a long session that is unbounded work: measured on the user's Galaxy A04s,
+     * one pass reported
+     *   analyze(tajweed): done 133417ms scored=37 tajweedErrors=9
+     * — **two minutes twenty** of the app scoring, and then nine accusations
+     * landing at once. Nothing else moves while it runs, so the app looks dead
+     * (the user's words: "make sure the app dont freeze like that again
+     * (2 min!)").
+     *
+     * A word costs one model evaluation per rule it carries (~1.8 s on the A05s,
+     * ~3.6 s on the A04s), so the cost is linear in the backlog. Bounding the
+     * backlog per pass spreads the same total work over the passes that follow —
+     * every emission re-requests the analysis, and a word left unscored simply
+     * stays text-only for now and is picked up next time. The walk hands the
+     * words over in reading order, so the ones the reader has just reached are
+     * scored first, which is what makes a verdict timely.
+     *
+     * `Int.MAX_VALUE` leaves every other caller unchanged.
+     */
+    tajweedScoreLimit: Int = Int.MAX_VALUE
 ): List<WordAnalysis> {
+    var tajweedScoredThisPass = 0
     val result = ArrayList<WordAnalysis>()
     var targetIndex = 0
     var spokenIndex = 0
@@ -3532,7 +3648,18 @@ suspend fun analyzeRecitationDetails(
             // `&& !matchedFromCarry`: a carry word has no spoken-stream index,
             // so there is no trustworthy audio span to score — it gets the
             // positional CORRECT verdict only, never an acoustic tajweed score.
-            if (scoreTajweed && labels.isNotEmpty() && hasRealAudio && isTajweedMode && !isHintedWord && !matchedFromCarry) {
+            if (scoreTajweed && labels.isNotEmpty() && hasRealAudio && isTajweedMode && !isHintedWord && !matchedFromCarry &&
+                tajweedScoredThisPass < tajweedScoreLimit
+            ) {
+                // §4.56 — AND THE BUDGET IS THE CONDITION, NOT A BRANCH. Past the
+                // limit the whole acoustic step is simply not taken for this word,
+                // so it keeps the same text-only verdict an unscored word already
+                // gets, and the NEXT pass (every emission re-requests the analysis)
+                // picks it up. That is deliberate: no single pass can own minutes of
+                // the user's time — measured on the A04s,
+                // `analyze(tajweed): done 133417ms scored=37 tajweedErrors=9`, during
+                // which nothing else in the app moved.
+                tajweedScoredThisPass++
                 // Find timing by exact index, or fallback to the closest matched word text
                 val timing = spokenTimings.find { it.startIndex == matchInSpokenAhead }
                     ?: spokenTimings.findLast { isWordMatch(it.word, targetWordNorm) }
@@ -4568,6 +4695,33 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // the pipeline is constructed BELOW `targetOrig` and stored in this holder,
     // scope; the pipeline is assigned to it once `targetOrig` is available.
     val tajweedPipelineHolder = remember { TajweedPipelineHolder() }
+
+    // §4.68 — A TEST-ONLY TRANSCRIPT SOURCE FOR THE NON-PIPELINE MODES.
+    //
+    // Tarteel runs on the PLATFORM SpeechRecognizer, and the PC-driven injection
+    // harness feeds the SHERPA pipeline (`runInjectLoop` reads filesDir/inject.pcm
+    // where the pipeline's mic worker would have opened the microphone). The two
+    // never meet, so before this line there was NO WAY to test Tarteel at all -
+    // every "injection test" in this project has silently measured Memorize +
+    // Tajweed. That is how §4.66 shipped untested against the surface where the
+    // user actually saw the bug ("keep displaying words after the missed word in
+    // tarteel mode").
+    //
+    // When - and ONLY when - a PCM file is sitting in filesDir, a non-Tajweed
+    // mode takes its transcript from the pipeline's injection loop instead of the
+    // recognizer. Everything that makes Tarteel Tarteel is untouched: the mode
+    // stays "Tarteel", so every gate keyed on `recitationMode == "Tajweed"` (the
+    // acoustic pass, the tajweed popup watcher, the tajweed scoring) stays OFF,
+    // and the walk, the freeze, the popup and the summary all run the exact code
+    // they run for a real reader. The SpeechRecognizer is NOT started alongside
+    // it - the single-mic invariant holds, and under injection the pipeline never
+    // opens the microphone anyway.
+    //
+    // Delete the injected PCM (or use the app normally) and this is false: real
+    // Tarteel behaviour is unchanged, byte for byte.
+    val injectTranscriptSource: Boolean =
+        recitationMode != "Tajweed" && tajweedPipelineHolder.pipeline?.isInjecting() == true
+
     // Forward-reference holder: the range-change auto-resume effect below is
     // declared ABOVE `startTajweedSession()` (Kotlin forbids forward references
     // to local functions). The effect body runs asynchronously (after its
@@ -4634,6 +4788,49 @@ fun RecitationApp(modifier: Modifier = Modifier) {
     // verdicts waiting. Latching on (word, rule) lets each rule's verdict reach
     // him, in the same one-at-a-time "must be dismissed" flow.
     var lastTajweedPopupRule by remember { mutableStateOf("") }
+    // §4.53 — EVERY (WORD, RULE) VERDICT ALREADY SHOWN, as a SET. The pair above
+    // only remembers the LAST one, which makes two standing mistakes alternate for
+    // ever (dismiss A, B is next; dismiss B, A again). Cleared by the same events
+    // that clear the pair — a range change, a restart, leaving the tab, and the
+    // re-read re-arm, because the user acting on a mistake is what makes a fresh
+    // verdict on that word speakable again.
+    var shownTajweedPopups by remember { mutableStateOf(setOf<String>()) }
+    /**
+     * set. It exists because two things were contradicting it:
+     *
+     *  * the popup re-raised. The guard was a single index that the popup's own
+     *    DISMISSAL cleared, so the next frozen pass re-opened the same dialog —
+     *    "it showed me a mistake then i continued. then when i paused i get the
+     *    popup of the same mistake again !"
+     *  * the summary forgave it. The forgive test is an ABSENCE-of-evidence test
+     *    (`mistakeVerifyAbsentStrikes >= 1`) and that evidence comes only from
+     *    `verifyTailWords`, which needs the Sherpa pipeline. Tarteel has none, so
+     *    its strikes are permanently 0 and every mistake it showed was forgiven:
+     *    "and the summury tells me no mistake !". Measured:
+     *    `autoFinalize(): grace expired with an UNPROVEN mistake at wordIndex=6
+     *    (no substantial decode ever judged it) -> forgiving`, then
+     *    `endOfRange(): ... wrong=0 skipped=0`.
+     *
+     * A mistake the user was shown is a decision this app made. Only the RE-READ
+     * may overturn it — `acquittal` puts the word back to CORRECT with its spoken
+     * token — never the absence of an arbiter. Cleared with the session (range
+     * change, restart, tab switch), never by dismissing a dialog.
+     */
+    var shownMistakeWords by remember { mutableStateOf(setOf<Int>()) }
+
+    // §4.67 — WHICH WORD IS CURRENTLY RIDDEN OVER, AND SINCE WHEN.
+    //
+    // The ride-over is a bounded grace for a tentative error while the confirm loop
+    // verifies it, and it has to be BOUNDED. The user's report: "for tajweed mode at
+    // the end i kept saying random words and instead of getting a popup of wrong word
+    // the app continued displaying words" — because the arbiter (a tail decode) keeps
+    // returning INCONCLUSIVE and §4.51's ride-over had no deadline, so the display
+    // advanced over the wrong word for ever.
+    //
+    // Wall-clock rather than a pass count: passes are emitted per decode window and
+    // their rate varies a lot between phones (this one is ~2x slower than the other).
+    var rideOverCandidateIdx by remember { mutableStateOf(-1) }
+    var rideOverCandidateSinceMs by remember { mutableStateOf(0L) }
 
     // Wrong/skipped-word auto-stop latch (see the LaunchedEffect by the alignment
     // vars): the index of the last WRONG/SKIPPED word that auto-stopped the mic, so
@@ -5031,6 +5228,9 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         // scratch - otherwise the first words of the new range would be blocked by
         // how far the previous one had got.
         displayCursorFloor = 0
+        shownMistakeWords = emptySet()
+        rideOverCandidateIdx = -1
+        rideOverCandidateSinceMs = 0L
         // §4.50 — and so does the stall clock: the previous range's silence must
         // not pre-arm this one's stalled-session dialog.
         stallSinceMs = 0L
@@ -5073,6 +5273,11 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         } else {
                             errorMessage = getAppString(isArabic, "Tajweed is warming up — please wait a moment…")
                         }
+                    } else if (injectTranscriptSource && tajweedPipelineHolder.pipeline != null) {
+                        // §4.68 — injected PCM present: take the transcript
+                        // from the pipeline's injection loop (see
+                        // [injectTranscriptSource]) instead of the recognizer.
+                        startTajweedSessionRef[0]?.invoke()
                     } else if (speechRecognizer != null) {
                         startListening(speechRecognizer!!, context.packageName) { msg ->
                             errorMessage = if (msg.isEmpty()) null else msg; isListening = false
@@ -5424,6 +5629,153 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // session is paused for a re-read. Anything else is still TENTATIVE.
                 val armedMistake = mistakeResumeIndex >= 0
                 var rodeOverTentativeSkip = false
+                // §4.58 — A RIDE-OVER IS ONLY HONEST WHERE SOMETHING WILL JUDGE IT.
+                //
+                // The ride-over trades "stop now" for "keep the highlight on the
+                // voice while the confirm loop decides", and that trade only makes
+                // sense if the confirm loop EXISTS. It is gated on Memorize +
+                // Tajweed, so on the READ / Tarteel surface a ridden-over error is
+                // never judged at all: the walk steps over it, the display fills in
+                // the words between the last correct word and the word the user
+                // actually said, and no skipped-word mistake is ever raised. The
+                // user: "in tarteel mode … tried skipping words but it always display
+                // the words between the last correct word and the word i said
+                // instead of stopping and giving me a skipped word mistake".
+                //
+                // In Tarteel a jump IS the mistake: there is no acoustic pass and no
+                // verify decode to second-guess it, and the reader can SEE that they
+                // skipped. So there the walk freezes on the first gap exactly as it
+                // always did, and the display stops where the reader actually is.
+                val confirmLoopWillJudge = currentTab == "Memorize" && recitationMode == "Tajweed"
+
+                // §4.66 — CORRECTED: A FRAGMENT-LESS PENDING ROW IS **ALWAYS
+                // TRAILING**, SO IT CAN NEVER BE A GAP IN THE MIDDLE OF THE WALK.
+                //
+                // This comment used to claim the opposite, and that claim WAS the
+                // whole diagnosis of the user report "keep displaying words after the
+                // missed word in tarteel mode". It is wrong, and the analyzer itself
+                // proves it: there are exactly THREE places
+                // `analyzeRecitationDetails` emits a PENDING row -
+                //   * the clipped-decode guard, which CARRIES `spokenText` (it IS a
+                //     heard word, and the walk counts it),
+                //   * the transcript-FRONTIER row (one row, `spokenText = null`),
+                //     after which `spokenIndex` runs past the end of `spoken`, and
+                //   * the "spoken exhausted" fill, which emits a PENDING row for
+                //     every remaining target word and then BREAKS.
+                // The frontier row is therefore immediately followed by the exhausted
+                // fill, so a PENDING row with no fragment is NEVER followed by a
+                // DECIDED row: there is no mid-range gap to detect, and a rule keyed
+                // on one could only ever have been dead code.
+                //
+                // Kept as a stated invariant instead, because it is the reason the
+                // unreached TAIL of a live recitation can never freeze the highlight
+                // (§4.34), and because it means the walk on a skipped word depends
+                // entirely on the WRONG/SKIPPED rows the analyzer really does emit -
+                // which is exactly what §4.67 then bounds.
+
+
+                // §4.67 — AND THE RIDE-OVER IS **TIME-BOUNDED**.
+                //
+                // "for tajweed mode at the end i kept saying random words and instead
+                // of getting a popup of wrong word the app continued displaying words".
+                // On Memorize + Tajweed a tentative error is ridden over while the
+                // confirm loop verifies it — right in principle, but §4.51 made it
+                // UNBOUNDED, and the arbiter is a tail decode that regularly comes back
+                // INCONCLUSIVE. The ride-over became permanent: the display advanced
+                // over a wrong word and no popup was ever raised. A ride-over is a
+                // bounded grace, not a redefinition of the verdict.
+                //
+                // After [RIDE_OVER_BUDGET_MS] of riding over the SAME word the walk
+                // stops and the mistake is raised. If the confirm loop proved it in the
+                // meantime the word is already in `shownMistakeWords`, so this cannot
+                // produce a second popup for it.
+                fun rideOverBudgetSpent(wordIdx: Int): Boolean {
+                    if (rideOverCandidateIdx != wordIdx) {
+                        rideOverCandidateIdx = wordIdx
+                        rideOverCandidateSinceMs = System.currentTimeMillis()
+                        return false
+                    }
+                    return System.currentTimeMillis() - rideOverCandidateSinceMs >=
+                        RIDE_OVER_BUDGET_MS
+                }
+
+                // §4.61 — ONE MISTAKE SURFACE FOR BOTH KINDS, ON BOTH PATHS.
+                //
+                // The user, after testing Tarteel on its own: "still no popups and no
+                // summary". Two reasons, both mine:
+                //
+                //  * The auto-pause + popup was wired into the **WRONG** branch only.
+                //    The SKIPPED branch's freeze was left as a bare `break`, and a
+                //    Tarteel skip is a SKIP — so the display stopped (correct) and
+                //    nothing was ever raised. A reader who skips a word saw silence.
+                //  * The gate also had to work when the row is skipped, which the
+                //    inline block above could not do because it is a statement, not a
+                //    decision point.
+                //
+                // So the decision lives in one place, called from BOTH freezes. It is
+                // a no-op on Memorize + Tajweed (where the confirm loop owns the
+                // verdict and arms the latch itself), and on every other surface the
+                // freeze itself IS the verdict: the reader visibly jumped, there is no
+                // pipeline and no tail decode to arbitrate, so the popup is raised here.
+                // `confirmedMistakeUiIdx` keeps it to once per word, the resume latch
+                // is armed exactly as on the Tajweed path so the display rewinds to
+                // the mistake, and the mic is stopped so the popup owns the screen.
+                fun raiseFreezePopupIfUnjudged(
+                    wordIndex: Int,
+                    wordText: String,
+                    skipped: Boolean,
+                    // §4.67 — `force` is the RIDE-OVER BUDGET running out. Normally a
+                    // freeze leaves the verdict to the confirm loop, which owns it on
+                    // Memorize + Tajweed. But the budget expiring means the grace is
+                    // over and no arbiter proved the word in all that time, so the app
+                    // itself is the decider and must speak — otherwise the display
+                    // would stop with no popup and the reader would have no idea why
+                    // ("instead of getting a popup of wrong word the app continued
+                    // displaying words"). The shown-set means this can never double up
+                    // with a popup the confirm loop already raised.
+                    force: Boolean = false
+                ) {
+                    if (confirmLoopWillJudge && !force) return
+                    if (armedMistake) return
+                    // §4.64 — ONCE PER WORD, FOR THE WHOLE SESSION, VIA A SET. The
+                    // single-index guard this replaced was cleared on dismissal, so
+                    // the very next frozen pass re-raised the same dialog — the user
+                    // saw: "it showed me a mistake then i continued. then when i
+                    // paused i get the popup of the same mistake again !". A set
+                    // survives the dismissal, and it is ALSO what the summary reads,
+                    // so the popup and the summary can never disagree.
+                    if (wordIndex in shownMistakeWords) return
+                    if (latestTajweedPopup != null) return
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "mistakeStop(): ${if (skipped) "SKIPPED" else "WRONG"} at wordIndex=$wordIndex " +
+                            "word='$wordText' in $recitationMode mode — no confirm loop here (no " +
+                            "pipeline, no tail decode), so the walk's own freeze is the verdict: " +
+                            "auto-pause + popup"
+                    )
+                    confirmedMistakeUiIdx = wordIndex
+                    shownMistakeWords = shownMistakeWords + wordIndex
+                    latestPopupKind = if (skipped) "skipped" else "wrong"
+                    latestTajweedPopup = Pair(wordText, wordIndex)
+                    mistakeResumeLiveText = (finalSpokenText + " " + partialSpokenText).trim()
+                    mistakeResumeIndex = wordIndex
+                    recitationSessionActive = true
+                    displayCursorFloor = minOf(displayCursorFloor, wordIndex)
+                    // §4.52 — AND THE DISPLAY ACTUALLY GOES BACK NOW. The floor is
+                    // only a minimum, and with the mic stopped no further emission
+                    // arrives to recompute the cursor, so the renderer's own predicate
+                    // is written here: the reader sees the mistake under the highlight
+                    // the moment the popup appears, exactly as on the Tajweed path.
+                    alignment = Pair(wordIndex, true)
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "mistakeStop(): display rewound to $wordIndex so the reader can SEE where to " +
+                            "re-read from (§4.52 — the floor alone cannot move the cursor backwards)"
+                    )
+                    try { speechRecognizer?.stopListening() } catch (_: Throwable) {}
+                    try { tajweedPipelineHolder.pipeline?.pause() } catch (_: Throwable) {}
+                    isListening = false
+                }
 
                 // TAJWEED-only errors (rule-acoustic failed but the WORD was spoken correctly)
                 // no longer pause the recitation. The user explicitly asked the app to "continue
@@ -5461,18 +5813,50 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         // `mistakeResumeIndex`, `armedMistake` flips true and the
                         // NEXT pass freezes and returns to the mistake word with the
                         // popup. Only the UNPROVEN freeze is gone.
-                        if (!sessionFinalized && !armedMistake) {
-                            newHasError = true
+                        if (!sessionFinalized && !armedMistake && confirmLoopWillJudge &&
+                            !rideOverBudgetSpent(word.wordIndex)
+                        ) {
+                            // §4.54 — AND A RIDDEN-OVER ERROR MUST NOT SET
+                            // `newHasError`. The flag used to mean "the walk STOPPED
+                            // here"; §4.51 gave the walk a ride-over, so it no longer
+                            // stops — yet a single unresolved row (Al-Baqarah's
+                            // opening `الم ذلك` is one) kept re-setting the flag on
+                            // every pass and it never cleared for the whole
+                            // recitation. Measured on the user's real-mic Al-Baqarah
+                            // run: `hasError=true` in 44 of 47 passes, false only 3
+                            // times (all before the first word).
+                            //
+                            // It matters because that flag is what switches the cursor
+                            // into SMOOTH REVEAL — `maxOf(matched, previous)`,
+                            // one-directional — so a permanently-true flag pins the
+                            // display at the highest the walk ever reached and it can
+                            // never come back to the voice. The user's words: "display
+                            // of words is far away from what i am reading".
                             rodeOverTentativeSkip = true
                             if (seenIdx.add(word.wordIndex)) newMatchedWordCount++
                         } else {
+                            // §4.61 — THE FREEZE IS ALSO WHERE A POPUP IS RAISED, on
+                            // every surface that has no confirm loop to raise it.
+                            // §4.67 — and `force` when the ride-over budget ran out, so
+                            // a stale unproven error cannot stop the display silently.
+                            raiseFreezePopupIfUnjudged(
+                                word.wordIndex,
+                                word.text,
+                                skipped = false,
+                                force = rideOverBudgetSpent(word.wordIndex)
+                            )
                             newHasError = true
                             break
                         }
                         continue
                     }
                     if (word.status == RecitationStatus.SKIPPED) {
-                        if (!sessionFinalized && !armedMistake) {
+                        if (!sessionFinalized && !armedMistake && confirmLoopWillJudge &&
+                            !rideOverBudgetSpent(word.wordIndex)
+                        ) {
+                            // §4.54 — SAME AS ABOVE: a ridden-over SKIPPED does not
+                            // set `newHasError` either, for the same reason.
+                            //
                             // SMOOTH REVEAL over a TENTATIVE skip. The walk marks this
                             // word SKIPPED only because the recognizer's frontier already
                             // moved PAST it (the word's own decode was clipped/ambiguous —
@@ -5495,6 +5879,21 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                             if (seenIdx.add(word.wordIndex)) newMatchedWordCount++
                         } else {
                             // Finalized, or a confirmed skip is armed: freeze for the verdict.
+                            //
+                            // §4.61 — AND, ON A SURFACE WITH NO CONFIRM LOOP, FREEZE
+                            // *AND* RAISE. The user testing Tarteel on its own got
+                            // "still no popups": the display stopped correctly (that is
+                            // the freeze) but nothing was raised, because this branch
+                            // used to be a bare `break` while the popup lived only in
+                            // the WRONG branch. A SKIP is the mistake a reader makes
+                            // most often here, so it is the one that must speak.
+                            // §4.67 — and `force` when the ride-over budget ran out.
+                            raiseFreezePopupIfUnjudged(
+                                word.wordIndex,
+                                word.text,
+                                skipped = true,
+                                force = rideOverBudgetSpent(word.wordIndex)
+                            )
                             newHasError = true
                             break
                         }
@@ -5517,9 +5916,7 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         // word of an ayah/range never lit up until the user tapped
                         // pause (the on-device "the final word in Fatihah didn't get
                         // displayed" report). PENDING rows with spokenText == null are
-                        // words never heard — or everything after a WRONG — and must
-                        // NOT advance the cursor.
-                        if (seenIdx.add(word.wordIndex)) newMatchedWordCount++
+                        // words never heard, and must NOT advance the cursor.
                     }
                 }
 
@@ -5549,7 +5946,44 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     .filter { !it.spokenText.isNullOrEmpty() }
                     .maxOfOrNull { it.wordIndex }
                     ?.plus(1)
-                val revealFloor = if (!sessionFinalized && newHasError && !armedMistake)
+
+                // §4.69 — AND THE FLOOR MUST READ THE LATCH **AFTER** THE WALK.
+                //
+                // `armedMistake` is a snapshot taken BEFORE the walk, and the walk is
+                // allowed to ARM the latch: on a surface with no confirm loop,
+                // `raiseFreezePopupIfUnjudged` sets `mistakeResumeIndex` the instant
+                // it raises the popup. The floor logic below kept reading the
+                // PRE-walk snapshot, so on the very pass that raised the popup it
+                // still believed no mistake was armed - and did all three wrong
+                // things at once:
+                //   * `revealFloor` was lifted to `lastHeardWord`, i.e. the reader's
+                //     LAST HEARD WORD, which by construction is PAST the mistake
+                //     (he kept reading after the one he skipped),
+                //   * `resolveTranscriptCursor` was told "not armed", so it did not
+                //     park on the flagged index, and
+                //   * `displayCursorFloor` was LATCHED at that past-the-mistake value.
+                //
+                // That silently undid §4.52, which writes
+                // `alignment = Pair(wordIndex, true)` inside the popup helper
+                // precisely so the display rewinds the instant the popup appears: the
+                // `alignment = Pair(cursorNow, ...)` write a few lines below the
+                // helper overwrote it again with the drifted cursor.
+                //
+                // On Memorize + Tajweed a later pass used to rescue it, because the
+                // confirm loop re-ran the walk while the mic was still open. Tarteel
+                // has no confirm loop: the freeze STOPS the recognizer, so no further
+                // pass ever arrives, the cursor never comes back, and the screen keeps
+                // every word after the missed word coloured for as long as the popup
+                // is up. That is the report verbatim - "keep displaying words after
+                // the missed word in tarteel mode", and "there is a missed word i
+                // continued reading the word after it and it worked instead of
+                // rereading the mistake".
+                //
+                // The walk's OWN gate must keep the pre-walk snapshot: a word the walk
+                // has just decided must not flip its own branch mid-iteration. Only
+                // the cursor arithmetic below reads the post-walk value.
+                val armedMistakeNow = armedMistake || mistakeResumeIndex >= 0
+                val revealFloor = if (!sessionFinalized && newHasError && !armedMistakeNow)
                     maxOf(alignment.first, lastHeardWord ?: 0)
                 else
                     alignment.first
@@ -5558,7 +5992,11 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     previousCursor = revealFloor,
                     hasError = newHasError,
                     finalized = sessionFinalized,
-                    confirmedMistakeArmed = armedMistake
+                    confirmedMistakeArmed = armedMistakeNow,
+                    // §4.52 — park ON the flagged word, not wherever the walk got
+                    // to. The walk rides over a tentative error now, so its count
+                    // is past the mistake and would keep the highlight there.
+                    mistakeIndex = mistakeResumeIndex
                 )
                 // - §4.46 THE SESSION FLOOR: A WORD ONCE SHOWN STAYS SHOWN -
                 // The cursor drives the RENDER, and a lower cursor literally
@@ -5579,15 +6017,47 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // The floor is reset only by an EXPLICIT fresh start (Restart
                 // button, surah/range change) - never by a pause, a resume, a
                 // mistake or the end of the range.
-                val floorNow = if (armedMistake) 0 else displayCursorFloor
-                val cursorNow = maxOf(resolvedCursor, floorNow)
-                if (!armedMistake && cursorNow > displayCursorFloor) displayCursorFloor = cursorNow
+                // §4.69 — `armedMistakeNow` here too, for the same reason: on the pass
+                // that raised the popup the latch IS armed, so the session floor must
+                // not pin the cursor (nor be latched below) at the drifted value the
+                // pre-walk snapshot had already allowed.
+                val floorNow = if (armedMistakeNow) 0 else displayCursorFloor
+                // §4.54 — EXCEPT WHEN THE WALK FALLS FAR BEHIND. A floor that only
+                // ever ratchets up turns every large re-alignment into PERMANENT
+                // drift, and the user has named the symptom: "display of words is
+                // far away from what i am reading". Measured on his real-mic
+                // Al-Baqarah run, one session:
+                //   walk=104 … walk=156            (the display was up at 156)
+                //   cursor held at 30 (walk wanted 12, heardThrough=58, floor=30)
+                // The aligner re-ran after the pause and came back with 12, and the
+                // display stayed pinned ~30 words ahead of it.
+                //
+                // The floor exists for a ONE- or TWO-word flicker while a decision
+                // settles (§4.46: a word must not blink grey as the acoustic pass
+                // catches up). A regression of DISPLAY_FLOOR_SLACK words or more is
+                // not a flicker, it is a re-alignment — and there the display must
+                // follow the voice, because a highlight that disagrees with the
+                // reader is worse than one that briefly re-colours.
+                val floorTooFarAhead = floorNow - newMatchedWordCount > DISPLAY_FLOOR_SLACK
+                if (floorTooFarAhead) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "analyze(fast): the walk fell $floorNow -> $newMatchedWordCount " +
+                            "(more than $DISPLAY_FLOOR_SLACK words) so the display follows it " +
+                            "instead of staying ${floorNow} words ahead (§4.54 — a floor that only " +
+                            "ratchets up drifts away from the voice)"
+                    )
+                    displayCursorFloor = newMatchedWordCount
+                }
+                val effectiveFloor = if (floorTooFarAhead) newMatchedWordCount else floorNow
+                val cursorNow = maxOf(resolvedCursor, effectiveFloor)
+                if (!armedMistakeNow && cursorNow > displayCursorFloor) displayCursorFloor = cursorNow
                 alignment = Pair(cursorNow, newHasError)
                 if (cursorNow != newMatchedWordCount) {
                     android.util.Log.i(
                         "ItqanSherpa",
                         "analyze(fast): cursor held at $cursorNow (walk wanted " +
-                            "$newMatchedWordCount, heardThrough=${lastHeardWord ?: -1}, armed=$armedMistake, " +
+                            "$newMatchedWordCount, heardThrough=${lastHeardWord ?: -1}, armed=$armedMistakeNow, " +
                             "floor=$floorNow) - a displayed word may not go grey again"
                     )
                 }
@@ -5738,7 +6208,13 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         finalReport = latest.finalized,
                         verdictCache = tajweedVerdictCache,
                         failCache = tajweedFailCache,
-                        scoreTajweed = true
+                        scoreTajweed = true,
+                        // §4.56 — BOUND THE WORK PER PASS. The walk hands the words
+                        // over in reading order, so this scores what the reader has
+                        // just reached and leaves the rest to the passes that follow,
+                        // instead of one pass owning 37 words and two minutes twenty
+                        // of the user's time.
+                        tajweedScoreLimit = TAJWEED_WORDS_PER_PASS
                     )
                 }
                 // §4.47 — WRITE-SIDE EPOCH GUARD, same reasoning as the fast loop.
@@ -5847,12 +6323,76 @@ fun RecitationApp(modifier: Modifier = Modifier) {
             // Rows are one per (word, rule), so latching on (word, rule) and
             // taking the first UNSHOWN verdict surfaces every distinct rule
             // mistake exactly once, still one dialog at a time.
+            //
+            // §4.53 — "SHOWN" IS A **SET**, NOT ONLY THE LAST ONE SHOWN. With a
+            // single latched pair, two standing errors take turns: dismissing A
+            // makes B eligible, dismissing B makes A eligible again. That is
+            // exactly what the user saw ("i continued receiting until i got a new
+            // tajweed mistake … and again the old mistake is shown also"):
+            //   tajweedPop(): wordIndex=83 rule=Madd score=34
+            //   tajweedPop(): wordIndex=2  rule=Madd score=31
+            //   tajweedPop(): wordIndex=83 rule=Madd score=34
+            //   tajweedPop(): wordIndex=2  rule=Madd score=31
+            //   tajweedPop(): wordIndex=83 rule=Madd score=34
+            // The scores are identical every time: the same two verdicts,
+            // ping-ponging. Every pair that has been shown is remembered, so each
+            // speaks at most once — and the re-read re-arms them, because that is
+            // the user acting on it.
             val tajweedError = detailedAnalysis.firstOrNull {
                 it.status == RecitationStatus.TAJWEED_ERROR &&
                     it.tajweedRule != null &&
-                    !(it.wordIndex == lastTajweedPopupIndex && it.tajweedRule == lastTajweedPopupRule)
+                    "${it.wordIndex}|${it.tajweedRule}" !in shownTajweedPopups
             }
             if (tajweedError != null) {
+                // §4.55 — AN ACCUSATION MUST BE **ISOLATED** TO BE SHOWN.
+                //
+                // "a lot of problems for tajweed mistakes as usual". The log says all
+                // nine came from ONE acoustic pass that took **133 SECONDS** and then
+                // fired them as a burst:
+                //   analyze(tajweed): done 133417ms scored=37 tajweedErrors=9
+                //   word 18  Iqlab & Ikhfa  17%   adjacent accusers: [19]
+                //   word 19  Iqlab & Ikhfa  33%   adjacent accusers: [18, 21]
+                //   word 21  Idgham         47%   adjacent accusers: [19, 22, 23]
+                //   word 22  Idgham         47%   adjacent accusers: [21, 23]
+                //   word 23  Iqlab & Ikhfa  48%   adjacent accusers: [21, 22, 25]
+                //   word 25  Idgham         43%   adjacent accusers: [23]
+                //   word 30  Meem Sakinah   41%   adjacent accusers: [31, 32]
+                //   word 31  Iqlab & Ikhfa  48%   adjacent accusers: [30, 32]
+                //   word 32  Idgham         48%   adjacent accusers: [30, 31]
+                //   -> 9 of 9 have an adjacent accuser (100%)
+                //
+                // A reader who mispronounces produces ISOLATED failures. Nine
+                // ADJACENT words all failing, all inside a 31-point band just under
+                // the threshold, is not nine mistakes — it is the scorer's audio
+                // boundary sitting in the wrong place, so every cross-word rule
+                // (Ikhfa, Idgham and Meem Sakinah all need the CUE AT THE BOUNDARY
+                // between two words) gets the wrong slice. The user recited correctly
+                // and was told nine times that he did not.
+                //
+                // So a verdict with a failing neighbour is an alignment artefact and
+                // is NOT shown. The row and its score stay in the analysis, and once
+                // the boundary settles the word is re-scored on its own and can then
+                // speak up — the only honest way to accuse someone.
+                val failingWords = detailedAnalysis
+                    .filter { it.status == RecitationStatus.TAJWEED_ERROR }
+                    .map { it.wordIndex }
+                    .toHashSet()
+                val neighbours = failingWords.filter {
+                    it != tajweedError.wordIndex &&
+                        kotlin.math.abs(it - tajweedError.wordIndex) <= TAJWEED_ISOLATION_SLACK
+                }
+                if (neighbours.isNotEmpty()) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "tajweedPop(): NOT accusing word ${tajweedError.wordIndex} " +
+                            "(${tajweedError.tajweedRule} ${tajweedError.tajweedScore}) — words " +
+                            "$neighbours also fail within $TAJWEED_ISOLATION_SLACK words, so this is " +
+                            "a RUN and not an isolated mistake (§4.55 — a run means the scorer's audio " +
+                            "boundary is offset, and a correct recitation must not be charged for it). " +
+                            "The verdict stays in the analysis and re-speaks once its neighbours settle."
+                    )
+                    return@LaunchedEffect
+                }
                 // - ONE POPUP PER (WORD, RULE), AND ONLY AFTER THE USER ACTS (§4.45) -
                 // The old guard fired again for the SAME word whenever its SCORE
                 // changed, and only PASSING verdicts are cached - so every
@@ -5869,17 +6409,17 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 // through the fresh-session event) - or after moving on. Dismissal
                 // alone must never re-open it.
                 //
-                // §4.49 — the latch test is the (word, RULE) PAIR, not the word:
-                // a second rule on the SAME word is a different mistake with a
-                // different score, and the user must be shown it too. (The
-                // selection above already skips the latched pair; the explicit
-                // test stays as the guard that keeps a popup from stacking while
-                // one is on screen.)
+                // §4.49/§4.53 — the latch is the whole SET of shown (word, rule)
+                // pairs: a second rule on the SAME word is a different mistake with
+                // a different score and must still be reported, and a verdict that
+                // has already been shown must never be re-opened. `latestTajweedPopup
+                // == null` is what keeps a popup from stacking while one is on screen.
                 if (latestTajweedPopup == null &&
-                    !(tajweedError.wordIndex == lastTajweedPopupIndex &&
-                        tajweedError.tajweedRule == lastTajweedPopupRule)
+                    "${tajweedError.wordIndex}|${tajweedError.tajweedRule}" !in shownTajweedPopups
                 ) {
                     android.util.Log.i("ItqanSherpa", "tajweedPop(): TAJWEED_ERROR wordIndex=${tajweedError.wordIndex} rule=${tajweedError.tajweedRule} score=${tajweedError.tajweedScore} -> pushing popup")
+                    shownTajweedPopups = shownTajweedPopups +
+                        "${tajweedError.wordIndex}|${tajweedError.tajweedRule}"
                     lastTajweedPopupIndex = tajweedError.wordIndex
                     lastTajweedPopupScore = tajweedError.tajweedScore ?: -1
                     lastTajweedPopupRule = tajweedError.tajweedRule!!
@@ -5944,12 +6484,37 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                         // Same as stopForMistake: a mistake PAUSES the session,
                         // it does not end it (§4.45).
                         recitationSessionActive = true
-                        // §4.48 — AND THE DISPLAY STOPS AT THE MISTAKE, so the
+                        // §4.48 - AND THE DISPLAY STOPS AT THE MISTAKE, so the
                         // words after it stop looking reached and the reader can
                         // see where the popup wants them to continue.
                         displayCursorFloor = minOf(
                             displayCursorFloor,
                             tajweedError.wordIndex
+                        )
+                        // §4.52 — AND IT GOES BACK **NOW**, NOT ON THE NEXT
+                        // ANALYSIS PASS. Lowering the floor is only a MINIMUM: the
+                        // cursor is `maxOf(walk, floor)`, so a floor under a cursor
+                        // that is already further along changes nothing. And after
+                        // this popup the mic is stopped, so no further emission
+                        // ever arrives and `analyze(fast)` never runs again to
+                        // recompute it. The user saw exactly that: the popup named
+                        // the word, the mic stopped, and the display stayed put
+                        // until he turned the mic back on ("i want the display of
+                        // words to get back to the mistaken word when the popup is
+                        // showed to the user and the mic is stopped so he could
+                        // know from where to receite again after the mistake").
+                        //
+                        // So write the renderer's own predicate (`alignment.first`
+                        // IS the display cursor) here, at the moment the popup
+                        // appears. `hasError = true` keeps the error colour on the
+                        // flagged word, which the renderer's error branch needs.
+                        val cursorBeforeRewind = alignment.first
+                        alignment = Pair(tajweedError.wordIndex, true)
+                        android.util.Log.i(
+                            "ItqanSherpa",
+                            "tajweedPop(): display rewound $cursorBeforeRewind -> " +
+                                "${tajweedError.wordIndex} so the reader can SEE where to re-read " +
+                                "from (§4.52 — the floor alone cannot move the cursor backwards)"
                         )
                         // Post-pause pipeline emissions are dead audio from
                         // BEFORE the stop; freeze them exactly like the
@@ -5958,21 +6523,61 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     }
                 }
             } else if (latestTajweedPopup == null) {
-                // No error currently AND no popup showing -> reset the latch so that if the user
-                // re-reads the SAME word and makes the SAME mistake again after the previous popup
-                // auto-dismissed, the fresh TAJWEED_ERROR re-triggers instead of being swallowed
-                // by the stale index. lastWrongStopIndex is deliberately NOT touched: the
-                // WRONG-word confirmation state lives in its own effect below.
-                // §4.49 — the latch is the (word, rule) PAIR, so the rule half of it
-                // is cleared with the index.
-                lastTajweedPopupIndex = -1
-                lastTajweedPopupScore = -1
-                lastTajweedPopupRule = ""
+                // §4.53 — AND THE LATCH IS **NOT** CLEARED JUST BECAUSE ONE PASS
+                // HAPPENED TO HAVE NO ERROR.
+                //
+                // The user's real-mic Al-Baqarah run looped on one popup: he
+                // dismissed it, and it came straight back, over and over
+                // ("it got back to that error and keep showing me popups and i
+                // dismiss them and they keep coming"):
+                //   tajweedPop(): TAJWEED_ERROR wordIndex=12 rule=Al-Lam score=40
+                //   tajweedPop(): display rewound 15 -> 12
+                //   analyze(tajweed): done 3555ms scored=8 tajweedErrors=0 changed=4
+                //   tajweedPop(): TAJWEED_ERROR wordIndex=12 rule=Al-Lam score=40
+                // Identical word, identical rule, identical score. The acoustic
+                // pass that re-scored the word had a `tajweedErrors=0` window in
+                // between, and THAT is what cleared the latch — this branch. The
+                // next pass re-flagged the same word and, with the latch gone, the
+                // "first verdict not yet shown" selection picked it again.
+                //
+                // §4.49 made the latch per (word, rule), which made this worse: a
+                // cleared latch no longer merely allowed one re-fire, it made the
+                // very same row immediately eligible again.
+                //
+                // The contract is §4.45's and it is about the USER, not about the
+                // analysis: a popup stays up until he dismisses it, and the same
+                // (word, rule) may only raise a new one after he has DONE something
+                // — dismissed it and RE-READ the word, which re-arms the latch
+                // explicitly at the resume (§4.49). So the latch now survives a
+                // blank pass and is released only when the word it belongs to has
+                // actually LEFT the analysis (re-read away, or the range changed).
+                val popupWordGone = lastTajweedPopupIndex >= 0 &&
+                    detailedAnalysis.none { it.wordIndex == lastTajweedPopupIndex }
+                if (popupWordGone) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "tajweedPop(): word $lastTajweedPopupIndex left the analysis -> releasing the " +
+                            "popup latch, so a future verdict on it can speak up again"
+                    )
+                    lastTajweedPopupIndex = -1
+                    lastTajweedPopupScore = -1
+                    lastTajweedPopupRule = ""
+                    shownTajweedPopups = emptySet()
+                    shownMistakeWords = emptySet()
+                    rideOverCandidateIdx = -1
+                    rideOverCandidateSinceMs = 0L
+                }
+                // lastWrongStopIndex is deliberately NOT touched: the WRONG-word
+                // confirmation state lives in its own effect below.
             }
         } else if (currentTab != "Memorize") {
             // User left Memorize -- clear any stale popup state so re-entering is clean.
             lastTajweedPopupIndex = -1
             lastTajweedPopupRule = ""
+            shownTajweedPopups = emptySet()
+            shownMistakeWords = emptySet()
+            rideOverCandidateIdx = -1
+            rideOverCandidateSinceMs = 0L
             // §4.45 - a session that is only PAUSED (a mistake popup, or a pause
             // waiting for its final decode) has no mic to stop, so the tab-change
             // effect below never sees it. Leaving the tab still ends it: keep it
@@ -6050,6 +6655,11 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 "word='$wordText' (sightings=$lastWrongStopSightings) -> auto-pause + popup"
         )
         lastWrongStopIndex = wordIdx
+        // §4.64 — THE TAJWEED CONFIRM PATH JOINS THE SAME SET. So a mistake the
+        // user was shown on Memorize + Tajweed is remembered in exactly the way a
+        // Tarteel one is: the popup cannot re-raise for it, and the summary cannot
+        // forgive it as "unproven". One rule, both modes.
+        shownMistakeWords = shownMistakeWords + wordIdx
         // THE ONE PLACE A MISTAKE BECOMES VISIBLE. `confirmedMistakeUiIdx` drives
         // BOTH the inline banner and the red word highlight, and it is armed here
         // — together with the dialog — so the two can never disagree. Arming it
@@ -6078,6 +6688,19 @@ fun RecitationApp(modifier: Modifier = Modifier) {
         // (§ the collector's freshSession block), because a mistake is a real
         // rewind, not a transient walk regression.
         displayCursorFloor = minOf(displayCursorFloor, wordIdx)
+        // §4.52 — AND THE CURSOR ACTUALLY GOES BACK, HERE AND NOW. The floor is
+        // only a MINIMUM (`cursor = maxOf(walk, floor)`), so dropping it under a
+        // cursor that is already further along does nothing on its own, and once
+        // the mic is stopped no further emission arrives to recompute it. The
+        // popup is raised in the same instant, so this is the moment the reader
+        // can be shown where to re-read from.
+        val cursorBeforeRewind = alignment.first
+        alignment = Pair(wordIdx, true)
+        android.util.Log.i(
+            "ItqanSherpa",
+            "mistakeStop(): ${if (skipped) "SKIPPED" else "WRONG"} at $wordIdx — display rewound " +
+                "$cursorBeforeRewind -> $wordIdx so the reader can SEE where to re-read from (§4.52)"
+        )
         try { tajweedPipelineHolder.pipeline?.pause() } catch (_: Throwable) {}
         try { speechRecognizer?.stopListening() } catch (_: Throwable) {}
         isListening = false
@@ -6145,7 +6768,43 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                 currentSpoken != lastWrongStopSpokenText
             if (mistakeIdx < 0) {
                 mistakeCleanStreak += 1
-                if (mistakeCleanStreak >= 2 || lastWrongStopIndex == -1) {
+                // §4.57 — A TENTATIVE VERDICT MUST SURVIVE A BRIEF ABSENCE.
+                // This branch is the wrong/skipped twin of the tajweed popup latch
+                // (§4.53), and it had exactly the same bug: two consecutive passes
+                // without the row WIPED the whole confirmation state — the sightings
+                // counter, the dwell clock, the absent strikes. A WRONG/SKIPPED is
+                // tentative by construction (the text re-analysis rewrites
+                // `detailedAnalysis` on every pass, so the row flickers in and out),
+                // so the evidence it was accumulating was destroyed before it could
+                // ever reach the bar.
+                //
+                // Measured on the user's real-mic Al-Baqarah run — the sightings
+                // counter never left 1, so the verification never really ran:
+                //   candidate row=6 word=5 sightings=1 ... verify idx=5 launched
+                //   candidate row=5 word=5 sightings=1     <- the ROW index flickers
+                //   candidate row=6 word=5 sightings=1     (one row per word x rule)
+                //   candidate row=5 word=5 sightings=1
+                // and in the later session not one `mistakeStop(): ... CONFIRMED`
+                // line appeared: the candidate could never be judged, so a real
+                // mistake produced NO popup at all and the app looked indifferent.
+                //
+                // The candidate is now released only when its WORD has actually LEFT
+                // the analysis — a re-read, a range change, a re-seat — which is the
+                // one thing that really does mean "this is no longer the candidate".
+                val trackedWordGone = lastWrongStopIndex >= 0 &&
+                    detailedAnalysis.none { it.wordIndex == lastWrongStopIndex }
+                if (lastWrongStopIndex == -1) {
+                    lastWrongStopSpokenText = ""
+                    lastWrongStopSightings = 0
+                    lastWrongStopFirstSeenMs = 0L
+                    confirmedMistakeUiIdx = -1
+                    mistakeEpisodeAnchor = -1
+                    mistakeCleanStreak = 0
+                    mistakeVerifyAbsentIdx = -1
+                    mistakeVerifyAttempts = 0
+                    mistakeVerifyAbsentStrikes = 0
+                    mistakeVerdictAtMs = 0L
+                } else if (mistakeCleanStreak >= 2 && trackedWordGone) {
                     lastWrongStopIndex = -1
                     lastWrongStopSpokenText = ""
                     lastWrongStopSightings = 0
@@ -6157,6 +6816,16 @@ fun RecitationApp(modifier: Modifier = Modifier) {
                     mistakeVerifyAttempts = 0
                     mistakeVerifyAbsentStrikes = 0
                     mistakeVerdictAtMs = 0L
+                } else if (!trackedWordGone) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "mistakeStop(): word $lastWrongStopIndex is absent from this pass but still in " +
+                            "the analysis -> keeping the candidate (sightings=$lastWrongStopSightings, " +
+                            "dwell=${System.currentTimeMillis() - lastWrongStopFirstSeenMs}ms) instead " +
+                            "of wiping it (§4.57 — a tentative verdict flickers, and wiping it meant no " +
+                            "mistake could ever be proven)"
+                    )
+                    mistakeCleanStreak = 0
                 }
             } else if (!sameEpisode && mistakeWord != lastWrongStopIndex) {
                 // A genuinely different region is now the first mistake:
@@ -7636,6 +8305,30 @@ val audio = if (tajweedPipelineHolder.running) {
             // regression the user hit twice ("no word display in memorize + tajweed"). The
             // single-mic invariant stays intact here.
             onState?.invoke(false)
+            // §4.62 — FOR THE PLATFORM RECOGNIZER, `onResults` **IS** THE
+            // END-OF-SESSION SIGNAL. Nothing else will ever arrive after it, and
+            // until it does the app is still waiting.
+            //
+            // It has to raise that signal itself, because the flag is owned by the
+            // SHERPA pipeline everywhere else (the endpoint / final-commit marker) and
+            // Tarteel does not use the pipeline. Without it nothing downstream could
+            // fire: the summary gate demands `(sessionFinalized || forceDecision)`, and
+            // the auto-finalize effect demands `sessionFinalized` — so a Tarteel pause
+            // produced NO summary, and a Tarteel recitation that simply ran out of
+            // words ended in silence. The user: "i tired tarteel only and still no
+            // popups and no summary".
+            //
+            // Tajweed is deliberately excluded: there the pipeline's final decode is
+            // still to come, and marking the session final here would race it and let a
+            // summary be built from a half-merged transcript.
+            if (recitationMode != "Tajweed") {
+                android.util.Log.i(
+                    "ItqanSherpa",
+                    "SpeechRec onResults: final transcript delivered in $recitationMode mode -> " +
+                        "marking the session final so the pause/end summary can be raised (§4.62)"
+                )
+                sessionFinalized = true
+            }
         }
         override fun onPartialResults(results: android.os.Bundle?) {
             val res = results?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
@@ -7808,7 +8501,18 @@ val audio = if (tajweedPipelineHolder.running) {
     androidx.compose.runtime.key(tajweedPipelineHolder.pipeline) {
         LaunchedEffect(tajweedPipelineHolder.pipeline, currentTab, recitationMode) {
             val pipelineDriven =
-                currentTab == "Tajweed" || (currentTab == "Memorize" && recitationMode == "Tajweed")
+                currentTab == "Tajweed" ||
+                    (currentTab == "Memorize" && recitationMode == "Tajweed") ||
+                    // §4.68 — ...or an INJECTED non-Tajweed session, whose transcript
+                    // also comes from this pipeline. Without this the §4.68 hook starts
+                    // the pipeline and NOTHING subscribes to its partials, so the run
+                    // decodes 29 words and the app receives none of them:
+                    //   decodeWindow(): done ... emitted=29w        (pipeline, fine)
+                    //   finalDecodeAndEmit(): final-commit marker   (pipeline, fine)
+                    //   -- zero collector() lines, zero analyze(fast) lines --
+                    // which reads as "Tarteel displays nothing" and is exactly the
+                    // symptom the hook exists to reproduce.
+                    (currentTab == "Memorize" && injectTranscriptSource)
             if (!pipelineDriven) return@LaunchedEffect
             val pipe = tajweedPipelineHolder.pipeline ?: return@LaunchedEffect
             // MEMORIZE-word filter for the sliding-window CTC engine. The
@@ -7979,7 +8683,32 @@ val audio = if (tajweedPipelineHolder.running) {
                             // are displayed" (measured: the popup named word 18 and
                             // the cursor sat at 22). Drop the floor to the mistake,
                             // which is where the reader must be looking.
-                            displayCursorFloor = resumeIdx
+                            // §4.53 — BUT NOT UP TO THE MISTAKE. The floor is a
+                            // MINIMUM, and the display can only move while the WALK
+                            // is at or past it. After a re-seat the walk has to
+                            // re-climb the kept prefix from target word 0 before it
+                            // reaches the mistake, so a floor parked at the mistake
+                            // froze the display ABOVE the walk for the whole climb.
+                            // The user's report: "i receited and got a tajweed error
+                            // then when i continue no words are displayed" —
+                            // measured, the whole re-read:
+                            //   re-seated ... the user continues at target word 55
+                            //   cursor held at 55 (walk wanted 41, heardThrough=41)
+                            //   cursor held at 55 (walk wanted 43, heardThrough=43)
+                            //   cursor held at 55 (walk wanted 45, heardThrough=45)
+                            //   cursor held at 55 (walk wanted 52, heardThrough=52)
+                            // i.e. 55 words lit, the voice moving, and the display
+                            // static for ~14 s.
+                            //
+                            // So the floor goes to where the WALK actually is — the
+                            // kept prefix — and follows it up from there. The words
+                            // already recited stay lit (nothing un-greys), and every
+                            // word of the re-read lights as the aligner reaches it.
+                            displayCursorFloor = minOf(
+                                displayCursorFloor,
+                                prefixWords.size,
+                                resumeIdx
+                            )
                             android.util.Log.i(
                                 "ItqanSherpa",
                                 "collector(): re-seated the transcript for the re-read - " +
@@ -7999,6 +8728,10 @@ val audio = if (tajweedPipelineHolder.running) {
                             lastTajweedPopupIndex = -1
                             lastTajweedPopupScore = -1
                             lastTajweedPopupRule = ""
+                            shownTajweedPopups = emptySet()
+                            shownMistakeWords = emptySet()
+                            rideOverCandidateIdx = -1
+                            rideOverCandidateSinceMs = 0L
                         }
                     }
                 }
@@ -8404,6 +9137,9 @@ val wordsLength = words.size
                     } else {
                         errorMessage = getAppString(isArabic, "Tajweed is warming up — please wait a moment…")
                     }
+                } else if (injectTranscriptSource && tajweedPipelineHolder.pipeline != null) {
+                    // §4.68 — see [injectTranscriptSource].
+                    startTajweedSession()
                 } else if (speechRecognizer != null) {
 spokenTimings.clear()
         currentWordCount = 0
@@ -8806,8 +9542,65 @@ spokenTimings.clear()
                     } else named
                 }
             }
+            // §4.60 — DISMISSING A MISTAKE POPUP HANDS THE NEXT TAP BACK TO THE
+            // START PATH, ON EVERY MODE THAT HAS NO RESUME LATCH.
+            //
+            // On Memorize + Tajweed the next tap RESUMES: the pipeline is warm and
+            // the collector re-seats the committed transcript at the mistake. Tarteel
+            // has neither, so the flag that makes a tap mean "pause" has to be
+            // released on dismissal — otherwise the reader's next tap can only ever
+            // produce ANOTHER SUMMARY and he can never continue from the word the
+            // popup just named ("wether it freezes or we can continue").
+            //
+            // The transcript is deliberately KEPT (§4.46: a start does not clear the
+            // Memorize transcript, and the count filter suppresses replayed words), so
+            // the walk simply carries on from where it stopped — at the mistake.
+            val dismissMistakePopup: () -> Unit = {
+                latestTajweedPopup = null
+                if (recitationMode != "Tajweed" && recitationSessionActive) {
+                    android.util.Log.i(
+                        "ItqanSherpa",
+                        "popup dismissed in $recitationMode mode -> releasing the pause flag so the " +
+                            "next mic tap CONTINUES the recitation from the flagged word instead of " +
+                            "summarizing it again (§4.60)"
+                    )
+                    recitationSessionActive = false
+                    confirmedMistakeUiIdx = -1
+                    // §4.65 — AND ON A NON-PIPELINE MODE, RELEASE THE FREEZE ITSELF.
+                    //
+                    // The mistake latch (`mistakeResumeIndex`) is what freezes the
+                    // walk at the flagged word, and on Memorize + Tajweed it is
+                    // cleared by the collector's fresh-session re-seat, which the
+                    // PIPELINE emits. Tarteel has no pipeline, so nothing ever
+                    // cleared it and the walk stayed pinned — measured across a whole
+                    // session:
+                    //   analyze(fast): done 110ms matched=6 hasError=true   <- popup
+                    //   popup dismissed in Tarteel mode
+                    //   analyze(fast): done 112ms matched=6 hasError=true   <- 30 s later
+                    //   ... the same two numbers, every pass ...
+                    // A pinned cursor also pins the AUTO-SCROLL (its effect keys off
+                    // `matchedWordCount`), which is the user's other report: "when i
+                    // receite the words/ayahs are not scrolling automatically like it
+                    // used to do before".
+                    //
+                    // So the dismissal — which IS the reader saying "I have read it" —
+                    // releases the latch here. The mistake itself is NOT forgotten:
+                    // `shownMistakeWords` still holds it, so the popup cannot re-raise
+                    // and the summary still reports it.
+                    if (recitationMode != "Tajweed") {
+                        android.util.Log.i(
+                            "ItqanSherpa",
+                            "popup dismissed in $recitationMode mode -> releasing the mistake freeze " +
+                                "so the walk, the highlight and the auto-scroll move again (§4.65). " +
+                                "The mistake is still on record for the summary."
+                        )
+                        mistakeResumeIndex = -1
+                        mistakeResumeLiveText = ""
+                    }
+                }
+            }
             AlertDialog(
-                onDismissRequest = { latestTajweedPopup = null },
+                onDismissRequest = { dismissMistakePopup() },
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
@@ -8834,7 +9627,7 @@ spokenTimings.clear()
                     )
                 },
                 confirmButton = {
-                    TextButton(onClick = { latestTajweedPopup = null }) {
+                    TextButton(onClick = { dismissMistakePopup() }) {
                         Text(getAppString(isArabic, "OK"))
                     }
                 }
@@ -10292,6 +11085,9 @@ spokenTimings.clear()
                                     // transcript, or the reader keeps looking at words
                                     // they have not re-read yet (§4.48).
                                     displayCursorFloor = 0
+                                    shownMistakeWords = emptySet()
+                                    rideOverCandidateIdx = -1
+                                    rideOverCandidateSinceMs = 0L
                                     // Re-reading the whole ayah is a deliberate
                                     // restart: swallow any pending mistake-resume.
                                     mistakeResumeIndex = -1
@@ -10376,6 +11172,10 @@ spokenTimings.clear()
                                     lastTajweedPopupIndex = -1
                                     lastTajweedPopupScore = -1
                                     lastTajweedPopupRule = ""
+                                    shownTajweedPopups = emptySet()
+                                    shownMistakeWords = emptySet()
+                                    rideOverCandidateIdx = -1
+                                    rideOverCandidateSinceMs = 0L
                                     confirmedMistakeUiIdx = -1
                                     // The acoustic verdicts were cut against the
                                     // PREVIOUS attempt's audio and timing.
@@ -10493,6 +11293,10 @@ spokenTimings.clear()
                                 lastTajweedPopupIndex = -1
                                 lastTajweedPopupScore = -1
                                 lastTajweedPopupRule = ""
+                                shownTajweedPopups = emptySet()
+                                shownMistakeWords = emptySet()
+                                rideOverCandidateIdx = -1
+                                rideOverCandidateSinceMs = 0L
                                 confirmedMistakeUiIdx = -1
                                 lastWrongStopIndex = -1
                                 lastWrongStopSpokenText = ""
@@ -10506,6 +11310,9 @@ spokenTimings.clear()
                                 // display floor is dropped with the transcript
                                 // (§4.46), so word 0 can be displayed again.
                                 displayCursorFloor = 0
+                                shownMistakeWords = emptySet()
+                                rideOverCandidateIdx = -1
+                                rideOverCandidateSinceMs = 0L
                                 // Drop the just-finished summary so a fresh
                                 // recitation can raise its own.
                                 viewModel.dismissSessionSummary()
@@ -10839,9 +11646,16 @@ spokenTimings.clear()
                             // teardown so the analyzeRecitationDetails
                             // LaunchedEffect below picks up the audio on its
                             // `tajweedRecordedAudio != null` trigger.
-                            if (recitationMode == "Tajweed" && tajweedPipelineHolder.running) {
-                                stopTajweedSession()
-                            } else {
+                              // §4.68 — ...and under injection it owns it in a
+                              // NON-Tajweed mode too: [injectTranscriptSource] started the
+                              // pipeline there, so stopping only the (never started)
+                              // recognizer would leave the injector running and the run
+                              // would never end.
+                              if ((recitationMode == "Tajweed" || injectTranscriptSource) &&
+                                  tajweedPipelineHolder.running
+                              ) {
+                                  stopTajweedSession()
+                              } else {
                                 speechRecognizer.stopListening()
                                 isListening = false
                             }
@@ -10881,7 +11695,31 @@ spokenTimings.clear()
                                     it.status == RecitationStatus.SKIPPED) &&
                                     !(absentProven && absentAnchorIdx >= 0 &&
                                         kotlin.math.abs(it.wordIndex - absentAnchorIdx) <= 3) &&
-                                    it.wordIndex !in verifiedSpokenIndices
+                                    it.wordIndex !in verifiedSpokenIndices &&
+                                    // §4.64 — AND A MISTAKE THE APP **ALREADY SHOWED** IS
+                                    // NOT "UNPROVEN" — it is a decision this app made and put
+                                    // in front of the user, and forgiving it here makes the
+                                    // app contradict its own popup. Exactly what the user
+                                    // saw: the mistake popup for word 6, then
+                                    // "the summury tells me no mistake !"
+                                    //   autoFinalize(): grace expired with an UNPROVEN
+                                    //   mistake at wordIndex=6 (no substantial decode ever
+                                    //   judged it) -> forgiving rather than accusing
+                                    //   endOfRange(): ... wrong=0 skipped=0 tajweed=0
+                                    //
+                                    // The forgive test is an ABSENCE-of-evidence test, and
+                                    // that evidence can only come from `verifyTailWords` —
+                                    // which needs the Sherpa pipeline. Tarteel has none, so
+                                    // its strikes are permanently 0 and EVERY mistake it
+                                    // showed was forgiven by this very line. On the Tajweed
+                                    // path the same rule could also erase a mistake the
+                                    // confirm loop had already popped up for.
+                                    //
+                                    // Only the RE-READ may overturn a mistake the user was
+                                    // shown: `acquittal` returns the word to CORRECT with
+                                    // its spoken token, which is the `verifiedSpokenIndices`
+                                    // test above. A word in neither set stays a mistake.
+                                    it.wordIndex !in shownMistakeWords
                             }
                             if (unprovenMistakes.isNotEmpty()) {
                                 val forgiveIdx = unprovenMistakes.map { it.wordIndex }.toHashSet()
@@ -11427,6 +12265,9 @@ spokenTimings.clear()
                                         errorMessage = getAppString(isArabic, "Tajweed is warming up — please wait a moment…")
                                         android.util.Log.w("ItqanSherpa", "FAB: Tajweed tapped but pipeline not wired yet — blocked (no Tarteel fallback)")
                                     }
+                                } else if (injectTranscriptSource && tajweedPipelineHolder.pipeline != null) {
+                                    // §4.68 — see [injectTranscriptSource].
+                                    startTajweedSession()
                                 } else if (speechRecognizer != null) {
                                     spokenTimings.clear()
                                     currentWordCount = 0
@@ -11481,9 +12322,29 @@ spokenTimings.clear()
                     )
                     return@LaunchedEffect
                 }
-                val deadline = System.currentTimeMillis() + 20000L
+                // §4.52 — THE WAIT IS NOW 1.5 s, NOT 20 s. "for showing the
+                // summary after i turn the mic off if you could make it a little
+                // faster". Measured on his own real-mic runs, everything after the
+                // final decode lands is already fast — the whole cost is WAITING
+                // for that decode:
+                //   stopTajweedSession()          0 ms
+                //   finalDecodeAndEmit(): done    +4388 ms   (Al-Fatihah 1-7)
+                //   finalDecodeAndEmit(): done    +3104 ms   (Al-Baqarah)
+                //   userPauseFinalize()           +90 ms
+                //   endOfRange(): summary raised  +6 ms
+                // So a 1.5 s budget caps what the user waits at ~1.5 s instead of
+                // 3-4.4 s (and instead of 20 s when the decode is slow), and the
+                // summary then reports exactly the transcript he watched being
+                // built word by word.
+                //
+                // The repair decode is NOT cancelled — it keeps running in the
+                // background and its words still merge into `detailedAnalysis`
+                // (a finalized session's decided words are protected by
+                // `keepFinalizedDecisions`, §4.37). Nothing is lost; the user just
+                // stops staring at a frozen screen while the recognizer thinks.
+                val deadline = System.currentTimeMillis() + 1500L
                 while (!sessionFinalized && System.currentTimeMillis() < deadline) {
-                    kotlinx.coroutines.delay(200L)
+                    kotlinx.coroutines.delay(100L)
                 }
                 userPauseFinalizePending = false
                 // §4.45 - A PAUSE MUST ALWAYS PRODUCE THE SUMMARY. The user
@@ -11522,7 +12383,30 @@ spokenTimings.clear()
             fun onMicTap() {
                 // Tarteel (SpeechRecognizer) has no pipeline to pause and no
                 // resume latch, so it keeps the original single synchronous
-                // finalize for both directions of the button.
+                // finalize for both directions of the button: it STARTS when
+                // nothing is running and PAUSES+SUMMARY when a session is live.
+                //
+                // §4.60 — AND THAT MUST NOT BE "IMPROVED" INTO A PIPELINE CALL.
+                // Routing the post-mistake tap to `startTajweedSession()` looked
+                // reasonable (let the reader continue instead of summarizing) and
+                // was a straight regression: that function is the SHERPA PIPELINE
+                // session, and Tarteel deliberately does NOT use the pipeline.
+                // Measured on the user's first run of the build — Memorize +
+                // Tarteel displayed NOTHING at all:
+                //   onMicTap(): Tarteel — resuming after the mistake popup
+                //     (mistake latch=none)
+                //   startTajweedSession(): holder.pipeline=202565362 ...
+                //   startTajweedSession(): resume() returned true
+                //   analyze(fast): done 70ms matched=0 hasError=false targetWords=29
+                // while the words displayed perfectly the moment he switched the
+                // mode chip to Tajweed. The SpeechRecognizer was never started, so
+                // there was nothing to match. The user's words: "i tried memorize +
+                // tarteel and nothing got displayed. then i clicked on tajweed and
+                // found that the words are displayed there."
+                //
+                // Continuing after a mistake is handled where it belongs — on the
+                // popup's DISMISSAL (see below), which hands the next tap back to
+                // this start path.
                 if (recitationMode != "Tajweed") {
                     runStopAndFinalize(true, false)
                     return
@@ -11607,8 +12491,32 @@ spokenTimings.clear()
                 }
             }
             LaunchedEffect(sessionFinalized, isListening, detailedAnalysis, analysisEpoch, finalizeTick) {
-                if (currentTab != "Memorize" || recitationMode != "Tajweed") return@LaunchedEffect
-                if (!sessionFinalized || !isListening) {
+                // §4.59 — TARTEEL INCLUDED. The user: "there is popup for mistaks and
+                // summury in pause and end and everything exactly like we do in tajweed
+                // mode except we dont have tajweed mistakes/popups". The END-OF-RANGE
+                // SUMMARY is part of that contract, and this gate excluded every mode
+                // but Tajweed — so in Tarteel a recitation that simply ran out of words
+                // ended in silence, with no summary, until the user happened to tap the
+                // mic.
+                //
+                // Nothing tajweed-specific happens below: the acoustic pass is gated
+                // separately (isTajweedMode) and the tajweed popup watcher keeps its own
+                // `recitationMode == "Tajweed"` gate, so Tarteel gains the end summary
+                // and the pause handling and nothing else. Its recognition — which the
+                // user says is far better than the Tajweed path — is untouched.
+                if (currentTab != "Memorize" ||
+                    (recitationMode != "Tajweed" && recitationMode != "Tarteel")
+                ) return@LaunchedEffect
+                // §4.63 — AND FOR A NON-PIPELINE MODE, `isListening` MAY ALREADY BE
+                // FALSE. `onResults` (the platform recognizer's "I am done", §4.62)
+                // also flips the listening state off, so demanding both flags meant
+                // the end-of-range decision could never run in Tarteel: it re-armed
+                // and returned every time. The `isListening` requirement exists for
+                // the PIPELINE, where a stray endpoint can mark a session final while
+                // the reader is still going — there we must keep waiting. For a
+                // session the recognizer itself has closed, waiting IS the bug.
+                val needsLiveMic = recitationMode == "Tajweed"
+                if (!sessionFinalized || (!isListening && needsLiveMic)) {
                     // Live (or re-started) session: re-arm for the next finalize.
                     autoFinalizeDone = false
                     mistakeHoldSinceMs = 0L

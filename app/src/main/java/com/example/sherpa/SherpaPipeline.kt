@@ -957,7 +957,17 @@ class SingleAudioPipeline(
     // is that a long pause hands the mic back without an explicit tap. Matches
     // a normal breath between ayahs in casual recitation. The final-commit
     // decode runs on auto-stop just like a manual pause()/stop().
-    private val autoStopSilenceMs = 4000L
+    //
+    // §4.52 — 4 s → 2.5 s. "it take too long after i finish to turn the mic off
+    // (i think 8 sec)". Measured on the user's own real-mic Al-Baqarah run, the
+    // mic did not hand back for 4 s after the last syllable, and THEN the
+    // end-of-session repair decode ran for 10.3 s before anything appeared on
+    // screen — 14 s of the app appearing to think, for a recitation that was
+    // over. 2.5 s of silence is still far longer than the ~1 s breath between
+    // ayat, so the recitation is not cut off, and it takes 1.5 s off BOTH the
+    // manual and the automatic path (the user waits out the same clock when he
+    // stops speaking without tapping).
+    private val autoStopSilenceMs = 2500L
     private val minDecodeFrames = sampleRate * 3 / 2 // never decode < 1.5 s (mid-word slices)
 
     // Verification-decode geometry (see verifyTailWords). This model decodes a
@@ -2574,7 +2584,22 @@ class SingleAudioPipeline(
         // Decode the whole session when it fits the cap so the repair can
         // actually run; keep the short tail for anything longer, rather than
         // spending 20+ s decoding audio at the end of a long session.
-        val FINAL_DECODE_MAX_SEC = 90
+        //
+        // §4.52 — AND THE CAP IS NOW A COST BOUND, NOT A LENGTH BOUND. The user:
+        // "it take too long after i finish to turn the mic off (i think 8 sec) …
+        // make the summary a little faster". Measured on his own real-mic
+        // Al-Baqarah run, the end-of-session decode was THE ENTIRE WAIT:
+        //   finalDecodeAndEmit(): begin   endpoint=true window=54,5s
+        //   finalDecodeAndEmit(): done 10253ms
+        //   endOfRange(): summary raised   (+49 ms after that)
+        // i.e. ~0.19 s of recognizer time per second of audio, so a 90 s cap
+        // could mean 17 s of silence on screen. 30 s keeps the WHOLE-SESSION
+        // repair (and therefore `coversSession` and the repair-swap) for every
+        // normal recitation — Al-Fatihah 1-7 is 26.5 s and still gets it — while
+        // bounding the worst case at ~5.7 s. Anything longer falls back to the
+        // 10 s tail, which is what repairs a FINISH (the closing seconds the last
+        // sliding window clipped).
+        val FINAL_DECODE_MAX_SEC = 30
         var fromIdx = maxOf(0, src.size - FINAL_DECODE_MAX_SEC * sampleRate)
         if (fromIdx != 0) {
             fromIdx = maxOf(0, src.size - 10 * sampleRate)
