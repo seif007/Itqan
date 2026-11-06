@@ -37,6 +37,9 @@ _parity*.log
 # Local work notes / handoff docs — developer-only, never committed.
 WORK_NOTES.txt
 
+# Marketing build scratch (final assets go to docs/marketing).
+.tmp-marketing/
+
 # One-off probe / signature dumps from PC debugging sessions.
 probe_*.txt
 eng_*.txt
@@ -45,11 +48,10 @@ build_fails*.txt
 nullx/
 
 # ----------------------------------------------------------------------------
-# Large bundled STT model assets — local-only (exceed GitHub's 100 MB file
-# limit; the original repo never tracked them). The app extracts/downloads
-# them on device; see WORK_NOTES.txt locally for where they come from.
-# ----------------------------------------------------------------------------
-app/src/main/assets/quran_stt/
+# Large bundled STT model assets - local-only (exceed GitHub's 100 MB file
+# limit). The weights are downloaded on first use; only the small token map and
+# the model license ship in the APK.
+app/src/main/assets/stt_model/*.onnx
 app/src/main/assets/sherpa_tarteel/
 app/src/main/assets/qalun_nemo_manifest.jsonl
 

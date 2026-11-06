@@ -32,6 +32,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "My Application"
+rootProject.name = "Itqan"
 
 include(":app")

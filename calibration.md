@@ -106,7 +106,7 @@ explicitly overridden.
   UI layer via `ruleLabelToHead` / `getAppString`, NOT by the model.
 - Parity: `TajweedNetParityTest` runs the same fixture through both Kotiln and the
   PyTorch reference and asserts forward-pass agreement to within float32 tolerance. Run
-  `./gradlew :app:testDebugUnitTest --tests com.example.ml.TajweedNetParityTest` after any
+  `./gradlew :app:testDebugUnitTest --tests itqan.app.ml.TajweedNetParityTest` after any
   weights refresh.
 
 ---

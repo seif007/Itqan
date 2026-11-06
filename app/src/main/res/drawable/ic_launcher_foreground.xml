@@ -36,7 +36,7 @@
         android:strokeWidth="2"
         android:pathData="M54,38 L54,43" />
 
-    <!-- Open Quran Book design -->
+    <!-- Open book design -->
     <!-- Left Page -->
     <path
         android:fillColor="#5EEAD4"

@@ -7,15 +7,23 @@
 }
 
 android {
-  namespace = "com.example"
+  namespace = "itqan.app"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.aistudio.recitationpractice.quranstt"
+    applicationId = "itqan.app"
     minSdk = 24
     targetSdk = 36
     versionCode = 1
     versionName = "1.0"
+
+    // The app ships one native runtime (onnxruntime-android). Limiting it to
+    // arm64-v8a drops the armeabi-v7a/x86/x86_64 copies of libonnxruntime.so
+    // (~47 MB of the APK). Every supported phone is arm64; the x86 builds were
+    // only ever useful to an emulator, which can use an arm64 system image.
+    ndk {
+      abiFilters.add("arm64-v8a")
+    }
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -141,8 +149,8 @@ dependencies {
   "ksp"(libs.androidx.room.compiler)
   "ksp"(libs.moshi.kotlin.codegen)
 testImplementation("javazoom:jlayer:1.0.1")
-  // PC-side end-to-end STT harness (PcQuranSttEndToEndTest): loads the SAME
-  // quran_stt ONNX model with the DESKTOP onnxruntime so unit tests can run the
+  // PC-side end-to-end STT harness (PcSttEndToEndTest): loads the SAME
+  // stt_model ONNX model with the DESKTOP onnxruntime so unit tests can run the
   // real recognizer on real audio without a device. The Android artifact stays
   // on the main compile classpath (identical ai.onnxruntime API); at test
   // RUNTIME the Android natives would shadow the desktop ones, so the Android
@@ -150,15 +158,15 @@ testImplementation("javazoom:jlayer:1.0.1")
   testImplementation("com.microsoft.onnxruntime:onnxruntime:1.17.1")
 
   // ONNX Runtime (Android) drives the FastConformer CTC model from
-  // Muno459/fastconformer-quran bundled in assets/quran_stt/. Runs on the
-  // CPU EP. The model is NPL-1.1 (non-commercial); the surrounding
-  // application stays Apache-2.0.
+  // Muno459/fastconformer-quran (downloaded into files/sherpa_model/, license
+  // at assets/stt_model/LICENSE). Runs on the CPU EP. The model is NPL-1.1
+  // (non-commercial); the application's own source is MIT-licensed (LICENSE).
   implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.1")
 }
 
 // Keep the Android ORT natives OFF the unit-test runtime so the desktop
 // onnxruntime (added above as a testImplementation) loads ITS natives and can
-// run the same quran_stt model on the PC. (testRuntimeClasspath is created
+// run the same stt_model model on the PC. (testRuntimeClasspath is created
 // lazily by AGP, hence configureEach.)
 configurations.configureEach {
   if (name == "testRuntimeClasspath") {

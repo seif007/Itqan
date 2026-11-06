@@ -112,10 +112,17 @@ purely the calibrated threshold.
 
 ## 4. Mistake surfacing (the new UX)
 
-**Memorize + Tarteel (the default):** when the user speaks, word-tracking via the
-SpeechRecognizer advances through the target text. On a wrong or skipped word the existing
-banner appears, an `errorIndex` is computed, and the alignment stops advancing until the
-user recites correctly — no tajweed analysis is engaged, so the user pays no battery tax.
+**Memorize + Tarteel (the default):** word-tracking runs on the platform Android
+`SpeechRecognizer` (`recognitionMode == "Tarteel"`), so its recognition accuracy is exactly what
+that recognizer gives — no tajweed analysis is ever engaged, so no tajweed rule, score or popup can
+appear. It does get the *same session contract* as Memorize + Tajweed: on a wrong or skipped word
+the walk freezes at that word and raises the same must-dismiss popup, the display rewinds to it, a
+pause shows the honest "Recitation Paused" summary, finishing the range shows the completion
+summary, and dismissing the popup lets the next mic tap continue from the flagged word. Because
+there is no pipeline and no tail decode to arbitrate, **the freeze itself is the verdict** — in
+particular a skipped word is confirmed immediately (a jump is visible to the reader), not after a
+multi-emission wait. See §4.58–§4.65 for the parity work and §4.69 for the cursor-pinning defect
+that made Tarteel display words past a mistake.
 
 **Memorize + Tajweed:** word-tracking runs on the **Sherpa-ONNX** offline
 recognizer (`SherpaPipeline`): a single `AudioRecord` feeds both the STT
@@ -126,17 +133,18 @@ rule-detector tagged. When the model judges `P(correct) < threshold` (after
 the bounded confirmation search, §1 step 5):
 
 - the word's `status` becomes `TAJWEED_ERROR`,
-- a separate piece of UI state (`latestTajweedPopup`) is set to `(ruleLabel, wordIndex, score)`,
-- a small auto-dismissing dialog appears — "**Tajweed Mistake — <rule>**, your
-  <rule> score: N%" — and the mic auto-stops so the user can read the feedback;
-  a score-aware guard (`lastTajweedPopupIndex` + `lastTajweedPopupScore`) lets
-  the SAME word re-fire when a later re-read produces a different score,
-- stopping arms the same mistake-resume re-seat as WRONG/SKIPPED: tapping the
-  mic truncates the display transcript to the prefix BEFORE that word, so the
-  re-read passes the collector's count-filter (otherwise it is swallowed as an
-  "already committed" replay copy and nothing shows), gets displayed, gets
-  freshly scored (verdict-cache key includes the utterance timing), and
-  re-popups if still wrong,
+- one dialog at a time is raised for that `(word, rule)` pair — "**Tajweed Mistake — <rule>**, your
+  <rule> score: N%" — and the mic auto-stops so the user can read the feedback; the popup is NEVER
+  auto-dismissed, and `shownTajweedPopups` (a SET of pairs) means each verdict speaks at most once
+  per session and two standing mistakes cannot take turns (§4.53); the re-read re-arms it,
+- a verdict is only spoken if it is ISOLATED — a failing neighbour within `TAJWEED_ISOLATION_SLACK`
+  (= 2) words means the scorer's cross-word boundary is offset, not a mistake (§4.55); and one
+  acoustic pass scores at most `TAJWEED_WORDS_PER_PASS` (= 6) words (§4.56),
+- stopping rewinds the display to the flagged word IN THE SAME INSTANT (§4.52) and arms the same
+  mistake-resume re-seat as WRONG/SKIPPED: tapping the mic truncates the display transcript to the
+  prefix BEFORE that word, so the re-read passes the collector's count-filter (otherwise it is
+  swallowed as an "already committed" replay copy and nothing shows), gets displayed, gets freshly
+  scored (verdict-cache key includes the utterance timing), and re-popups if still wrong,
 - while the resume latch is armed the collector FREEZES: every post-stop
   emission (in-flight window decodes plus `pause()`'s own final full-tail
   decode) is dropped, so dead pre-stop audio can never resurrect the mistake
@@ -156,13 +164,21 @@ never wipe a brand-new run on its first mic tap. Both flags reset on every range
 change.
 
 **WRONG / SKIPPED mistakes — confirmation + verification gate.** A text-level
-candidate only becomes a *punished* mistake after three gates:
+candidate only becomes a *punished* mistake after three gates. These gates describe the surface
+that HAS a confirm loop — **Memorize + Tajweed**. There, a tentative candidate is RIDDEN OVER (the
+walk keeps tracking the voice) for at most `RIDE_OVER_BUDGET_MS` (= 8 s, §4.67); if the gates below
+resolve it as absent the mistake pops, and if they never resolve, the budget expiry makes the app
+the decider and it pops anyway. On **Tarteel** there is no confirm loop, so the walk's freeze IS the
+verdict: skip AND wrong raise the popup immediately from that freeze (§4.58/§4.61).
 
 1. **Multi-emission confirmation:** the SAME first-mistake index must survive
    distinct emissions — 2 for WRONG, 3 for SKIPPED (plus ≥2 s dwell and the
-   transcript advancing ≥3 words past the skip). The visible banner/red word
+   transcript advancing ≥3 words past the skip). The visible red word highlight
    uses this same evidence (`confirmedMistakeUiIdx`) so a transient
-   single-window decode artifact never flashes.
+   single-window decode artifact never flashes — and **§4.57**: a candidate is
+   released only when its WORD has really left the analysis (a re-read, a range
+   change, a re-seat); a brief absence no longer wipes the sightings, dwell and
+   absent strikes, which is what used to make a real mistake unprovable.
 2. **Early tail verification:** at the SECOND sighting, one full-context
    offline decode of the trailing ~10 s (`SingleAudioPipeline.verifyTailWords`,
    read-only, serialized against the live decode loop via `decodeBusy`) looks
@@ -199,10 +215,11 @@ is then adopted WHOLESALE when it aligns to the target with more leading
 matches than the live log — the same heal a manual pause used to trigger,
 applied automatically mid-session.
 
-**Verified-only display.** The wrong/skipped banner + red word appear ONLY after
+**Verified-only display.** The popup + red word appear ONLY after
 the tail verification says the word truly was not said. Transient candidates
 stay invisible while self-heal has a chance; "only true mistakes should be seen
-by the user".
+by the user". On a surface with no confirm loop (Tarteel) the walk's freeze is
+the decision itself — see §4.58/§4.61.
 
 **Exclusive popups.** WRONG/SKIPPED rows carry no tajweed rule (and stale scored
 rows for that word are purged): the user sees either a recitation-mistake popup
@@ -329,7 +346,7 @@ for fresh material on every expand/refresh, like the practice_recitation-main bu
 card colouring and the acoustic coach are both driven by `getTajweedRuleForWord` /
 `buildTajweedAnnotatedString`, the generator reuses those exact functions rather than
 duplicating colouring logic. On expand and on the refresh icon, the card calls
-[`generateRandomQuranExample(head)`](app/src/main/java/com/example/ui/RecitationApp.kt), which:
+[`generateRandomRecitationExample(head)`](app/src/main/java/com/example/ui/RecitationApp.kt), which:
 
 1. picks a random surah (1..114),
 2. fetches it from `https://api.alquran.cloud/v1/surah/{n}/ar.alafasy` (OkHttp),
@@ -351,14 +368,24 @@ before, so offline UX is unchanged.
 The practice card's "Acoustic score per rule" panel used to disagree with the example it
 scored, in three ways (all fixed):
 
-1. **Missing rules.** `analyzeRecitationDetails` scores ONE rule per word —
-   `getTajweedRuleForWord` returns the FIRST match and returns immediately, so
+1. **Wrong rule set (missing *and* phantom rows).** `analyzeRecitationDetails` scores ONE
+   rule per word — `getTajweedRuleForWord` returns the FIRST match and returns immediately, so
    الْحَمْدُ short-circuits on its Al-Lam article and the Izhar-Shafawi meem inside the SAME
-   word is never scored. After the primary pass, the card now runs a supplemental pass:
-   `TajweedRules.detectRulesForWord` (the training-aligned multi-rule table) detects every
-   rule across the example tokens; heads the primary pass left uncovered are scored directly
-   against `RecitationAnalyzer` on each token's proportional audio slice (silence-trimmed)
-   and appended as extra rows. Rows never duplicate a primary one.
+   word is never scored. The card fills that gap with a supplemental pass, but the ROW SET is
+   bounded by what the example actually DISPLAYS: `tajweedHeadsInPhrase` runs the example
+   colouriser (`buildTajweedAnnotatedString`) with a heads sink and returns the rule heads it
+   paints, and **that painted set decides which rows exist**. Heads the primary pass left
+   uncovered are scored directly against `RecitationAnalyzer` on each token's proportional
+   audio slice (silence-trimmed) and appended; a primary row for a head the example does not
+   paint is dropped; rows never duplicate a head, and they are ordered by first appearance in
+   the example. (Before this, the supplemental pass unioned `TajweedRules.detectRulesForWord`
+   with `getTajweedRuleForWord`. Those two detectors disagree with the colouriser — the
+   table's noon-saakinah branch pairs the noon with the NEXT word's first letter even when a
+   letter follows it inside the same word, inventing IKHFA/IZHAR/IDGHAM; its tanween branch
+   emits GHUNNAH for any tanween; its MADD fires on natural 2-count vowels the colouriser
+   never paints red — so the user reported *"the example has only 2 tajweed rules but I got
+   the percentages of 4 rules"*. Pinning the rows to the painted set also fixes the opposite
+   bug: `مِّن مَّآءِ` now correctly gains the IDGHAM row the old union missed.)
 2. **Wrong row colours.** Row colours resolved via an exact card-title match
    (`rulesList.firstOrNull { it.name == ruleName }`) — sub-labels like "Madd Muttasil" /
    "Al-Lam" match no title and fell back to the theme primary (a Madd row rendered TEAL).
@@ -368,8 +395,10 @@ scored, in three ways (all fixed):
    TAJWEED_ERROR / WRONG / SKIPPED word flat red, which read as "this word is a Madd
    mistake" even when the red was a skipped word or a different rule. Each word is now
    rendered with `buildTajweedAnnotatedString` — the SAME letter-level palette as the
-   example — with two status overrides: WRONG/SKIPPED get error colour + strikethrough,
-   TAJWEED_ERROR keeps its rule colours plus an underline.
+   example — with two status overrides: WRONG/SKIPPED get error colour, TAJWEED_ERROR
+   keeps its rule colours plus an underline. The annotated line now lives in the card's
+   "Your recitation" block (replacing the recognizer's raw transcript, which is never
+   shown) instead of under the per-rule percentages.
 
 ### 4.3 The end-of-range popup was gated on PENDING — and PENDING never clears
 
@@ -578,7 +607,7 @@ session (measured fatihah_c23 at `01:15:13.179` and `01:15:13.703`), so goal pro
 
 ```
 E/MainViewModel: Error updating goals
-java.lang.IllegalStateException: Migration didn't properly handle: goals(com.example.data.Goal).
+java.lang.IllegalStateException: Migration didn't properly handle: goals(itqan.app.data.Goal).
   Expected: createdTimestamp, id, mistakeEntriesJson, mistakesCount, rangeEnd, rangeStart,
             recitedAyahs, skippedWordsCount, surahNumber, tajweedMistakesBreakdown,
             tajweedMistakesCount, targetAyahs, type, wrongWordsCount
@@ -793,7 +822,7 @@ Two supporting changes:
 
 ### 4.15 The verification loop starves the recognizer it is judging
 
-The mistake-verification decode runs on the **same** `QuranSttEngine` as the live sliding
+The mistake-verification decode runs on the **same** `SttEngine` as the live sliding
 windows, and an **INCONCLUSIVE** result (decode too short, or fewer than 2 words shared with the
 target neighbourhood) does **not** count as a strike (§4.13). So a candidate that never resolves
 was retried forever — one decode every 3 s, for the rest of the session.
@@ -1494,7 +1523,7 @@ The rule cards carry *display* titles; the detectors emit *sub-labels*. The mapp
 the bare card title `"Madd"`. Three consequences, all real:
 
 1. The card-expand effect starts with `val head = ruleLabelToHead(rule.name) ?: return@LaunchedEffect`,
-   so for Madd it returned early: `generateRandomQuranExample` was never called and the card stayed
+   so for Madd it returned early: `generateRandomRecitationExample` was never called and the card stayed
    on `rule.examples.first()` forever. The user's *"it always gives me an example containing madd"*
    was true but for the wrong reason — it was always the SAME example.
 2. The supplemental score rows resolve a head to a display name with
@@ -1523,26 +1552,32 @@ TajweedExample("عَلَيْهِمْ غَيْرِ", "Not of those")         // �
 
 **Finding 3 — the multi-rule reachability check was a tautology.** The first version of the audit
 asserted `all ⊆ primary ∪ (all - primary)`, which is true by construction and can never fail. The
-row *set* really is complete by construction; what can break is how a row **resolves for display**
-(head → card label → Arabic string → rule colour → calibrated threshold). That is what a missing
-`"Madd" -> "MADD"` case actually broke, so the assertion was rewritten to pin exactly that, plus the
-`headToFriendlyLabel` → `ruleLabelToHead` round-trip that `analyzeRecitationDetails` composes when it
-labels every multi-rule row.
+row *set* is now pinned by the PAINTED set instead: `tajweedHeadsInPhrase` is the single authority
+for which rows exist (see §4.2), and two tests guard the contract — every bundled example must
+PAINT its own card's rule, and every head the primary pass scores must also be painted (otherwise
+the painted-only row filter would drop a rule the user can see). What can still break is how a row
+**resolves for display** (head → card label → Arabic string → rule colour → calibrated threshold),
+which a missing `"Madd" -> "MADD"` case broke; that stays pinned too, along with the
+`headToFriendlyLabel` → `ruleLabelToHead` round-trip.
 
-**Verified** — `TajweedCardExampleAuditTest`, 5/5 passing:
+**Verified** — `TajweedCardExampleAuditTest`, 7/7 passing:
 
 ```
-tests=5 failures=0 errors=0
+tests=7 failures=0 errors=0
   PASS every scoreable head is fully resolvable for display
   PASS head to friendly label round-trips through ruleLabelToHead
   PASS every bundled example exhibits its own card's rule
+  PASS every bundled example paints its own card's rule
+  PASS primary heads are a subset of the painted heads
   PASS report the rules each bundled example actually contains
   PASS every card maps to a trained model head
 ```
 
-The audit dump is also the reference for **which rules each example really teaches** — e.g. the
-Ghunnah card's `إِنَّمَا` reports `primary=[GHUNNAH]` while `detectRulesForWord` also sees `MADD`,
-which is precisely the case the supplemental pass exists to turn into a second score row.
+The audit dump is also the reference for **which rules each example really teaches** — it prints
+`painted`, `primary` and `detected` per example together with the row count under each policy, so
+a detector-alignment regression is visible at a glance (e.g. `مَقْطُوعَةٌ` showed 3 rows under the
+old `primary ∪ detected` union and 1 under the painted set; `مِّن مَّآءِ` goes the other way, 2 → 3,
+because its painted IDGHAM was previously missed).
 
 ### 4.27 The popup named only the rule, the summary was withheld by a rebuild, and the acoustic pass starved the decoder
 
@@ -2713,6 +2748,621 @@ it to justify adopting an ORDER. Coverage and order are different claims; a bran
 the other needs both guards. And when two sources each carry part of the truth, neither one's order
 should win by default — there is a third, authoritative order available, and it is the one the app is
 scoring against.
+
+### 4.42 The display lag: remove dead wait, never the decode cadence
+
+**Symptom.** "it takes too long to display the words."
+
+**Measured.** Emission → display was ~215 ms, and `analyze(fast)` averaged 215 ms of which most
+was the loop's own `delay(200)`.
+
+**The constraint that governs every latency change here.** `spokenTimings` is written in
+`onPartial` at the partial's ARRIVAL time, and the tajweed scorer cuts each word's PCM segment
+from it. Moving the decode cadence therefore moves the model's input, and a rule that IS a
+duration (MADD) can flip. The first attempt lowered `decodeIntervalMs` 1500 → 800 and regressed:
+`رَزَقْنَٰهُمْ` flagged at 44/50 against the 0.56 bar. It was reverted.
+
+**The shipped form** moves only wait that runs AFTER an emission, so it cannot move a timestamp:
+
+- fast (text-only) loop debounce `delay(200)` → `delay(60)`;
+- `SherpaPipeline.decodeLoop` poll `delay(150)` → `delay(50)`;
+- `decodeIntervalMs = 1500`, `windowSeconds = 4.0`, `minDecodeFrames` untouched.
+
+**Result.** `analyze(fast)` 215 → **77 ms** average, emission → display **95 ms median**, and the
+decode COUNT per run unchanged (30) — which is the proof the cadence did not move. The inline
+comment records the invariant: *a latency knob that does not move emission timing is not a
+tajweed knob.*
+
+**Still open (structural).** Give `decodeWindow` the recognizer's real per-word sample spans
+(`SttEngine.transcribeWithWordTimes()`) so the scorer cuts the true acoustic span instead of
+the emission wall-clock. Only then is it safe to lower `decodeIntervalMs` for the larger win.
+
+### 4.43 An acquittal must leave evidence
+
+The tail verify proved a flagged word WAS spoken (`found=true`, `verifiedSpokenIndices += idx`),
+and the summary was still withheld on a perfect recitation:
+
+```
+autoFinalize(): grace expired with 36/36 words decided (unheard=0 mistake=false)
+autoFinalize(): undecided rows = w1/ذَٰلِكَ:CORRECT:spoken='-'
+endOfRange(): auto stop but NOT genuinely finished (unheard=1/36) -> no summary
+```
+
+Cause: the verified-spoken override only flips a row that is still WRONG/SKIPPED, and by then the
+row had been promoted to CORRECT with no token. `unheardWordCount()` counts that shape as UNHEARD,
+so `genuinelyFinished` stayed false. Fix (recovered from the stash, `found=true` branch): stamp the
+vindicated row with the decoded token that actually matched it, using the same normalization ladder
+the `found` test used. §4.31 is untouched — a word no decode found still gets no token and still
+blocks. This is the rule: **an acquittal must RESTORE evidence, not only clear the accusation.**
+
+### 4.44 The reveal froze, then jumped: a tentative SKIPPED is not a hard stop
+
+**Symptom** (both real mic and injection, long ranges): the highlight froze at ayah 2 of Al-Baqarah
+and then all words up to ayah 5 appeared at once. Verdicts were correct; this was display only.
+
+**Cause.** The count loop `break`s on the first WRONG/SKIPPED, so `newMatchedWordCount` stalled on
+the tentative row for the whole 15–26 s confirm window, then leapt when it was acquitted. The first
+floor fix (`maxOf(count, previous)` lifted to `lastHeardWord`) could not reach far, because a
+SKIPPED row has `spokenText = null` — there is no heard evidence to ride on
+(`cursor held at 6 (walk wanted 1, heardThrough=6, armed=false)`).
+
+**Fix.** In the count loop, a tentative SKIPPED during a live session with no armed latch still
+sets `newHasError` (the confirm loop keeps verifying) but no longer breaks — the walk keeps counting
+the words the recognizer HAS matched. WRONG, a finalized session and a CONFIRMED skip still freeze.
+`resolveTranscriptCursor` gained the `confirmedMistakeArmed` parameter it needs to tell the two
+apart. Device proof: `matched=` climbed **1→6→7→…→36/36** with no stall, and
+`SMOOTH-REVEAL rode over tentative SKIPPED` fired exactly when the row appeared.
+
+### 4.45–4.47 Always decide the session; never un-display a word
+
+**§4.45 — the end of a session must be decided, not guessed.**
+
+- The collector set `sessionFinalized` only from an endpoint that CARRIED WORDS, and
+  `finalDecodeAndEmit` legitimately emits nothing on the normal end of a real-mic recitation
+  (`hold - no new words`, or a blank render). `SherpaPartialEvent` now carries an explicit
+  `finalCommit` marker after every real decode attempt, generation-guarded so a decode that raced a
+  resume cannot finalize the new session.
+- `unheardWordCount() == 0` made "finished" unreachable, because the closing word is routinely the
+  one never rendered. `isGenuineFinish()`: at least 90 % heard, at most `GENUINE_FINISH_MAX_UNHEARD`
+  (= 2) decoder blind spots, and the display already at the end of the range. A mid-range stall is
+  still not a finish.
+- `runStopAndFinalize` was wrapped in `if (isListening)`, and both stop paths clear `isListening`
+  first — so a pause skipped its own summary. The decision is now gated on
+  `recitationSessionActive` (the SESSION), takes a `force` flag so a pause whose endpoint never
+  lands still summarizes after a bounded wait, and `pendingRemain` no longer vetoes a pause the
+  user asked for.
+
+**§4.46 — one popup per (word, rule), re-armed only when the user acts.**
+
+- The guard re-fired for the same word whenever its SCORE drifted, and only PASSING verdicts were
+  cached — so every acoustic pass re-scored the failing word against a longer buffer, got a
+  marginally different percentage, and re-opened the dialog the instant it was dismissed. The fix
+  is the CONTRACT: a popup stays until dismissed, and the same verdict can only speak again after
+  the user re-reads the word.
+- Faster: acoustic cadence 3.0 s → 1.8 s, live settle 2.0 s → 1.5 s, a staged confirmation sweep
+  (coarse 600 ms probe, then the original 150 ms sweep as the fallback, so forgiveness is never
+  reduced), and failed verdicts cached against the search window that produced them — a fail is
+  re-run only when the buffer has grown enough to expose new candidates.
+- The re-read seats the transcript on the SPOKEN words consumed before the mistake (target and
+  spoken indices diverge as soon as anything was skipped). The FAB is explicit about its three
+  intents: stop, re-read, start. `start()` is retried while a teardown is in flight, and
+  `verifyInFlightIdx` is released in a `finally` (a cancellation used to latch it).
+
+**§4.47 — the display contract.**
+
+- **REACHED ⇒ DISPLAYED**, one-directional: a per-session cursor floor means a word once shown
+  cannot go grey again, except when a CONFIRMED mistake must be returned to so the error colour
+  paints there.
+- The epoch guard covered only the queue; a pass already running when the user hit Restart /
+  Repeat Ayah / changed the range could write the old cursor back. Both loops now re-check the epoch
+  immediately before writing.
+- The end-of-session forgiveness is bounded to `FINALIZE_FORGIVE_TAIL_WINDOW` (= 8) words past the
+  last word carrying a spoken token, and promotes NOTHING when there is no heard evidence. It used
+  to promote every undecided row, which turned an early end into a fully green range.
+- `stop()` / `release()` capture the utterance generation synchronously; read inside their async
+  teardown, a session-end signal from an ABANDONED session always landed and re-armed the
+  end-of-range hold on a wiped transcript (the "froze, then all words appeared at once" report).
+- The renderer resolves rows through one index per analysis instead of a linear scan per drawn word
+  (cost grew with the SIZE OF THE RANGE), and auto-scrolls only when the target ayah has actually
+  left the viewport.
+- Repeat Ayah / Restart really stop the mic (a SpeechRecognizer call is a no-op in
+  Memorize + Tajweed), reset the session, the endpoint evidence, the grace latches, the popup
+  latches and the verdict caches; Repeat Ayah re-seats the committed set and the word timings to
+  the prefix so the re-read is not swallowed as a replay.
+
+### 4.48–4.50 Honest display, honest summary, bounded storage
+
+Every item below is pinned to a log line from the user's own device runs.
+
+**§4.48 — the real-mic report (Al-Fatihah + Al-Baqarah).**
+
+- An UNPROVEN candidate reached the summary. A tentative row (`absentIdx=-1 verified=false`, no
+  absent strike) was still open when the user paused, and the pause path listed it — a clean
+  recitation was told it had skipped a word. Both paths now forgive an unproven candidate first and
+  report only what a whole-session tail decode actually proved.
+- The resume re-seat cut on (word, rule) ROWS, not words, so on a surah with cross-word rules the
+  transcript was cut three words deep and the re-read was compared against the wrong targets
+  ("it didnt get back to it").
+- The display floor did not rewind at a mistake, so words AFTER the flagged one stayed lit. It now
+  drops to the mistake at the popup, at the stop and at the re-seat.
+- A mid-range pause was titled "Recitation Summary" and read like a verdict on a 6116-word surah.
+  It is now "Recitation Paused" with an honest `Recited N of M words` line and no praise.
+
+**§4.49 — the tajweed cards.**
+
+- A generated example could lose the rule it was picked for: the window around the trigger could
+  drop the trigger's right-hand partner, and most rules are cross-word. The window now keeps it and
+  the finished snippet is re-detected before it is shown.
+- Ghunnah was detected but never painted: the colouriser required the shaddah immediately after the
+  noon/meem, but voweled orthography puts the harakah in between, so `إِنَّ` and `مِّن` rendered
+  plain.
+- Every rule in the summary was painted `0xFF7E57C2` (the Meem-Sakinah head colour), so a MADD
+  mistake came out purple; section icons borrowed Idgham orange; the lunar Al-Lam was painted in
+  Ikhfa's exact cyan. All rule colours now resolve through one palette, the legend reads it, and
+  the colour table is font-locked at §6.
+- A word with two failed rules only ever showed one verdict: the popup latch was keyed on the word.
+  It is keyed on (word, rule) now, so every distinct verdict surfaces once, still one dialog at a
+  time.
+
+**§4.50 — "it keeps getting stuck in displaying words".**
+
+- The auto-finalize loop could not end: the branch that fires when the range is far from finished
+  never advanced the promotion counter, so the "fall through on the next pass" guard returned every
+  2 s, forever. Then the pending-veto blocked the summary and the session parked with a frozen
+  display and no dialog. A committed session that stops making progress for
+  `STALL_SUMMARY_AFTER_MS` (= 20 s) now raises the honest paused dialog, and the veto yields to it.
+- The display advanced over words the user never read: the grace promotion was bounded by DISTANCE
+  (+8) with no evidence, and `finalizeCorrect()` did the same while counting ROWS instead of words
+  (13 words measured as 15, window to 23). A word is now only coloured when it carries a decoded
+  fragment, or when the user demonstrably reached the end of the range
+  (`promoteClippedPendingRows()`).
+- On a pause, "N words were not picked up by the recognizer" blamed the recognizer for words the
+  user never uttered. Shown only for a real finish.
+
+**Storage — bound the debug dumps.** `files/sherpa_debug` held **227 wavs / 277 MB** — more than the
+STT model — because every stop and pause dumped the session and nothing deleted them. Now pruned to
+the newest `SHERPA_DEBUG_KEEP` (= 6) before each write. Device went 448 MB → ~172 MB
+(`SherpaDebugDumpRetentionTest`).
+
+### 4.51 A candidate mistake must never freeze the display
+
+**Symptom.** "It got stuck in baqarah." The user's real-mic Al-Baqarah run (6116-word range) froze
+the display on its SECOND word and never moved again while the recognizer kept hearing him:
+
+```
+decodeWindow(): done 683ms new=3 w emitted=25w
+analyze(fast): cursor held at 2 (walk wanted 1, heardThrough=2, armed=false, floor=2)
+finalize(): forgiving 1 UNPROVEN mistake(s) [1] — no tail decode ever came back
+            without them (absentAnchor=-1 strikes=0)
+endOfRange(): summary raised (... cursor=2/6116 -> 6114 word(s) still grey)
+```
+
+The app itself conceded it had NO evidence for the flagged word — and the recitation was dead
+anyway. Two defects, both from treating a CANDIDATE as a confirmed mistake:
+
+- **The analyzer deleted the rest of the recitation.** The WRONG branch emitted the row and then
+  filled every remaining word with a fragment-less PENDING row and returned, so no CORRECT row
+  existed past word 1 and the cursor had nothing to advance over. The SKIPPED branch had always
+  stepped over the word and continued; the WRONG branch now does the same.
+- **The walk froze on it unconditionally.** The WRONG branch did `newHasError = true; break` with
+  no test, while SKIPPED had the SMOOTH-REVEAL ride-over. It now rides over an unproven WRONG the
+  same way, and the confirm loop keeps judging it in the background.
+
+The mistake contract is unchanged: `mistakeStop` still needs two emissions plus a whole-session tail
+decode that came back without the word before it pauses and pops up. Only the UNPROVEN freeze is
+gone. Device-verified on Al-Baqarah 1–5: progression `m=1 → m=6 → … → m=36`, the candidate was
+verified, `ذَٰلِكَ` was ACQUITTED, no false popup, `cursor=36/36 -> ALL WORDS DISPLAYED`.
+
+### 4.52 The reader must not wait — and the display must go back NOW
+
+Two halves of the same complaint ("it take too long after i finish to turn the mic off (i think
+8 sec) … make the summary a little faster"; "i want the display of words to get back to the
+mistaken word when the popup is showed … so he could know from where to recite again").
+
+**Hand the mic and the summary back faster.**
+
+- Auto-stop silence **4 s → 2.5 s** (`autoStopSilenceMs`). Measured: the mic did not hand back for
+  4 s after the last syllable, AND THEN the end-of-session repair decode ran 10.3 s before anything
+  appeared — 14 s of the app appearing to think. 2.5 s is still far longer than the ~1 s breath
+  between ayat.
+- Manual-pause wait **20 s → 1.5 s**. The whole cost is waiting for the final decode
+  (`finalDecodeAndEmit()` +3.1–4.4 s), and the summary then reports the transcript the user watched
+  being built. The repair decode is NOT cancelled — it keeps merging in the background
+  (`keepFinalizedDecisions`, §4.37).
+- Whole-session final-decode cap **90 s → 30 s** (`FINAL_DECODE_MAX_SEC`), a COST bound rather than
+  a length bound (~0.19 s of recognizer time per second of audio, so 90 s could mean 17 s of
+  silence). 30 s still gives the whole-session repair to every normal recitation — Al-Fatihah 1–7
+  is 26.5 s — and bounds the worst case at ~5.7 s; anything longer falls back to the 10 s tail.
+
+**The display rewinds in the same instant the popup appears.** The floor is only a MINIMUM
+(`cursor = maxOf(walk, floor)`), and with the mic stopped no further emission arrives to recompute
+the cursor — so dropping the floor alone left the reader staring at words past the mistake. The
+popup now writes the renderer's own predicate, `alignment = Pair(mistakeIndex, true)`, on BOTH the
+Tajweed path (`stopForMistake`) and the freeze path (`raiseFreezePopupIfUnjudged`), and logs the
+rewind: `display rewound $cursorBeforeRewind -> $wordIdx`.
+
+The `mistakeIndex` is passed to `resolveTranscriptCursor` explicitly. It used to be implicit —
+the walk happened to break on the error, so the count was the mistake index — and §4.51's ride-over
+silently broke that inference.
+
+### 4.53 "Shown" is a set, not a latch
+
+The popup guard was a single latched (word, rule) pair, which made two standing mistakes alternate
+for ever:
+
+```
+tajweedPop(): wordIndex=83 rule=Madd score=34
+tajweedPop(): wordIndex=2  rule=Madd score=31
+tajweedPop(): wordIndex=83 rule=Madd score=34
+```
+
+The scores are identical every time: the same two verdicts, ping-ponging. `shownTajweedPopups` is
+now a SET: every pair that has been shown is remembered, so each speaks at most once, and the
+re-read re-arms them because that is the user acting on the mistake. The same pass also fixed the
+re-read floor: it follows the kept prefix (not the whole transcript), so the display advances
+during a re-read instead of staying pinned.
+
+The latch also survives a blank decode pass. It used to be cleared whenever the row momentarily
+disappeared, which re-opened a dialog the user had already dismissed.
+
+### 4.54 A ridden-over error must not pin the display ahead of the voice
+
+`newHasError` used to mean "the walk STOPPED here". §4.51 gave the walk a ride-over, so it no
+longer stops — yet a single unresolved row (Al-Baqarah's opening `الم ذلك` is one) kept re-setting
+the flag on every pass and it never cleared. Measured on the real-mic Al-Baqarah run:
+`hasError=true` in **44 of 47 passes**, false only before the first word.
+
+That matters because the flag switches the cursor into SMOOTH REVEAL (`maxOf(matched, previous)`,
+one-directional), so a permanently-true flag pins the display at the highest the walk ever reached
+and it can never come back to the voice: *"display of words is far away from what i am reading"*.
+A ridden-over WRONG/SKIPPED no longer sets it.
+
+The same report produced **`DISPLAY_FLOOR_SLACK = 3`**. The session floor (a word once shown stays
+shown, §4.46) was implemented as "never go backwards", which also made every LARGE re-alignment
+permanent — after a pause the aligner can come back tens of words behind
+
+```
+walk=104 … walk=156   (display at 156)
+cursor held at 30 (walk wanted 12, heardThrough=58, floor=30)
+```
+
+The floor exists for a ONE- or TWO-word flicker (measured aligner jitter: 1–2 words). A regression
+of 3+ words is a re-alignment, and there the display follows the voice and the floor is re-seated
+(`the walk fell $floor -> $new, so the display follows it instead of staying $floor words ahead`).
+
+### 4.55 A tajweed accusation must be isolated
+
+"a lot of problems for tajweed mistakes as usual." The log shows all nine came from ONE acoustic
+pass that took **133 seconds** and then fired them as a burst:
+
+```
+analyze(tajweed): done 133417ms scored=37 tajweedErrors=9
+word 18  Iqlab & Ikhfa  17%   adjacent accusers: [19]
+word 19  Iqlab & Ikhfa  33%   adjacent accusers: [18, 21]
+word 21  Idgham         47%   adjacent accusers: [19, 22, 23]
+...
+-> 9 of 9 have an adjacent accuser (100%)
+```
+
+A reader who mispronounces produces ISOLATED failures. Nine ADJACENT words failing, all inside a
+31-point band just under the threshold, is not nine mistakes — it is the scorer's audio boundary
+sitting in the wrong place, so every cross-word rule (Ikhfa, Idgham, Meem Sakinah all need the cue
+AT THE BOUNDARY between two words) gets the wrong slice. A verdict with a failing neighbour within
+`TAJWEED_ISOLATION_SLACK` (= 2) is NOT shown. The row and its score stay in the analysis, and once
+the boundary settles the word is re-scored on its own and can then speak up.
+
+### 4.56 One acoustic pass is bounded
+
+The pass is a model evaluation per word per rule and runs on the deferred loop, so its cost is
+linear in the backlog. Unbounded, one pass produced `analyze(tajweed): done 133417ms scored=37` —
+two minutes twenty during which the app did nothing else, followed by every accumulated verdict
+landing at once. `TAJWEED_WORDS_PER_PASS` (= 6) caps what one pass may score (~11 s on the A04s,
+~5 s on the A05s); the budget is the CONDITION, not a branch, so a past-the-limit word keeps its
+text-only verdict and the NEXT pass (every emission re-requests the analysis, walking in reading
+order) picks it up.
+
+### 4.57 A tentative verdict must survive a brief absence
+
+The wrong/skipped confirmation branch had the same bug §4.53 fixed for tajweed popups, and it was
+worse: TWO consecutive passes without the row wiped the sightings counter, the dwell clock and the
+absent strikes. A WRONG/SKIPPED is tentative by construction (the text re-analysis rewrites
+`detailedAnalysis` on every pass, so the row flickers), so the evidence was destroyed before it
+could reach the bar. Measured on the real-mic Al-Baqarah run: the sightings counter never left 1,
+`verify idx=` lines never launched, and `mistakeStop(): CONFIRMED` never appeared — a real mistake
+produced NO popup at all.
+
+The candidate is now released only when its WORD has actually left the analysis — a re-read, a
+range change, a re-seat — which is the one thing that really means "this is no longer the
+candidate".
+
+### 4.58–4.61 Tarteel parity: the freeze is the verdict
+
+The user's report after testing Tarteel on its own: **"keep displaying words after the missed word
+in tarteel mode"** and "tried skipping words but it always display the words between the last
+correct word and the word i said instead of stopping and giving me a skipped word mistake", then
+"still no popups and no summary".
+
+**§4.58 — a ride-over is only honest where something will judge it.** The ride-over is gated on
+Memorize + Tajweed (`confirmLoopWillJudge`). On the Read / Tarteel surface there is no acoustic pass
+and no tail decode, so a ridden-over error is never judged at all: the walk stepped over it, the
+display filled in the words between, and no mistake was ever raised. In Tarteel **a jump IS the
+mistake** — there is no arbiter, and the reader can see that they skipped — so the walk freezes on
+the first gap and the display stops where the reader actually is.
+
+**§4.59 — the end-of-range summary includes Tarteel.** The auto-finalize gate excluded every mode
+but Tajweed, so a Tarteel recitation that simply ran out of words ended in silence until the user
+happened to tap the mic. Tarteel now gets the end summary and the pause handling and nothing else:
+the acoustic pass is gated separately (`isTajweedMode`) and the tajweed popup watcher keeps its own
+`recitationMode == "Tajweed"` gate, so no tajweed scoring or tajweed popup is possible there. Its
+recognition — the platform `SpeechRecognizer`, which the user says is far better than the Tajweed
+path — is untouched.
+
+**§4.60 — dismissal hands the next tap back to CONTINUE.** On Memorize + Tajweed the next tap
+resumes (the pipeline is warm and the collector re-seats at the mistake). Tarteel has neither, so
+the flag that makes a tap mean "pause" is released on dismissal — otherwise the reader's next tap
+could only ever produce ANOTHER SUMMARY and he could never continue from the word the popup named.
+
+**§4.61 — one mistake surface for both kinds, on both paths.** The auto-pause + popup lived only in
+the WRONG branch; the SKIPPED branch's freeze was a bare `break`. A Tarteel skip is a SKIP, so the
+display stopped correctly and nothing was raised. The decision now lives in ONE place,
+`raiseFreezePopupIfUnjudged(...)`, called from both freezes: it is a no-op on Memorize + Tajweed
+(where the confirm loop owns the verdict), and on every other surface the freeze itself IS the
+verdict. It arms the resume latch exactly as the Tajweed path does, stops the mic, and writes the
+`alignment` rewind of §4.52 so the reader sees the mistake under the highlight.
+
+### 4.62–4.63 The platform recognizer's `onResults` is the end of the session
+
+**§4.62.** The `sessionFinalized` flag is owned by the Sherpa pipeline everywhere else (the endpoint
+/ `finalCommit` marker), and Tarteel does not use the pipeline — so nothing downstream could fire:
+the summary gate demands `(sessionFinalized || forceDecision)` and the auto-finalize effect demands
+`sessionFinalized`. A Tarteel pause produced NO summary, and a Tarteel recitation that ran out of
+words ended in silence. For a non-Tajweed mode, the platform recognizer's `onResults` — the only
+thing that will ever arrive after it — now marks the session final. **Tajweed is deliberately
+excluded**: there the pipeline's final decode is still to come, and marking the session final here
+would race it and let a summary be built from a half-merged transcript.
+
+**§4.63.** The auto-finalize gate demanded `isListening`, but `onResults` also flips the listening
+state off, so the decision could never run in Tarteel — it re-armed and returned every time. The
+`isListening` requirement exists for the PIPELINE, where a stray endpoint can mark a session final
+while the reader is still going and we must keep waiting. For a session the recognizer itself has
+closed, waiting IS the bug. `needsLiveMic = recitationMode == "Tajweed"`.
+
+### 4.64–4.65 A mistake the user was shown is a decision
+
+**§4.64.** `shownMistakeWords` is a SET, and it closes a hole with two faces:
+
+- the popup re-raised. The old guard was a single index that the popup's own DISMISSAL cleared, so
+  the next frozen pass re-opened the same dialog — "it showed me a mistake then i continued. then
+  when i paused i get the popup of the same mistake again !"
+- the summary forgave it. The forgive test is an ABSENCE-of-evidence test
+  (`mistakeVerifyAbsentStrikes >= 1`), and that evidence comes only from `verifyTailWords`, which
+  needs the Sherpa pipeline. Tarteel has none, so its strikes are permanently 0 and every mistake
+  it showed was forgiven: the popup said word 6, then "the summury tells me no mistake !".
+
+Only the RE-READ may overturn a mistake the user was shown — `acquittal` puts the word back to
+CORRECT with its spoken token — never the absence of an arbiter. The set is cleared with the session
+(range change, restart, tab switch), never by dismissing a dialog.
+
+**§4.65.** Dismissing a popup must release the FREEZE itself, not only the pause flag. On
+Memorize + Tajweed the mistake latch is cleared by the collector's fresh-session re-seat, which the
+PIPELINE emits; Tarteel has no pipeline, so nothing cleared it and the walk stayed pinned:
+
+```
+analyze(fast): done 110ms matched=6 hasError=true   <- popup
+popup dismissed in Tarteel mode
+analyze(fast): done 112ms matched=6 hasError=true   <- 30 s later
+```
+
+A pinned cursor also pins the AUTO-SCROLL (its effect keys off `matchedWordCount`), which is the
+user's other report: "when i receite the words/ayahs are not scrolling automatically like it used
+to do before". The dismissal — which IS the reader saying "I have read it" — releases the latch on
+non-pipeline modes. The mistake itself is not forgotten: `shownMistakeWords` still holds it, so the
+popup cannot re-raise and the summary still reports it.
+
+### 4.66 A correction: the fragment-less PENDING row is trailing, never a gap
+
+An earlier diagnosis in this section claimed that a missed word arrives as a fragment-less PENDING
+row and the walk sails over it. **That was wrong, and the rule built on it was unreachable dead
+code.** `analyzeRecitationDetails` emits PENDING from exactly three places:
+
+- the clipped-decode guard — which CARRIES `spokenText`, so the walk counts it as heard;
+- the transcript-FRONTIER row — one row, `spokenText = null`, after which `spokenIndex` runs past
+  the end of `spoken`;
+- the "spoken exhausted" fill — a PENDING row for every remaining target word, then `break`.
+
+The frontier row is immediately followed by the exhausted fill, so a fragment-less PENDING row is
+NEVER followed by a DECIDED row: there is no mid-range gap to detect, and a rule keyed on one could
+only ever have been dead code. The invariant is stated instead, because it is why the unreached TAIL
+of a live recitation can never freeze the highlight (§4.34), and because it means the walk on a
+skipped word depends entirely on the WRONG/SKIPPED rows the analyzer really does emit — which
+§4.67 bounds.
+
+### 4.67 The ride-over is time-bounded
+
+"for tajweed mode at the end i kept saying random words and instead of getting a popup of wrong
+word the app continued displaying words." §4.51's ride-over is right in principle, but §4.51 made
+it UNBOUNDED and its arbiter is a tail decode that regularly comes back INCONCLUSIVE — so the
+ride-over became permanent: the display advanced over a wrong word and no popup was ever raised.
+
+`RIDE_OVER_BUDGET_MS` (= 8 s), measured on the WALL CLOCK rather than a pass count (passes are
+emitted per decode window and their rate varies a lot between phones). Eight seconds is comfortably
+longer than a healthy verification (the confirm loop launches on the second sighting; the tail
+decode lands in 1.5–4 s), so the grace that stopped one unverified conflict freezing all 6116 words
+of an Al-Baqarah run is preserved. When the budget expires the app itself is the decider:
+`raiseFreezePopupIfUnjudged(..., force = true)`. The shown-set means this can never double up with
+a popup the confirm loop already raised. The candidate index and its clock are cleared at every
+session reset.
+
+### 4.68 A test hook that reaches Tarteel without changing it
+
+Tarteel runs on the platform `SpeechRecognizer` while the PC-driven harness feeds the SHERPA
+pipeline (`runInjectLoop` reads `filesDir/inject.pcm` where the mic worker would open the
+microphone). The two never met, so before this there was **NO WAY to injection-test Tarteel at
+all** — every "injection test" in this project had silently measured Memorize + Tajweed. That is how
+the Tarteel cursor bug shipped untested against the surface where the user actually saw it.
+
+```kotlin
+val injectTranscriptSource: Boolean =
+    recitationMode != "Tajweed" && tajweedPipelineHolder.pipeline?.isInjecting() == true
+```
+
+When — and ONLY when — a PCM file is sitting in `filesDir`, a non-Tajweed mode takes its transcript
+from the injection loop. Everything that makes Tarteel Tarteel is untouched: the mode stays
+"Tarteel", so every gate keyed on `recitationMode == "Tajweed"` (the acoustic pass, the tajweed
+popup watcher, per-word scoring) stays OFF, and the walk, the freeze, the popup and the summary run
+the exact code they run for a real reader. The SpeechRecognizer is NOT started alongside it (the
+single-mic invariant holds, and under injection the pipeline never opens the microphone anyway).
+
+Wired at five sites: the range-change auto-resume, the permission launcher, the FAB start branch,
+`runStopAndFinalize`'s teardown (`(recitationMode == "Tajweed" || injectTranscriptSource) &&
+running`), and the partials collector's `pipelineDriven` gate. Delete the PCM and real Tarteel is
+unchanged, byte for byte. (`InjectTranscriptSourceTest`.)
+
+### 4.69 The cursor floor must read the latch AFTER the walk
+
+The Tarteel report had a second half: **"there is a missed word i continued reading the word after
+it and it worked instead of rereading the mistake"** — i.e. words after the missed word stayed
+coloured.
+
+The walk was already right (in Tarteel a WRONG/SKIPPED breaks it and §4.61 raises the popup). The
+defect was one level up and it was an ORDERING defect:
+
+- `armedMistake` is a snapshot taken BEFORE the walk, but the walk is allowed to ARM the latch:
+  `raiseFreezePopupIfUnjudged` sets `mistakeResumeIndex` the instant it raises the popup.
+- The floor logic then read the PRE-walk snapshot, concluded "no mistake is armed", and did three
+  wrong things at once:
+  - `revealFloor` was lifted to `lastHeardWord` — the reader's LAST HEARD WORD, which by
+    construction is PAST the mistake (he kept reading after the one he skipped);
+  - `resolveTranscriptCursor` was told "not armed", so it did not park on the flagged index;
+  - `displayCursorFloor` was LATCHED at that past-the-mistake value.
+- The `alignment = Pair(cursorNow, …)` write a few lines below the helper then overwrote the §4.52
+  rewind the popup helper had just written.
+
+On Memorize + Tajweed a later pass used to rescue it, because the confirm loop re-ran the walk while
+the mic was still open. Tarteel has no confirm loop: the freeze STOPS the recognizer, so no further
+pass ever arrives and the cursor never comes back.
+
+The fix: the cursor arithmetic reads the latch AFTER the walk
+(`armedMistakeNow = armedMistake || mistakeResumeIndex >= 0`), used by `revealFloor`,
+`resolveTranscriptCursor(confirmedMistakeArmed = …)`, `floorNow` and the `displayCursorFloor`
+latch; the log line reports `armed=$armedMistakeNow`. The walk's OWN gate keeps the pre-walk
+snapshot, so a word the walk has just decided cannot flip its own branch mid-iteration.
+
+**Verified on device** (Galaxy A05s, the two skip clips, `RECITATION_MODE` Tarteel / Tajweed):
+both Tarteel runs stopped the cursor ON the missed word with no `cursor held at` line at all — the
+§4.69 proof — and raised exactly one popup each; both Memorize + Tajweed runs on the same clips
+finished 29/29 with the summary raised, because the confirm loop decoded the tail, found the word
+HAD been said and forgave it. On identical audio Tarteel accuses where Tajweed forgives; that is
+inherent (Tarteel has no arbiter), and injection exaggerates it because sherpa's sliding window
+drops-then-restores a word where the platform recognizer's cumulative hypothesis does not.
+(`MistakeFreezeMustPinTheCursorTest`, `TarteelSkipMustFreezeTest`, `TarteelPopupAndSummaryTest`,
+`ShownMistakeIsHonestTest`, `GapIsASkipTest`, `TajweedPopupLatchTest`, `TarteelParityTest`.)
+
+### 4.70 First-use model download (APK 180.5 MB -> 38.6 MiB)
+
+The 166 MiB int8 graph was shipped as `assets/stt_model/model_int8.onnx`, where it
+compressed to ~137 MB of the 180.5 MB debug APK. The user expects a small download,
+not a bundled recognizer, so the weights now live in a **public Hugging Face
+mirror** and are fetched on the first Tajweed run.
+
+**Hosting.** Upstream `Muno459/fastconformer-quran` is gated (`gated: manual`) and a
+download from it needs a logged-in account. Its card declares `license: other` /
+`license_name: npl-1.1`; the exact text (fetched with the user's token) is the
+**Quran-Lab No-Profit License 1.1**. Sections 6/7 explicitly allow redistribution
+provided the license file is retained, the mirror stays under the same license and
+nothing is charged for it; section 8 leaves the NVIDIA CC-BY-4.0 base-model terms
+in place. The public mirror
+[`saif96/itqan-fastconformer-quran-int8`](https://huggingface.co/saif96/itqan-fastconformer-quran-int8)
+carries the two app files plus `LICENSE` and a model card, is ungated, and is free.
+The APK now ships that same `LICENSE` at `assets/stt_model/LICENSE`, and
+`THIRD-PARTY-NOTICES.md` records the upstream author, the NVIDIA base model, the
+training datasets and ONNX Runtime. NPL-1.1 forbids selling the model or a feature
+it powers, so the app must stay free (no ads on the Tajweed surface).
+
+**Transfer.** `SherpaModelDownloader` keeps the exact `Progress` API the Compose
+dialog already consumed. The dialog itself is now just the title "Downloading the
+model" and the determinate progress bar; the old explanatory paragraph and the
+percentage/filename line were removed. `tokens.txt` (12,847 B) still comes from the
+asset; only `model_int8.onnx` crosses the network:
+
+- resumable: bytes land in `model_int8.onnx.part`, and a retry (or a later screen
+  entry) sends `Range: bytes=N-`; a 200 response restarts from zero, a 416 deletes
+  the bogus part;
+- the exact byte count (174,544,089) must match `Content-Length` (when announced)
+  and the final file, then SHA-256
+  `4DC38B31...2A4E7C` must match before an atomic rename;
+- 3 attempts with a 1.5 s / 3 s backoff, a free-space preflight (weights + 16 MB),
+  and a checksum failure deletes the part instead of retrying a poisoned file;
+- leaving the screen cancels inside the chunk loop, keeps the `.part` and resets
+  the state to `Idle`, so entering again resumes instead of showing a stale
+  "Downloading" dialog forever;
+- `isSherpaModelReady` now requires the **exact** size, not `>=`.
+
+The int8 graph is not re-exported, quantized or modified here: the mirror is a
+byte-identical copy of the two files, and `PcSttEndToEndTest` /
+`PcTajweedFalsePositiveTest` keep consuming their local fixtures. A debug APK is
+now 38.6 MiB (40,430,626 bytes) and a fresh install downloads the graph once; an
+existing install keeps the file in `files/sherpa_model/`, so updates do not
+re-download it. Verified end-to-end on an SM-A057F: the first-use run reached
+174,544,089 bytes, the SHA-256 matched, and `prewarm()` created the engine.
+
+### 4.71 Three contract regressions: Tarteel's mic, the rule popup, and the next ayah
+
+**Tarteel must stay listening until the user stops it.** The platform
+`SpeechRecognizer` ends a session on its own after a short silence and on
+every benign `NO_MATCH` / `SPEECH_TIMEOUT` / `CLIENT` error. The app treated
+both as a user stop (`isListening = false`, trim the transcript, finalize), so
+a reader who paused between ayahs watched the mic turn itself off.
+`tarteelWantsMic` now records the user's intent across recognizer sessions;
+`tarteelSegmentEnded` wakes a 300 ms restart effect after a natural segment
+end. A benign error is an utterance boundary, not a failure: it schedules the
+next session without trimming anything. A start failure or a fatal error
+(permissions/network/busy) clears the intent instead of retrying forever. The
+user's stop clears the intent *before* `stopListening()`, so the
+`ERROR_CLIENT` that a stop can produce can never restart the mic. Segment
+local counters (`currentWordCount`, `partialSpokenText`) and the segment's
+`spokenTimings` reset at the boundary while `finalSpokenText` keeps the
+committed words. The recognizer is also
+asked for longer silence/minimum lengths (5 s / 2.5 s / 8 s), but those extras
+are advisory; the restart loop is the actual guarantee. In Tarteel an
+utterance end no longer sets `sessionFinalized`, so the grace/auto-finalize
+machinery cannot mistake a short pause for the end of the recitation.
+
+**A Tajweed rule is never a skipped word.** The rule popup assigned
+`latestTajweedPopup` without assigning `latestPopupKind`. The kind therefore
+stayed `"skipped"` from an earlier real skip, and the dialog titled the rule
+("Al-Lam") as a *Skipped Word* and said it "was not heard". The kind is now
+set in the same statement group as the pair. The popup also resolves its word
+and percentage from the exact `(wordIndex, rule)` row
+(`forWordAndRule`) instead of the first row for that word, so a multi-rule
+word cannot show another rule's score.
+
+**Pausing must not colour the next ayah.** `detailedAnalysis` is a flat list
+for the whole selected range and always carries a PENDING tail for later
+ayahs. `finalizeCorrect()` and the grace promotion bounded that tail by
+`FINALIZE_FORGIVE_TAIL_WINDOW` in GLOBAL word indices, so a clipped/pending
+row just across the ayah boundary could be decided; `displayedCursorFor()`
+then coloured every decided row up to it, and the list auto-scrolled to the
+next ayah. `displayCapForHeardAyah()` now returns the exclusive end of the
+ayah containing the last word that carries a spoken token, further limited by
+the same eight-word clipped-tail allowance. Both promotion paths use that
+boundary, every stopped-session coverage call is capped by it, and
+`runStopAndFinalize()` pulls a cursor that had already crossed the boundary
+back before the final decode runs. The cursor is an exclusive count, so after
+a perfect ayah it points at the first word of the next one; while LIVE that is
+the correct scroll target, but after a stop it made the header and auto-scroll
+jump to the next ayah. `displayAyahAnchor()` moves that navigation anchor back
+one word only when the cursor is exactly on an ayah boundary (or the range
+end); `mistakeArmed` overrides it so a popup's flagged word stays on screen,
+and a spoken token at the boundary keeps the next ayah because the reader
+really began it. A user who really began the next ayah has evidence in it, so its end
+becomes the ceiling - the cap removes bookkeeping, not real words.
+
+Unit tests: `NextAyahDisplayCapTest`, the multi-rule case in
+`TajweedPopupWordTest`, plus the existing `DisplayedCursorTest`,
+`TarteelPopupAndSummaryTest` and `TajweedPopupLatchTest`. On-device
+verification of the three behaviours is still pending because no phone was
+attached while the code was changed.
 
 ## 5. Why the previous pipeline is gone
 
