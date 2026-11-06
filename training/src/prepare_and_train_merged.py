@@ -23,8 +23,11 @@ import time
 import subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TADABUR_PART = (r"C:/Users/seifg/Downloads/practice_recitation-main/"
-                r"practice_recitation-main/tools/calib/tadabur_part")
+TADABUR_PART = os.environ.get(
+    "TADABUR_PART",
+    os.path.join(os.path.expanduser("~"), "Downloads", "practice_recitation-main",
+                 "practice_recitation-main", "tools", "calib", "tadabur_part"),
+)
 TARGET_DIR = os.path.join(HERE, "..", "dataset_merged")
 SHARDS_DONE = os.path.join(TADABUR_PART, "_shards_done.txt")
 REQUIRED_SHARDS = [8, 9, 10, 11, 12]

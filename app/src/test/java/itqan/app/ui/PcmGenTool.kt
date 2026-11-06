@@ -12,8 +12,9 @@ import kotlin.math.min
 class PcmGenTool {
     @Test
     fun generateBaqarahPcm() {
-        val mp3 = File("C:/Users/seifg/AppData/Local/Temp/stt_e2e/baqarah_full.mp3")
-        val out = File("C:/Users/seifg/AppData/Local/Temp/stt_e2e/baqarah_16k.pcm")
+        val dir = File(System.getProperty("java.io.tmpdir"), "stt_e2e")
+        val mp3 = File(dir, "baqarah_full.mp3")
+        val out = File(dir, "baqarah_16k.pcm")
         val bitstream = Bitstream(ByteArrayInputStream(mp3.readBytes()))
         val decoder = Decoder()
         val pcm44 = ArrayList<Float>((mp3.length() / 2).toInt())

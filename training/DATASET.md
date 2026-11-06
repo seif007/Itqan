@@ -14,7 +14,7 @@ For training, see [`TRAINING.md`](TRAINING.md).
 ## 1. Source corpus
 
 - **Audio:** the `tadabur_part/` tree at
-  `C:/Users/seifg/.../tools/calib/tadabur_part` — word-aligned verse sidecars
+  `<corpus>/tools/calib/tadabur_part` — word-aligned verse sidecars
   (`*.json`) sitting next to their mono `*.wav`s, organised as
   `tadabur_part/shardK/<reciter_id>/<verse>.json|.wav`. Read-only; nothing is
   copied (manifest rows keep *absolute* paths and decode clips on the fly).

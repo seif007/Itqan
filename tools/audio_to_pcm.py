@@ -16,6 +16,7 @@ import argparse
 import os
 import struct
 import sys
+import tempfile
 import urllib.request
 
 
@@ -63,7 +64,7 @@ def main():
                    help="Hard cap on output length (seconds); used to chunk long surahs")
     p.add_argument("--silence-between-ayahs", type=float, default=0.7,
                    help="Seconds of silence inserted between ayahs (default 0.7)")
-    p.add_argument("--cache-dir", default=r"C:/Users/seifg/AppData/Local/Temp/muno_inject_cache")
+    p.add_argument("--cache-dir", default=os.path.join(tempfile.gettempdir(), "muno_inject_cache"))
     args = p.parse_args()
 
     if args.ayah_end is None:
