@@ -1,4 +1,4 @@
-# Quran Recitation Practice
+# Itqan – Quran Recitation Practice
 
 An interactive Android application designed to help users practice Quranic recitation with live ASR (Automatic Speech Recognition) and on-device acoustic Tajweed analysis. The app supports both Hafs 'an 'Asim and Qalun 'an Nafi' transmissions, gives near-real-time feedback on wrong / skipped words and per-rule Tajweed mistakes, and offers the whole UI in either English or Arabic with a single in-app language toggle.
 
