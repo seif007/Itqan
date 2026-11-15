@@ -19,18 +19,22 @@ import org.json.JSONObject
  * in the previous per-call construction). Use [get] — guaranteed cheap after
  * the first hit — rather than constructing [RecitationAnalyzer] directly.
  */
-class RecitationAnalyzer private constructor(context: Context) {
+class RecitationAnalyzer private constructor(private val context: Context) {
 
-    private val net: TajweedNet
-    // ONNX-Runtime backed net (assets/tajweed_net.onnx). Same graph as [net]
-    // but ~20-30x faster on-device (~10-20 ms vs ~370 ms per forward pass on
-    // the A05s). Used when present; the Kotlin net is the fallback so the app
-    // still works if the ONNX asset is missing or ORT fails to load it.
+    // Pure-Kotlin fallback, built lazily: when the ONNX net loads we neither parse
+    // the ~1 MB weights JSON nor hold a second copy of the model. Same graph as
+    // [netOnnx], ~20-30x slower on-device.
+    private val net: TajweedNet by lazy {
+        val json = context.assets.open("model_weights.json").bufferedReader().use { it.readText() }
+        TajweedNet(JSONObject(json))
+    }
+
+    // ONNX-Runtime backed net (assets/tajweed_net.onnx). Used when present; the
+    // Kotlin net is the fallback so the app still works if the ONNX asset is
+    // missing or ORT fails to load it.
     private val netOnnx: TajweedNetOnnx?
 
     init {
-        val json = context.assets.open("model_weights.json").bufferedReader().use { it.readText() }
-        net = TajweedNet(JSONObject(json))
         netOnnx = TajweedNetOnnx.create(context)
         android.util.Log.i("RecitationAnalyzer", if (netOnnx != null) "using ONNX TajweedNet" else "using Kotlin TajweedNet (ONNX unavailable)")
     }
@@ -113,7 +117,7 @@ class RecitationAnalyzer private constructor(context: Context) {
         } else {
             net.forward(feats.logmel, feats.dur, feats.ev)
         }
-        val probs = net.sigmoidLogits(logits)
+        val probs = TajweedNet.sigmoidLogits(logits)
 
         val targets = if (expectedRules == listOf("NONE")) TajweedFeatures.RULES else expectedRules
         return targets.map { rule ->

@@ -48,14 +48,32 @@ TANWEEN_DAMM = '\u064C'   # ٌ
 TANWEEN_KASR = '\u064D'   # ٍ
 TANWEEN = {TANWEEN_FATH, TANWEEN_DAMM, TANWEEN_KASR}
 
-# letters that DO carry a diacritic we must strip when finding base consonants
-DIACRITICS = set(TANWEEN) | {FATHA, DAMMA, KASRA, SUKOON, SHADDA, '\u0670', '\u0640'}
+# Quranic combining / annotation marks that are never base letters and never
+# standalone tokens. Two of them are load-bearing for Qalun, which writes the
+# alif-wasl as ALIF + harakah + U+06EC (the round dot) and does not use U+0671 at
+# all:
+#   * U+06EC must be stripped, otherwise it becomes the "first letter" of a
+#     following word and breaks cross-word noon/meem rules; it is also the marker
+#     that distinguishes the article from a word-initial hamzat qat' (see
+#     is_definite_article).
+#   * U+0653..U+065E, U+06DF..U+06ED are the remaining combining marks.
+# The standalone pause marks (U+06D6..U+06DE, U+06E9) are deliberately NOT listed:
+# they occur as whole whitespace-delimited tokens, and collapsing a token to an
+# empty base changes the cross-word noon/meem labels (it silently drops
+# MEEM_SAKINAH before a pause sign).
+QURANIC_MARKS = {'\u0653', '\u0654', '\u0655', '\u0656', '\u0657', '\u065E',
+                 '\u06DF', '\u06E0', '\u06E2', '\u06E3', '\u06E5', '\u06E6',
+                 '\u06E7', '\u06E8', '\u06EA', '\u06EB', '\u06EC', '\u06ED'}
+
+# marks that DO carry a diacritic we must strip when finding base consonants
+DIACRITICS = set(TANWEEN) | {FATHA, DAMMA, KASRA, SUKOON, SHADDA, '\u0670', '\u0640'} | QURANIC_MARKS
 
 QALQALAH = {'\u0642', '\u0637', '\u0628', '\u062C', '\u062F'}  # ق ط ب ج د
 THROAT   = {'\u0621', '\u0647', '\u0639', '\u062D', '\u063A', '\u062E'}  # ء ه ع ح غ خ (izhar)
 IKHFA    = {'\u062A', '\u062B', '\u062C', '\u062F', '\u0630', '\u0632',  # ت ث ج د ذ ز
             '\u0633', '\u0634', '\u0635', '\u0636', '\u0637', '\u0638',  # س ش ص ض ط ظ
-            '\u0641', '\u0642', '\u0643', '\u0644'}                     # ف ق ك ل
+            '\u0641', '\u0642', '\u0643'}                              # ف ق ك
+            # ل is NOT an ikhfa letter: it is idgham-plain and is tested before IKHFA
 IDGHAM_GHUNNAH = {'\u064A', '\u0646', '\u0645', '\u0648'}  # ي ن م و (with ghunnah)
 IDGHAM_PLAIN   = {'\u0644', '\u0631'}                       # ل ر (without ghunnah)
 SUN_LETTERS = {'\u062A', '\u062B', '\u062C', '\u062D', '\u062E', '\u0639', '\u063A',
@@ -84,6 +102,28 @@ def first_base_letter(next_word: str or None) -> str or None:
 
 def has_sukoon_after(word: str, idx: int) -> bool:
     return idx + 1 < len(word) and word[idx + 1] in (SUKOON, SHADDA)
+
+
+def is_definite_article(word: str) -> bool:
+    """True when `word` begins with the definite article الـ (lam shamsiyyah/qamariyyah).
+
+    Hafs encodes it as plain alif+lam or alif-wasl (U+0671)+lam. Qalun does not use
+    U+0671: it writes the alif-wasl as ALIF + harakah + U+06EC (round dot), so the
+    article is `اِ۬ل..` / `اَ۬ل..`. We require that U+06EC marker there, because a
+    word-initial hamzat qat' is written the same way minus the marker (إِلَيْكَ =
+    ALIF+KASRA+LAM...) and must NOT be read as the article.
+    """
+    if word.startswith(ALIF + LAM) or word.startswith(ALIF_WASL + LAM):
+        return True
+    if word[:1] == ALIF:
+        j = 1
+        saw_wasl_mark = False
+        while j < len(word) and word[j] != LAM and word[j] in DIACRITICS:
+            if word[j] == '\u06EC':
+                saw_wasl_mark = True
+            j += 1
+        return saw_wasl_mark and j < len(word) and word[j] == LAM
+    return False
 
 
 def detect_rules_for_word(word: str, next_word: str or None = None,
@@ -124,7 +164,7 @@ def detect_rules_for_word(word: str, next_word: str or None = None,
             rules.add("GHUNNAH")
 
     # --- ALLAM: the definite article الـ (lam shamsiyyah/qamariyyah) ---
-    if word.startswith(ALIF + LAM) or word.startswith(ALIF_WASL + LAM):
+    if is_definite_article(word):
         rules.add("ALLAM")
 
     nfl = first_base_letter(next_word)

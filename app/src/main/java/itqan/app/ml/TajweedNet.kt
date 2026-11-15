@@ -55,6 +55,11 @@ class TajweedNet(private val modelJson: JSONObject) {
     private val gruBihRev = load1D("gru_bih_rev")
     private val gruBhhRev = load1D("gru_bhh_rev")
 
+    // Per-rule head weights, pre-loaded once. These were previously read from the
+    // JSON blob inside forward() on every call (8 heads x ~134 floats of getDouble).
+    private val headW: Map<String, FloatArray> = rules.associateWith { load1D("head_${it}_W") }
+    private val headB: Map<String, Float> = rules.associateWith { load1D("head_${it}_b")[0] }
+
     private fun load2D(key: String): Array<FloatArray> {
         val a = W.getJSONArray(key)
         return Array(a.length()) { i ->
@@ -120,8 +125,8 @@ class TajweedNet(private val modelJson: JSONObject) {
             if (r == "MADD") parts.add(floatArrayOf(dur))
             parts.add(ev)
             val feat = concat(parts)
-            val hw = load1D("head_${r}_W")
-            val hb = load1D("head_${r}_b")[0]
+            val hw = headW.getValue(r)
+            val hb = headB.getValue(r)
             var acc = hb
             for (i in feat.indices) acc += hw[i] * feat[i]
             out[r] = acc
@@ -129,8 +134,15 @@ class TajweedNet(private val modelJson: JSONObject) {
         return out
     }
 
-    fun sigmoidLogits(logits: Map<String, Float>): Map<String, Float> =
-        logits.mapValues { 1f / (1f + exp(-it.value)) }
+    companion object {
+        /**
+         * Sigmoid of raw logits. Stateless, so it lives on the companion: the ONNX
+         * path maps its logits through this without needing a Kotlin [TajweedNet]
+         * instance (and therefore without parsing the weights JSON at all).
+         */
+        fun sigmoidLogits(logits: Map<String, Float>): Map<String, Float> =
+            logits.mapValues { 1f / (1f + exp(-it.value)) }
+    }
 
     // ---------------- low-level ops ----------------
     private fun conv1dRelu(x: Array<FloatArray>, cw: ConvW): Array<FloatArray> {

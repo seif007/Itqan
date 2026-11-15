@@ -52,19 +52,36 @@ object TajweedRules {
     private val MADDA_ABOVE = ch(CP.MADDA_ABOVE)
 
     private val TANWEEN = setOf(ch(CP.TANWEEN_FATH), ch(CP.TANWEEN_DAMM), ch(CP.TANWEEN_KASR))
+
+    // Quranic combining / annotation marks that are never base letters and never
+    // standalone tokens. Load-bearing for Qalun, which writes the alif-wasl as
+    // ALIF + harakah + U+06EC (round dot) and never uses U+0671:
+    //   * U+06EC must be stripped or it becomes the "first letter" of a following
+    //     word, breaking cross-word noon/meem rules; it is also the marker that
+    //     distinguishes the article from a word-initial hamzat qat' (isDefiniteArticle).
+    //   * U+0653..U+065E, U+06DF..U+06ED are the remaining combining marks.
+    // The standalone pause marks (U+06D6..U+06DE, U+06E9) are deliberately NOT listed:
+    // they occur as whole tokens, and collapsing a token to an empty base silently
+    // drops MEEM_SAKINAH before a pause sign.
+    private val QURANIC_MARKS = setOf(
+        ch(0x0653), ch(0x0654), ch(0x0655), ch(0x0656), ch(0x0657), ch(0x065E),
+        ch(0x06DF), ch(0x06E0), ch(0x06E2), ch(0x06E3), ch(0x06E5), ch(0x06E6),
+        ch(0x06E7), ch(0x06E8), ch(0x06EA), ch(0x06EB), ch(0x06EC), ch(0x06ED)
+    )
+
     private val DIACRITICS = setOf(
         ch(CP.TANWEEN_FATH), ch(CP.TANWEEN_DAMM), ch(CP.TANWEEN_KASR),
         ch(CP.FATHA), ch(CP.DAMMA), ch(CP.KASRA), ch(CP.SUKOON), ch(CP.SHADDA),
         ch(CP.MADDA_ABOVE), ch(CP.TATWEEL)
-    )
+    ) + QURANIC_MARKS
 
     private val QALQALAH = setOf(ch(0x0642), ch(0x0637), ch(0x0628), ch(0x062C), ch(0x062F))
     private val THROAT = setOf(ch(0x0621), ch(0x0647), ch(0x0639), ch(0x062D), ch(0x063A), ch(0x062E))
     private val IKHFA = setOf(
         ch(0x062A), ch(0x062B), ch(0x062C), ch(0x062F), ch(0x0630), ch(0x0632),
         ch(0x0633), ch(0x0634), ch(0x0635), ch(0x0636), ch(0x0637), ch(0x0638),
-        ch(0x0641), ch(0x0642), ch(0x0643), ch(0x0644)
-    )
+        ch(0x0641), ch(0x0642), ch(0x0643)
+    ) // Lam (0x0644) is NOT ikhfa: it is idgham-plain and is tested before IKHFA
     private val IDGHAM_GHUNNAH = setOf(ch(0x064A), ch(0x0646), ch(0x0645), ch(0x0648))
     private val IDGHAM_PLAIN = setOf(ch(0x0644), ch(0x0631))
     private val BEH = ch(CP.BEH)
@@ -86,6 +103,27 @@ object TajweedRules {
 
     private fun hasSukoonAfter(word: String, idx: Int): Boolean =
         idx + 1 < word.length && (word[idx + 1] == ch(CP.SUKOON) || word[idx + 1] == ch(CP.SHADDA))
+
+    /**
+     * True when [word] begins with the definite article الـ (lam shamsiyyah/qamariyyah).
+     *
+     * Hafs encodes it as plain alif+lam or alif-wasl (U+0671)+lam. Qalun does not use
+     * U+0671: it writes the alif-wasl as ALIF + harakah + U+06EC (round dot), so the
+     * article is `اِ۬ل..` / `اَ۬ل..`. That U+06EC marker is required here, because a
+     * word-initial hamzat qat' is written the same way minus the marker (إِلَيْكَ =
+     * ALIF + KASRA + LAM...) and must not be read as the article.
+     */
+    private fun isDefiniteArticle(word: String): Boolean {
+        if (word.startsWith("$ALIF$LAM") || word.startsWith("$ALIF_WASL$LAM")) return true
+        if (word.isEmpty() || word[0] != ALIF) return false
+        var j = 1
+        var sawWaslMark = false
+        while (j < word.length && word[j] != LAM && word[j] in DIACRITICS) {
+            if (word[j] == ch(0x06EC)) sawWaslMark = true
+            j++
+        }
+        return sawWaslMark && j < word.length && word[j] == LAM
+    }
 
     fun detectRulesForWord(word: String, nextWord: String? = null): List<String> {
         if (word.isEmpty()) return listOf("NONE")
@@ -116,7 +154,7 @@ object TajweedRules {
             if (idx >= 0 && hasSukoonAfter(word, idx) && ch(CP.SHADDA) in word) rules.add("GHUNNAH")
         }
 
-        if (word.startsWith("$ALIF$LAM") || word.startsWith("$ALIF_WASL$LAM")) rules.add("ALLAM")
+        if (isDefiniteArticle(word)) rules.add("ALLAM")
 
         val nfl = firstBaseLetter(nextWord)
 
